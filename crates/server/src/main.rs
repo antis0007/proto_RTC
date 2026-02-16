@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fs, net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, sync::Arc};
 
 use axum::{
     body::Bytes,
@@ -20,26 +20,9 @@ use storage::Storage;
 use tokio::sync::broadcast;
 use tracing::info;
 
-#[derive(Debug, Deserialize)]
-struct Settings {
-    bind_addr: String,
-    database_url: String,
-    livekit_api_key: String,
-    livekit_api_secret: String,
-    livekit_ttl_seconds: i64,
-}
+mod config;
 
-impl Default for Settings {
-    fn default() -> Self {
-        Self {
-            bind_addr: "127.0.0.1:8080".into(),
-            database_url: "sqlite://community.db".into(),
-            livekit_api_key: "devkey".into(),
-            livekit_api_secret: "devsecret".into(),
-            livekit_ttl_seconds: 3600,
-        }
-    }
-}
+use config::{load_settings, prepare_database_url};
 
 #[derive(Clone)]
 struct AppState {
@@ -87,7 +70,15 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt().with_env_filter("info").init();
 
     let settings = load_settings();
-    let storage = Storage::new(&settings.database_url).await?;
+    let database_url = prepare_database_url(&settings.database_url)?;
+    let storage = Storage::new(&database_url).await.map_err(|error| {
+        error!(
+            %database_url,
+            %error,
+            "failed to open SQLite database; verify parent directory exists and permissions are correct"
+        );
+        error
+    })?;
     let api = ApiContext {
         storage,
         livekit: LiveKitConfig {
@@ -110,44 +101,11 @@ async fn main() -> anyhow::Result<()> {
         .route("/ws", get(ws_handler))
         .with_state(Arc::new(state));
 
-    let addr: SocketAddr = settings.bind_addr.parse()?;
+    let addr: SocketAddr = settings.server_bind.parse()?;
     info!(%addr, "server listening");
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
-}
-
-fn load_settings() -> Settings {
-    let mut settings = Settings::default();
-    if let Ok(raw) = fs::read_to_string("server.toml") {
-        if let Ok(file_cfg) = toml::from_str::<HashMap<String, String>>(&raw) {
-            if let Some(v) = file_cfg.get("bind_addr") {
-                settings.bind_addr = v.clone();
-            }
-            if let Some(v) = file_cfg.get("database_url") {
-                settings.database_url = v.clone();
-            }
-        }
-    }
-
-    if let Ok(v) = std::env::var("APP__BIND_ADDR") {
-        settings.bind_addr = v;
-    }
-    if let Ok(v) = std::env::var("APP__DATABASE_URL") {
-        settings.database_url = v;
-    }
-    if let Ok(v) = std::env::var("APP__LIVEKIT_API_KEY") {
-        settings.livekit_api_key = v;
-    }
-    if let Ok(v) = std::env::var("APP__LIVEKIT_API_SECRET") {
-        settings.livekit_api_secret = v;
-    }
-    if let Ok(v) = std::env::var("APP__LIVEKIT_TTL_SECONDS") {
-        if let Ok(parsed) = v.parse::<i64>() {
-            settings.livekit_ttl_seconds = parsed;
-        }
-    }
-    settings
 }
 
 async fn healthz() -> &'static str {
