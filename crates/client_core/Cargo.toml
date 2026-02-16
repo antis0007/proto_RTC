@@ -15,6 +15,6 @@ serde_json.workspace = true
 shared = { path = "../shared" }
 tokio.workspace = true
 tokio-stream.workspace = true
-tokio-tungstenite = { version = "0.23", default-features = false, features = ["rustls-tls-webpki-roots"] }
+tokio-tungstenite = { version = "0.23", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 tracing.workspace = true
 url.workspace = true
