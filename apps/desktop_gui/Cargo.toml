@@ -1,0 +1,16 @@
+[package]
+name = "desktop_gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+base64.workspace = true
+client_core = { path = "../../crates/client_core" }
+eframe = { version = "0.28", default-features = true }
+egui = "0.28"
+shared = { path = "../../crates/shared" }
+crossbeam-channel = "0.5"
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
