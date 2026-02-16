@@ -9,3 +9,6 @@ chrono.workspace = true
 jsonwebtoken.workspace = true
 serde.workspace = true
 shared = { path = "../shared" }
+
+[dev-dependencies]
+serde_json.workspace = true
