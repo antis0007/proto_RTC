@@ -1,11 +1,17 @@
-use anyhow::Result;
+use std::sync::Arc;
+
+use anyhow::{anyhow, Context, Result};
+use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
+use futures::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use shared::{
     domain::{ChannelId, GuildId},
-    protocol::ClientRequest,
+    protocol::{ChannelSummary, ClientRequest, GuildSummary, ServerEvent},
 };
+use tokio::sync::{broadcast, Mutex};
+use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 pub trait CryptoProvider: Send + Sync {
     fn encrypt_message(&self, plaintext: &[u8]) -> Vec<u8>;
@@ -95,5 +101,241 @@ impl<C: CryptoProvider> CommunityClient<C> {
             can_publish_mic,
             can_publish_screen,
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum ClientEvent {
+    Server(ServerEvent),
+    Error(String),
+}
+
+#[async_trait]
+pub trait ClientHandle: Send + Sync {
+    async fn login(&self, server_url: &str, username: &str, password_or_invite: &str)
+        -> Result<()>;
+    async fn list_guilds(&self) -> Result<()>;
+    async fn list_channels(&self, guild_id: GuildId) -> Result<()>;
+    async fn select_channel(&self, channel_id: ChannelId) -> Result<()>;
+    async fn send_message(&self, text: &str) -> Result<()>;
+    fn subscribe_events(&self) -> broadcast::Receiver<ClientEvent>;
+}
+
+pub struct RealtimeClient<C: CryptoProvider + 'static> {
+    http: Client,
+    crypto: C,
+    inner: Mutex<RealtimeClientState>,
+    events: broadcast::Sender<ClientEvent>,
+}
+
+struct RealtimeClientState {
+    server_url: Option<String>,
+    user_id: Option<i64>,
+    selected_guild: Option<GuildId>,
+    selected_channel: Option<ChannelId>,
+    ws_started: bool,
+}
+
+#[derive(Serialize)]
+struct SendMessageHttpRequest {
+    user_id: i64,
+    guild_id: i64,
+    channel_id: i64,
+    ciphertext_b64: String,
+}
+
+impl<C: CryptoProvider + 'static> RealtimeClient<C> {
+    pub fn new(crypto: C) -> Arc<Self> {
+        let (events, _) = broadcast::channel(1024);
+        Arc::new(Self {
+            http: Client::new(),
+            crypto,
+            inner: Mutex::new(RealtimeClientState {
+                server_url: None,
+                user_id: None,
+                selected_guild: None,
+                selected_channel: None,
+                ws_started: false,
+            }),
+            events,
+        })
+    }
+
+    async fn spawn_ws_events(self: &Arc<Self>, server_url: &str, user_id: i64) -> Result<()> {
+        let ws_url = if server_url.starts_with("https://") {
+            server_url.replacen("https://", "wss://", 1)
+        } else if server_url.starts_with("http://") {
+            server_url.replacen("http://", "ws://", 1)
+        } else {
+            return Err(anyhow!("server_url must start with http:// or https://"));
+        };
+        let ws_url = format!("{ws_url}/ws?user_id={user_id}");
+        let (ws_stream, _) = connect_async(&ws_url)
+            .await
+            .with_context(|| format!("failed to connect websocket: {ws_url}"))?;
+        let (_, mut ws_reader) = ws_stream.split();
+
+        let client = Arc::clone(self);
+        tokio::spawn(async move {
+            while let Some(msg) = ws_reader.next().await {
+                match msg {
+                    Ok(Message::Text(text)) => match serde_json::from_str::<ServerEvent>(&text) {
+                        Ok(event) => {
+                            let _ = client.events.send(ClientEvent::Server(event));
+                        }
+                        Err(err) => {
+                            let _ = client
+                                .events
+                                .send(ClientEvent::Error(format!("invalid server event: {err}")));
+                        }
+                    },
+                    Ok(Message::Close(_)) => break,
+                    Ok(_) => {}
+                    Err(err) => {
+                        let _ = client.events.send(ClientEvent::Error(format!(
+                            "websocket receive failed: {err}"
+                        )));
+                        break;
+                    }
+                }
+            }
+            let mut guard = client.inner.lock().await;
+            guard.ws_started = false;
+        });
+
+        Ok(())
+    }
+
+    async fn session(&self) -> Result<(String, i64)> {
+        let guard = self.inner.lock().await;
+        let server_url = guard
+            .server_url
+            .clone()
+            .ok_or_else(|| anyhow!("not logged in: missing server_url"))?;
+        let user_id = guard
+            .user_id
+            .ok_or_else(|| anyhow!("not logged in: missing user_id"))?;
+        Ok((server_url, user_id))
+    }
+}
+
+#[async_trait]
+impl<C: CryptoProvider + 'static> ClientHandle for Arc<RealtimeClient<C>> {
+    async fn login(
+        &self,
+        server_url: &str,
+        username: &str,
+        _password_or_invite: &str,
+    ) -> Result<()> {
+        let res = self
+            .http
+            .post(format!("{server_url}/login"))
+            .json(&LoginRequest {
+                username: username.to_string(),
+            })
+            .send()
+            .await?
+            .error_for_status()?;
+        let body: LoginResponse = res.json().await?;
+
+        {
+            let mut guard = self.inner.lock().await;
+            guard.server_url = Some(server_url.to_string());
+            guard.user_id = Some(body.user_id);
+            guard.selected_guild = None;
+            guard.selected_channel = None;
+            guard.ws_started = true;
+        }
+
+        self.spawn_ws_events(server_url, body.user_id).await
+    }
+
+    async fn list_guilds(&self) -> Result<()> {
+        let (server_url, user_id) = self.session().await?;
+        let guilds: Vec<GuildSummary> = self
+            .http
+            .get(format!("{server_url}/guilds"))
+            .query(&[("user_id", user_id)])
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+
+        for guild in guilds {
+            let _ = self
+                .events
+                .send(ClientEvent::Server(ServerEvent::GuildUpdated { guild }));
+        }
+        Ok(())
+    }
+
+    async fn list_channels(&self, guild_id: GuildId) -> Result<()> {
+        let (server_url, user_id) = self.session().await?;
+        {
+            let mut guard = self.inner.lock().await;
+            guard.selected_guild = Some(guild_id);
+        }
+
+        let channels: Vec<ChannelSummary> = self
+            .http
+            .get(format!("{server_url}/guilds/{}/channels", guild_id.0))
+            .query(&[("user_id", user_id)])
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+
+        for channel in channels {
+            let _ = self
+                .events
+                .send(ClientEvent::Server(ServerEvent::ChannelUpdated { channel }));
+        }
+        Ok(())
+    }
+
+    async fn select_channel(&self, channel_id: ChannelId) -> Result<()> {
+        let mut guard = self.inner.lock().await;
+        guard.selected_channel = Some(channel_id);
+        Ok(())
+    }
+
+    async fn send_message(&self, text: &str) -> Result<()> {
+        let (server_url, user_id, guild_id, channel_id) = {
+            let guard = self.inner.lock().await;
+            let server_url = guard
+                .server_url
+                .clone()
+                .ok_or_else(|| anyhow!("not logged in: missing server_url"))?;
+            let user_id = guard
+                .user_id
+                .ok_or_else(|| anyhow!("not logged in: missing user_id"))?;
+            let guild_id = guard.selected_guild.unwrap_or(GuildId(1));
+            let channel_id = guard
+                .selected_channel
+                .ok_or_else(|| anyhow!("no channel selected"))?;
+            (server_url, user_id, guild_id, channel_id)
+        };
+
+        let ciphertext = self.crypto.encrypt_message(text.as_bytes());
+        let payload = SendMessageHttpRequest {
+            user_id,
+            guild_id: guild_id.0,
+            channel_id: channel_id.0,
+            ciphertext_b64: STANDARD.encode(ciphertext),
+        };
+
+        self.http
+            .post(format!("{server_url}/messages"))
+            .json(&payload)
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
+    fn subscribe_events(&self) -> broadcast::Receiver<ClientEvent> {
+        self.events.subscribe()
     }
 }
