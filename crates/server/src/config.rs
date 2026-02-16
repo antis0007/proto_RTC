@@ -165,7 +165,10 @@ fn sqlite_path(database_url: &str) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use std::{env, time::{SystemTime, UNIX_EPOCH}};
+    use std::{
+        env,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     use super::*;
 
