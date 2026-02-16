@@ -9,10 +9,11 @@ New-Item -ItemType Directory -Force -Path 'logs' | Out-Null
 
 if (Test-Path '.env') {
   Get-Content '.env' | ForEach-Object {
-    if ($_ -match '^\s*#' -or $_ -match '^\s*$') { continue }
-    $parts = $_ -split '=', 2
-    if ($parts.Count -eq 2) {
-      [System.Environment]::SetEnvironmentVariable($parts[0].Trim(), $parts[1].Trim().Trim('"'), 'Process')
+    if ($_ -notmatch '^\s*#' -and $_ -notmatch '^\s*$') {
+      $parts = $_ -split '=', 2
+      if ($parts.Count -eq 2) {
+        [System.Environment]::SetEnvironmentVariable($parts[0].Trim(), $parts[1].Trim().Trim('"'), 'Process')
+      }
     }
   }
 }
