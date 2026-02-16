@@ -32,18 +32,27 @@ See docs in `docs/` for details.
 1. Install Rust (stable) and Cargo: <https://rustup.rs>
 2. Verify toolchain:
 
+   **Linux/macOS:**
    ```bash
    cargo --version
    rustc --version
-   ```
+    ```
+
+    **Windows PowerShell:**
+    ```powershell
+    cargo --version
+    rustc --version
+    ```
 
 3. From the repository root, create a local env file:
+
+   **Linux/macOS:**
 
    ```bash
    cp .env.example .env
    ```
 
-   On Windows PowerShell:
+   **Windows PowerShell:**
 
    ```powershell
    Copy-Item .env.example .env
@@ -69,24 +78,25 @@ Use **bash scripts (`.sh`) on Linux/macOS**, and **PowerShell scripts (`.ps1`) o
 
 This is the fastest reproducible test path.
 
-- Linux/macOS:
+* Linux/macOS:
 
   ```bash
   ./scripts/test-local-stack.sh
   ```
 
-- Windows PowerShell:
+* Windows PowerShell:
 
   ```powershell
   ./scripts/test-local-stack.ps1
   ```
 
 What it does:
-- starts the server,
-- waits for `GET /healthz`,
-- runs client #1 and client #2 with unique usernames,
-- writes logs to `logs/test-local-*.log`,
-- stops the server process.
+
+* starts the server,
+* waits for `GET /healthz`,
+* runs client #1 and client #2 with unique usernames,
+* writes logs to `logs/test-local-*.log`,
+* stops the server process.
 
 ### B) One computer: manual server + clients (separate terminals)
 
@@ -94,18 +104,18 @@ Use this when you want interactive control.
 
 1. Terminal A (server):
 
-   - Linux/macOS: `./scripts/run-server.sh`
-   - Windows: `./scripts/run-server.ps1`
+   * Linux/macOS: `./scripts/run-server.sh`
+   * Windows: `./scripts/run-server.ps1`
 
 2. Terminal B (client 1):
 
-   - Linux/macOS: `./scripts/run-cli.sh`
-   - Windows: `./scripts/run-cli.ps1`
+   * Linux/macOS: `./scripts/run-cli.sh`
+   * Windows: `./scripts/run-cli.ps1`
 
 3. Terminal C (client 2, unique username):
 
-   - Linux/macOS: `CLI_USERNAME=second-user ./scripts/run-cli.sh`
-   - Windows: `$env:CLI_USERNAME='second-user'; ./scripts/run-cli.ps1`
+   * Linux/macOS: `CLI_USERNAME=second-user ./scripts/run-cli.sh`
+   * Windows: `$env:CLI_USERNAME='second-user'; ./scripts/run-cli.ps1`
 
 Default URL is `http://127.0.0.1:8443`.
 
@@ -114,15 +124,16 @@ Default URL is `http://127.0.0.1:8443`.
 #### PC-1 (server host)
 
 1. Find PC-1 LAN IP (example: `192.168.1.42`).
+
 2. Start server bound to all interfaces:
 
-   - Linux/macOS:
+   * Linux/macOS:
 
      ```bash
      ./scripts/launch-lan-server.sh 192.168.1.42 8443
      ```
 
-   - Windows:
+   * Windows:
 
      ```powershell
      ./scripts/launch-lan-server.ps1 192.168.1.42 8443
@@ -132,13 +143,13 @@ Default URL is `http://127.0.0.1:8443`.
 
 #### PC-2 (remote client)
 
-- Linux/macOS:
+* Linux/macOS:
 
   ```bash
   ./scripts/run-remote-client.sh http://192.168.1.42:8443 remote-user
   ```
 
-- Windows:
+* Windows:
 
   ```powershell
   ./scripts/run-remote-client.ps1 http://192.168.1.42:8443 remote-user
@@ -146,19 +157,21 @@ Default URL is `http://127.0.0.1:8443`.
 
 ## Environment variables used by scripts
 
-- `SERVER_BIND` (default `127.0.0.1:8443`): server bind address.
-- `SERVER_PUBLIC_URL` (default `http://127.0.0.1:8443`): URL clients use.
-- `DATABASE_URL` (default `sqlite://./data/server.db`).
-- `CLI_USERNAME` (default `local-user`).
-- `CLIENT1_USERNAME` / `CLIENT2_USERNAME`: used by `test-local-stack.*`.
+* `SERVER_BIND` (default `127.0.0.1:8443`): server bind address.
+* `SERVER_PUBLIC_URL` (default `http://127.0.0.1:8443`): URL clients use.
+* `DATABASE_URL` (default `sqlite://./data/server.db`).
+* `CLI_USERNAME` (default `local-user`).
+* `CLIENT1_USERNAME` / `CLIENT2_USERNAME`: used by `test-local-stack.*`.
 
 Variables can be set in `.env` (loaded by scripts) or inline in terminal.
 
 ## Developer helpers
 
-- `just server` / `make server`
-- `just gui` / `make gui`
-- `just cli` / `make cli`
-- `just tools` / `make tools`
-- `just test-local-stack` / `make test-local-stack`
-- `just dev` / `make dev` (starts server)
+* `just server` / `make server`
+* `just gui` / `make gui`
+* `just cli` / `make cli`
+* `just tools` / `make tools`
+* `just test-local-stack` / `make test-local-stack`
+* `just dev` / `make dev` (starts server)
+
+```
