@@ -1,4 +1,5 @@
 use anyhow::Result;
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use shared::{
@@ -77,7 +78,7 @@ impl<C: CryptoProvider> CommunityClient<C> {
         let ciphertext = self.crypto.encrypt_message(plaintext.as_bytes());
         ClientRequest::SendMessage {
             channel_id,
-            ciphertext_b64: base64::encode(ciphertext),
+            ciphertext_b64: STANDARD.encode(ciphertext),
         }
     }
 
