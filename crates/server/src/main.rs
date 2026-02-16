@@ -18,7 +18,7 @@ use shared::{
 };
 use storage::Storage;
 use tokio::sync::broadcast;
-use tracing::info;
+use tracing::{error, info};
 
 mod config;
 

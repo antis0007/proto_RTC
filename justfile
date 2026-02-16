@@ -12,6 +12,9 @@ tools:
 
 dev: server
 
+test-local-stack:
+    bash scripts/test-local-stack.sh
+
 test:
     cargo test --workspace --all-targets
 
