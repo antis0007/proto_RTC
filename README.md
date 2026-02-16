@@ -27,55 +27,138 @@ The split keeps our server as the **control plane** and LiveKit as the **media p
 
 See docs in `docs/` for details.
 
-## Quick Start (Local)
+## Prerequisites (all platforms)
 
-1. Copy the sample environment file and adjust values if needed:
+1. Install Rust (stable) and Cargo: <https://rustup.rs>
+2. Verify toolchain:
 
-```bash
-cp .env.example .env
-```
+   ```bash
+   cargo --version
+   rustc --version
+   ```
 
-2. Start the server (creates `./data` and `./logs` automatically):
+3. From the repository root, create a local env file:
 
-```bash
-./scripts/run-server.sh
-# Windows PowerShell: ./scripts/run-server.ps1
-```
+   ```bash
+   cp .env.example .env
+   ```
 
-3. Start clients in separate terminals:
+   On Windows PowerShell:
 
-```bash
-./scripts/run-cli.sh
-./scripts/run-gui.sh
-```
+   ```powershell
+   Copy-Item .env.example .env
+   ```
 
-### One-PC workflow (server + two clients)
+## Script map (no ambiguity)
 
-- Terminal 1: `./scripts/run-server.sh`
-- Terminal 2: `./scripts/run-cli.sh`
-- Terminal 3: `./scripts/run-cli.sh -- --username second-user`
+Use **bash scripts (`.sh`) on Linux/macOS**, and **PowerShell scripts (`.ps1`) on Windows**.
 
-Defaults connect clients to `http://127.0.0.1:8443`.
+| Purpose | Linux/macOS | Windows PowerShell |
+|---|---|---|
+| Start server (foreground) | `./scripts/run-server.sh` | `./scripts/run-server.ps1` |
+| Start client (foreground) | `./scripts/run-cli.sh` | `./scripts/run-cli.ps1` |
+| Start GUI (if available) | `./scripts/run-gui.sh` | `./scripts/run-gui.ps1` |
+| Start tools app | `./scripts/run-tools.sh` | `./scripts/run-tools.ps1` |
+| LAN host server helper | `./scripts/launch-lan-server.sh <LAN_IP> [PORT]` | `./scripts/launch-lan-server.ps1 <LAN_IP> [PORT]` |
+| Remote client helper | `./scripts/run-remote-client.sh <SERVER_URL> [USERNAME]` | `./scripts/run-remote-client.ps1 <SERVER_URL> [USERNAME]` |
+| One-machine smoke test (server + 2 clients) | `./scripts/test-local-stack.sh` | `./scripts/test-local-stack.ps1` |
 
-### Two-PC LAN workflow
+## Launch workflows
 
-On the server machine:
+### A) One computer: server + 2 clients (automated smoke test)
 
-```bash
-SERVER_BIND=0.0.0.0:8443 SERVER_PUBLIC_URL=http://<LAN_IP>:8443 ./scripts/run-server.sh
-```
+This is the fastest reproducible test path.
 
-On each client machine:
+- Linux/macOS:
 
-```bash
-SERVER_PUBLIC_URL=http://<LAN_IP>:8443 ./scripts/run-cli.sh
-```
+  ```bash
+  ./scripts/test-local-stack.sh
+  ```
 
-Allow inbound TCP port `8443` in your firewall.
+- Windows PowerShell:
 
-### Developer helpers
+  ```powershell
+  ./scripts/test-local-stack.ps1
+  ```
+
+What it does:
+- starts the server,
+- waits for `GET /healthz`,
+- runs client #1 and client #2 with unique usernames,
+- writes logs to `logs/test-local-*.log`,
+- stops the server process.
+
+### B) One computer: manual server + clients (separate terminals)
+
+Use this when you want interactive control.
+
+1. Terminal A (server):
+
+   - Linux/macOS: `./scripts/run-server.sh`
+   - Windows: `./scripts/run-server.ps1`
+
+2. Terminal B (client 1):
+
+   - Linux/macOS: `./scripts/run-cli.sh`
+   - Windows: `./scripts/run-cli.ps1`
+
+3. Terminal C (client 2, unique username):
+
+   - Linux/macOS: `CLI_USERNAME=second-user ./scripts/run-cli.sh`
+   - Windows: `$env:CLI_USERNAME='second-user'; ./scripts/run-cli.ps1`
+
+Default URL is `http://127.0.0.1:8443`.
+
+### C) Two computers: server on PC-1, client on PC-2
+
+#### PC-1 (server host)
+
+1. Find PC-1 LAN IP (example: `192.168.1.42`).
+2. Start server bound to all interfaces:
+
+   - Linux/macOS:
+
+     ```bash
+     ./scripts/launch-lan-server.sh 192.168.1.42 8443
+     ```
+
+   - Windows:
+
+     ```powershell
+     ./scripts/launch-lan-server.ps1 192.168.1.42 8443
+     ```
+
+3. Open inbound TCP port `8443` in firewall.
+
+#### PC-2 (remote client)
+
+- Linux/macOS:
+
+  ```bash
+  ./scripts/run-remote-client.sh http://192.168.1.42:8443 remote-user
+  ```
+
+- Windows:
+
+  ```powershell
+  ./scripts/run-remote-client.ps1 http://192.168.1.42:8443 remote-user
+  ```
+
+## Environment variables used by scripts
+
+- `SERVER_BIND` (default `127.0.0.1:8443`): server bind address.
+- `SERVER_PUBLIC_URL` (default `http://127.0.0.1:8443`): URL clients use.
+- `DATABASE_URL` (default `sqlite://./data/server.db`).
+- `CLI_USERNAME` (default `local-user`).
+- `CLIENT1_USERNAME` / `CLIENT2_USERNAME`: used by `test-local-stack.*`.
+
+Variables can be set in `.env` (loaded by scripts) or inline in terminal.
+
+## Developer helpers
 
 - `just server` / `make server`
 - `just gui` / `make gui`
 - `just cli` / `make cli`
+- `just tools` / `make tools`
+- `just test-local-stack` / `make test-local-stack`
 - `just dev` / `make dev` (starts server)
