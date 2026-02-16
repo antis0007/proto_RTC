@@ -242,7 +242,7 @@ fn visuals_for_theme(theme: ThemeSettings) -> egui::Visuals {
     visuals.widgets.active.bg_fill = theme.accent_color;
     visuals.widgets.hovered.bg_fill = theme.accent_color.gamma_multiply(0.85);
 
-    let radius = theme.panel_rounding;
+    let radius = f32::from(theme.panel_rounding);
     visuals.widgets.noninteractive.rounding = egui::Rounding::same(radius);
     visuals.widgets.inactive.rounding = egui::Rounding::same(radius);
     visuals.widgets.hovered.rounding = egui::Rounding::same(radius);
