@@ -27,12 +27,55 @@ The split keeps our server as the **control plane** and LiveKit as the **media p
 
 See docs in `docs/` for details.
 
-## Quick start
+## Quick Start (Local)
+
+1. Copy the sample environment file and adjust values if needed:
 
 ```bash
-cargo build
-cargo test
-cargo run -p server
+cp .env.example .env
 ```
 
-Or use `make dev` / `just dev`.
+2. Start the server (creates `./data` and `./logs` automatically):
+
+```bash
+./scripts/run-server.sh
+# Windows PowerShell: ./scripts/run-server.ps1
+```
+
+3. Start clients in separate terminals:
+
+```bash
+./scripts/run-cli.sh
+./scripts/run-gui.sh
+```
+
+### One-PC workflow (server + two clients)
+
+- Terminal 1: `./scripts/run-server.sh`
+- Terminal 2: `./scripts/run-cli.sh`
+- Terminal 3: `./scripts/run-cli.sh -- --username second-user`
+
+Defaults connect clients to `http://127.0.0.1:8443`.
+
+### Two-PC LAN workflow
+
+On the server machine:
+
+```bash
+SERVER_BIND=0.0.0.0:8443 SERVER_PUBLIC_URL=http://<LAN_IP>:8443 ./scripts/run-server.sh
+```
+
+On each client machine:
+
+```bash
+SERVER_PUBLIC_URL=http://<LAN_IP>:8443 ./scripts/run-cli.sh
+```
+
+Allow inbound TCP port `8443` in your firewall.
+
+### Developer helpers
+
+- `just server` / `make server`
+- `just gui` / `make gui`
+- `just cli` / `make cli`
+- `just dev` / `make dev` (starts server)
