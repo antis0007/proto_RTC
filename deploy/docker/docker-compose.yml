@@ -1,0 +1,28 @@
+services:
+  community-server:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    environment:
+      APP__BIND_ADDR: 0.0.0.0:8080
+      APP__DATABASE_URL: sqlite:///data/community.db
+      APP__LIVEKIT_API_KEY: devkey
+      APP__LIVEKIT_API_SECRET: devsecret
+      APP__LIVEKIT_URL: ws://livekit:7880
+    ports:
+      - "8080:8080"
+    volumes:
+      - community-data:/data
+    depends_on:
+      - livekit
+
+  livekit:
+    image: livekit/livekit-server:latest
+    command: ["--dev", "--bind", "0.0.0.0"]
+    ports:
+      - "7880:7880"
+      - "7881:7881"
+    # For production: provide full livekit.yaml, TLS, TURN, and API keys.
+
+volumes:
+  community-data:
