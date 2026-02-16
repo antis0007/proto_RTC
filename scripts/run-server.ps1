@@ -1,3 +1,8 @@
+param(
+  [Parameter(ValueFromRemainingArguments = $true)]
+  [string[]]$ExtraArgs
+)
+
 $ErrorActionPreference = 'Stop'
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -9,10 +14,11 @@ New-Item -ItemType Directory -Force -Path 'logs' | Out-Null
 
 if (Test-Path '.env') {
   Get-Content '.env' | ForEach-Object {
-    if ($_ -match '^\s*#' -or $_ -match '^\s*$') { continue }
-    $parts = $_ -split '=', 2
-    if ($parts.Count -eq 2) {
-      [System.Environment]::SetEnvironmentVariable($parts[0].Trim(), $parts[1].Trim().Trim('"'), 'Process')
+    if ($_ -notmatch '^\s*#' -and $_ -notmatch '^\s*$') {
+      $parts = $_ -split '=', 2
+      if ($parts.Count -eq 2) {
+        [System.Environment]::SetEnvironmentVariable($parts[0].Trim(), $parts[1].Trim().Trim('"'), 'Process')
+      }
     }
   }
 }
@@ -25,4 +31,4 @@ if (-not $env:APP__LIVEKIT_API_KEY) { $env:APP__LIVEKIT_API_KEY = $(if ($env:LIV
 if (-not $env:APP__LIVEKIT_API_SECRET) { $env:APP__LIVEKIT_API_SECRET = $(if ($env:LIVEKIT_API_SECRET) { $env:LIVEKIT_API_SECRET } else { 'devsecret' }) }
 if (-not $env:APP__LIVEKIT_URL -and $env:LIVEKIT_URL) { $env:APP__LIVEKIT_URL = $env:LIVEKIT_URL }
 
-cargo run -p server -- @args
+cargo run -p server -- @ExtraArgs
