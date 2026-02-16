@@ -1,0 +1,22 @@
+$ErrorActionPreference = 'Stop'
+
+$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$RepoRoot = (Resolve-Path (Join-Path $ScriptDir '..')).Path
+Set-Location $RepoRoot
+
+New-Item -ItemType Directory -Force -Path 'data' | Out-Null
+New-Item -ItemType Directory -Force -Path 'logs' | Out-Null
+
+if (Test-Path '.env') {
+  Get-Content '.env' | ForEach-Object {
+    if ($_ -match '^\s*#' -or $_ -match '^\s*$') { continue }
+    $parts = $_ -split '=', 2
+    if ($parts.Count -eq 2) {
+      [System.Environment]::SetEnvironmentVariable($parts[0].Trim(), $parts[1].Trim().Trim('"'), 'Process')
+    }
+  }
+}
+
+if (-not $env:DATABASE_URL) { $env:DATABASE_URL = 'sqlite://./data/server.db' }
+
+cargo run -p tools -- --database-url $env:DATABASE_URL @args
