@@ -13,16 +13,16 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    CreateGuild {
+    Guild {
         owner_user_id: i64,
         name: String,
     },
-    CreateChannel {
+    Channel {
         guild_id: i64,
         name: String,
         kind: String,
     },
-    CreateInvite {
+    Invite {
         guild_id: i64,
     },
 }
@@ -33,7 +33,7 @@ async fn main() -> Result<()> {
     let storage = Storage::new(&cli.database_url).await?;
 
     match cli.command {
-        Command::CreateGuild {
+        Command::Guild {
             owner_user_id,
             name,
         } => {
@@ -42,7 +42,7 @@ async fn main() -> Result<()> {
                 .await?;
             println!("created guild_id={}", guild_id.0);
         }
-        Command::CreateChannel {
+        Command::Channel {
             guild_id,
             name,
             kind,
@@ -57,7 +57,7 @@ async fn main() -> Result<()> {
                 .await?;
             println!("created channel_id={}", channel_id.0);
         }
-        Command::CreateInvite { guild_id } => {
+        Command::Invite { guild_id } => {
             println!("placeholder invite for guild_id={guild_id}: INVITE-TODO");
         }
     }
