@@ -10,11 +10,11 @@ use axum::{
 };
 use livekit_integration::LiveKitConfig;
 use serde::{Deserialize, Serialize};
-use server_api::{list_channels, list_guilds, request_livekit_token, send_message, ApiContext};
+use server_api::{list_channels, list_guilds, send_message, ApiContext};
 use shared::{
     domain::{ChannelId, FileId, GuildId, UserId},
     error::{ApiError, ErrorCode},
-    protocol::{ClientRequest, ServerEvent},
+    protocol::ServerEvent,
 };
 use storage::Storage;
 use tokio::sync::broadcast;
@@ -52,6 +52,19 @@ struct WsQuery {
     user_id: i64,
 }
 
+#[derive(Debug, Deserialize)]
+struct UserQuery {
+    user_id: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct SendMessageRequest {
+    user_id: i64,
+    guild_id: i64,
+    channel_id: i64,
+    ciphertext_b64: String,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt().with_env_filter("info").init();
@@ -85,6 +98,9 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/healthz", get(healthz))
         .route("/login", post(login))
+        .route("/guilds", get(http_list_guilds))
+        .route("/guilds/:guild_id/channels", get(http_list_channels))
+        .route("/messages", post(http_send_message))
         .route("/files/upload", post(upload_file))
         .route("/files/:file_id", get(download_file))
         .route("/ws", get(ws_handler))
@@ -180,7 +196,7 @@ async fn ws_handler(
 async fn ws_connection(
     state: Arc<AppState>,
     socket: axum::extract::ws::WebSocket,
-    user_id: UserId,
+    _user_id: UserId,
 ) {
     use axum::extract::ws::Message;
     use futures::{SinkExt, StreamExt};
@@ -219,50 +235,40 @@ async fn ws_connection(
     send_task.abort();
 }
 
-async fn handle_ws_request(
-    state: &AppState,
-    user_id: UserId,
-    req: ClientRequest,
-) -> Option<ServerEvent> {
-    match req {
-        ClientRequest::ListGuilds => {
-            let guilds = list_guilds(&state.api, user_id).await.ok()?;
-            guilds
-                .first()
-                .cloned()
-                .map(|guild| ServerEvent::GuildUpdated { guild })
-        }
-        ClientRequest::ListChannels { guild_id } => {
-            let channels = list_channels(&state.api, user_id, guild_id).await.ok()?;
-            channels
-                .first()
-                .cloned()
-                .map(|channel| ServerEvent::ChannelUpdated { channel })
-        }
-        ClientRequest::SendMessage {
-            channel_id,
-            ciphertext_b64,
-        } => send_message(&state.api, user_id, GuildId(1), channel_id, &ciphertext_b64)
-            .await
-            .ok(),
-        ClientRequest::RequestLiveKitToken {
-            guild_id,
-            channel_id,
-            can_publish_mic,
-            can_publish_screen,
-        } => request_livekit_token(
-            &state.api,
-            user_id,
-            guild_id,
-            channel_id,
-            can_publish_mic,
-            can_publish_screen,
-        )
+async fn http_list_guilds(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<UserQuery>,
+) -> Result<Json<Vec<shared::protocol::GuildSummary>>, (StatusCode, Json<ApiError>)> {
+    let guilds = list_guilds(&state.api, UserId(q.user_id))
         .await
-        .ok(),
-        _ => Some(ServerEvent::Error(ApiError::new(
-            ErrorCode::Validation,
-            "request variant not yet handled in websocket transport",
-        ))),
-    }
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(e)))?;
+    Ok(Json(guilds))
+}
+
+async fn http_list_channels(
+    State(state): State<Arc<AppState>>,
+    Path(guild_id): Path<i64>,
+    Query(q): Query<UserQuery>,
+) -> Result<Json<Vec<shared::protocol::ChannelSummary>>, (StatusCode, Json<ApiError>)> {
+    let channels = list_channels(&state.api, UserId(q.user_id), GuildId(guild_id))
+        .await
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(e)))?;
+    Ok(Json(channels))
+}
+
+async fn http_send_message(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<SendMessageRequest>,
+) -> Result<Json<ServerEvent>, (StatusCode, Json<ApiError>)> {
+    let event = send_message(
+        &state.api,
+        UserId(req.user_id),
+        GuildId(req.guild_id),
+        ChannelId(req.channel_id),
+        &req.ciphertext_b64,
+    )
+    .await
+    .map_err(|e| (StatusCode::BAD_REQUEST, Json(e)))?;
+    let _ = state.events.send(event.clone());
+    Ok(Json(event))
 }

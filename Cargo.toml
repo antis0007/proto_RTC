@@ -7,6 +7,7 @@ members = [
   "crates/server",
   "crates/client_core",
   "apps/desktop",
+  "apps/desktop_gui",
   "apps/tools",
 ]
 resolver = "2"
