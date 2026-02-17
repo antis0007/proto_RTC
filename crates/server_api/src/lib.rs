@@ -1,5 +1,5 @@
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use livekit_integration::{mint_token, room_name_for_voice_channel, LiveKitConfig};
 use serde::{Deserialize, Serialize};
 use shared::{
@@ -49,6 +49,7 @@ pub struct MlsWelcomeResponse {
     pub guild_id: i64,
     pub channel_id: i64,
     pub welcome_b64: String,
+    pub consumed_at: DateTime<Utc>,
 }
 
 pub fn mls_key_packages_route() -> &'static str {

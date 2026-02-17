@@ -116,26 +116,36 @@ const MAX_FILENAME_BYTES: usize = 180;
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt().with_env_filter("info").init();
 
+    info!("loading server settings");
     let settings = load_settings();
+    info!(bind_addr = %settings.server_bind, "server settings parsed");
     if settings.server_bind.trim().is_empty() {
+        error!("SERVER_BIND / bind_addr must not be empty");
         anyhow::bail!("SERVER_BIND / bind_addr must not be empty");
     }
+
     let database_url = prepare_database_url(&settings.database_url).map_err(|error| {
         error!(raw_database_url = %settings.database_url, %error, "database url preparation failed");
         error
     })?;
+    info!(%database_url, "database url prepared");
+
     let storage = Storage::new(&database_url).await.map_err(|error| {
         error!(
             %database_url,
             %error,
-            "failed to open SQLite database; verify parent directory exists and permissions are correct"
+            "database initialization/migrations failed; verify parent directory exists and permissions are correct"
         );
         error
     })?;
+    info!("database initialized and migrations applied");
+
     storage.health_check().await.map_err(|error| {
         error!(%database_url, %error, "database health check failed after initialization");
         error
     })?;
+    info!("database health check passed");
+
     let api = ApiContext {
         storage,
         livekit: LiveKitConfig {
@@ -149,24 +159,35 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState { api, events };
     let app = build_router(Arc::new(state));
 
-    for route in [
+    let routes = [
         "/healthz",
         "/messages",
         "/channels/:channel_id/messages",
         "/files/upload",
         "/files/:file_id",
+        mls_key_packages_route(),
         mls_welcome_route(),
-    ] {
+    ];
+    for route in routes {
         info!(%route, "route registered");
     }
+    info!("router readiness checks complete");
 
     let addr: SocketAddr = settings.server_bind.parse().map_err(|error| {
         error!(server_bind = %settings.server_bind, %error, "invalid server bind address");
         error
     })?;
+
+    let listener = tokio::net::TcpListener::bind(addr).await.map_err(|error| {
+        error!(%addr, %error, "failed to bind tcp listener");
+        error
+    })?;
     info!(%addr, "server listening");
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+
+    axum::serve(listener, app).await.map_err(|error| {
+        error!(%addr, %error, "server terminated unexpectedly");
+        error
+    })?;
     Ok(())
 }
 
@@ -443,23 +464,9 @@ async fn upload_key_package(
         ));
     }
 
-    state
-        .api
-        .storage
-        .membership_status(GuildId(q.guild_id), UserId(q.user_id))
+    ensure_active_membership_in_guild(&state.api, UserId(q.user_id), GuildId(q.guild_id))
         .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiError::new(ErrorCode::Internal, e.to_string())),
-            )
-        })?
-        .ok_or_else(|| {
-            (
-                StatusCode::FORBIDDEN,
-                Json(ApiError::new(ErrorCode::Forbidden, "user is not a member")),
-            )
-        })?;
+        .map_err(|error| (api_error_status(&error), Json(error)))?;
 
     let key_package_id = state
         .api
@@ -480,6 +487,10 @@ async fn fetch_key_package(
     State(state): State<Arc<AppState>>,
     Query(q): Query<MlsKeyPackageQuery>,
 ) -> Result<Json<KeyPackageResponse>, (StatusCode, Json<ApiError>)> {
+    ensure_active_membership_in_guild(&state.api, UserId(q.user_id), GuildId(q.guild_id))
+        .await
+        .map_err(|error| (api_error_status(&error), Json(error)))?;
+
     let (key_package_id, key_package_bytes) = state
         .api
         .storage
@@ -519,7 +530,7 @@ async fn fetch_pending_welcome(
     .await
     .map_err(|error| (api_error_status(&error), Json(error)))?;
 
-    let welcome_bytes = state
+    let consumed_welcome = state
         .api
         .storage
         .load_and_consume_pending_welcome(
@@ -548,7 +559,8 @@ async fn fetch_pending_welcome(
         user_id: q.user_id,
         guild_id: q.guild_id,
         channel_id: q.channel_id,
-        welcome_b64: STANDARD.encode(welcome_bytes),
+        welcome_b64: STANDARD.encode(consumed_welcome.welcome_bytes),
+        consumed_at: consumed_welcome.consumed_at,
     }))
 }
 
@@ -557,6 +569,16 @@ async fn store_pending_welcome(
     Query(q): Query<StorePendingWelcomeQuery>,
     body: Bytes,
 ) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    if body.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError::new(
+                ErrorCode::Validation,
+                "pending welcome body cannot be empty",
+            )),
+        ));
+    }
+
     ensure_active_membership_in_channel(
         &state.api,
         UserId(q.user_id),
@@ -835,7 +857,7 @@ mod tests {
 
     #[tokio::test]
     async fn file_upload_and_download_requires_membership() {
-        let (app, _storage, user_id, guild_id, channel_id) = test_app().await;
+        let (app, storage, user_id, guild_id, channel_id) = test_app().await;
         let upload = Request::post(format!(
             "/files/upload?user_id={user_id}&guild_id={guild_id}&channel_id={channel_id}&filename=test.bin"
         ))
@@ -844,10 +866,37 @@ mod tests {
         let response = app.clone().oneshot(upload).await.expect("upload response");
         assert_eq!(response.status(), StatusCode::OK);
 
-        let download = Request::get("/files/1?user_id=999")
+        let authorized_download = Request::get(format!("/files/1?user_id={user_id}"))
             .body(Body::empty())
             .expect("request");
-        let response = app.oneshot(download).await.expect("download response");
+        let authorized = app
+            .clone()
+            .oneshot(authorized_download)
+            .await
+            .expect("authorized download");
+        assert_eq!(authorized.status(), StatusCode::OK);
+
+        let outsider = storage.create_user("outsider-file").await.expect("user");
+        let unauthorized_upload = Request::post(format!(
+            "/files/upload?user_id={}&guild_id={guild_id}&channel_id={channel_id}&filename=test.bin",
+            outsider.0
+        ))
+        .body(Body::from("ciphertext"))
+        .expect("request");
+        let unauthorized_upload_response = app
+            .clone()
+            .oneshot(unauthorized_upload)
+            .await
+            .expect("unauthorized upload response");
+        assert_eq!(unauthorized_upload_response.status(), StatusCode::FORBIDDEN);
+
+        let unauthorized_download = Request::get(format!("/files/1?user_id={}", outsider.0))
+            .body(Body::empty())
+            .expect("request");
+        let response = app
+            .oneshot(unauthorized_download)
+            .await
+            .expect("download response");
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
@@ -905,6 +954,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn key_package_endpoints_require_active_membership() {
+        let (app, storage, user_id, guild_id, _channel_id) = test_app().await;
+
+        let upload = Request::post(format!(
+            "/mls/key_packages?user_id={user_id}&guild_id={guild_id}"
+        ))
+        .body(Body::from("kp"))
+        .expect("request");
+        let upload_response = app.clone().oneshot(upload).await.expect("response");
+        assert_eq!(upload_response.status(), StatusCode::OK);
+
+        let fetch = Request::get(format!(
+            "/mls/key_packages?user_id={user_id}&guild_id={guild_id}"
+        ))
+        .body(Body::empty())
+        .expect("request");
+        let fetch_response = app.clone().oneshot(fetch).await.expect("response");
+        assert_eq!(fetch_response.status(), StatusCode::OK);
+
+        storage
+            .add_membership(
+                GuildId(guild_id),
+                UserId(user_id),
+                shared::domain::Role::Member,
+                true,
+                false,
+            )
+            .await
+            .expect("ban user");
+
+        let banned_upload = Request::post(format!(
+            "/mls/key_packages?user_id={user_id}&guild_id={guild_id}"
+        ))
+        .body(Body::from("kp2"))
+        .expect("request");
+        let banned_upload_response = app.clone().oneshot(banned_upload).await.expect("response");
+        assert_eq!(banned_upload_response.status(), StatusCode::FORBIDDEN);
+
+        let banned_fetch = Request::get(format!(
+            "/mls/key_packages?user_id={user_id}&guild_id={guild_id}"
+        ))
+        .body(Body::empty())
+        .expect("request");
+        let banned_fetch_response = app.oneshot(banned_fetch).await.expect("response");
+        assert_eq!(banned_fetch_response.status(), StatusCode::FORBIDDEN);
+    }
+    #[tokio::test]
     async fn fetch_pending_welcome_succeeds_and_consumes_on_read() {
         let (app, storage, user_id, guild_id, channel_id) = test_app().await;
         let welcome_bytes = b"welcome-payload";
@@ -934,6 +1030,7 @@ mod tests {
         assert_eq!(dto.user_id, user_id);
         assert_eq!(dto.guild_id, guild_id);
         assert_eq!(dto.channel_id, channel_id);
+        assert!(dto.consumed_at.timestamp() > 0);
         assert_eq!(
             STANDARD.decode(dto.welcome_b64).expect("base64"),
             welcome_bytes
@@ -989,6 +1086,7 @@ mod tests {
             .await
             .expect("body");
         let dto: MlsWelcomeResponse = serde_json::from_slice(&body).expect("json");
+        assert!(dto.consumed_at.timestamp() > 0);
         assert_eq!(
             STANDARD.decode(dto.welcome_b64).expect("base64"),
             b"welcome-later"

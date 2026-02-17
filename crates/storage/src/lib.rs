@@ -49,6 +49,12 @@ pub struct StoredFile {
 }
 
 #[derive(Debug, Clone)]
+pub struct ConsumedPendingWelcome {
+    pub welcome_bytes: Vec<u8>,
+    pub consumed_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
 pub struct StoredMember {
     pub user_id: UserId,
     pub username: String,
@@ -438,7 +444,7 @@ impl Storage {
         guild_id: GuildId,
         channel_id: ChannelId,
         user_id: UserId,
-    ) -> Result<Option<Vec<u8>>> {
+    ) -> Result<Option<ConsumedPendingWelcome>> {
         let row = sqlx::query(
             "UPDATE pending_welcomes
              SET consumed_at = CURRENT_TIMESTAMP
@@ -449,7 +455,7 @@ impl Storage {
                 ORDER BY id DESC
                 LIMIT 1
              )
-             RETURNING welcome_bytes",
+             RETURNING welcome_bytes, consumed_at",
         )
         .bind(guild_id.0)
         .bind(channel_id.0)
@@ -457,7 +463,10 @@ impl Storage {
         .fetch_optional(&self.pool)
         .await?;
 
-        Ok(row.map(|r| r.get::<Vec<u8>, _>(0)))
+        Ok(row.map(|r| ConsumedPendingWelcome {
+            welcome_bytes: r.get::<Vec<u8>, _>(0),
+            consumed_at: r.get::<DateTime<Utc>, _>(1),
+        }))
     }
 }
 
@@ -753,7 +762,8 @@ mod tests {
             .await
             .expect("load welcome")
             .expect("welcome exists");
-        assert_eq!(welcome, b"welcome-v2");
+        assert_eq!(welcome.welcome_bytes, b"welcome-v2");
+        assert!(welcome.consumed_at <= Utc::now());
     }
 
     #[tokio::test]
@@ -778,7 +788,12 @@ mod tests {
             .load_and_consume_pending_welcome(guild, channel, user)
             .await
             .expect("first load");
-        assert_eq!(first.as_deref(), Some(b"single-use".as_ref()));
+        assert_eq!(
+            first
+                .as_ref()
+                .map(|welcome| welcome.welcome_bytes.as_slice()),
+            Some(b"single-use".as_ref())
+        );
 
         let second = storage
             .load_and_consume_pending_welcome(guild, channel, user)
@@ -844,28 +859,67 @@ mod tests {
             .await
             .expect("load target")
             .expect("target exists");
-        assert_eq!(welcome, b"target");
+        assert_eq!(welcome.welcome_bytes, b"target");
 
         let other_user = storage
             .load_and_consume_pending_welcome(guild_a, channel_a1, bob)
             .await
             .expect("load other user")
             .expect("other user exists");
-        assert_eq!(other_user, b"other-user");
+        assert_eq!(other_user.welcome_bytes, b"other-user");
 
         let other_channel = storage
             .load_and_consume_pending_welcome(guild_a, channel_a2, alice)
             .await
             .expect("load other channel")
             .expect("other channel exists");
-        assert_eq!(other_channel, b"other-channel");
+        assert_eq!(other_channel.welcome_bytes, b"other-channel");
 
         let other_guild = storage
             .load_and_consume_pending_welcome(guild_b, channel_b1, alice)
             .await
             .expect("load other guild")
             .expect("other guild exists");
-        assert_eq!(other_guild, b"other-guild");
+        assert_eq!(other_guild.welcome_bytes, b"other-guild");
+    }
+
+    #[tokio::test]
+    async fn consuming_pending_welcome_is_race_safe() {
+        let storage = Storage::new("sqlite::memory:").await.expect("db");
+        let user = storage.create_user("race-user").await.expect("user");
+        let guild = storage
+            .create_guild("race-guild", user)
+            .await
+            .expect("guild");
+        let channel = storage
+            .create_channel(guild, "race-channel", ChannelKind::Text)
+            .await
+            .expect("channel");
+
+        storage
+            .insert_pending_welcome(guild, channel, user, b"race-welcome")
+            .await
+            .expect("insert welcome");
+
+        let storage_a = storage.clone();
+        let storage_b = storage.clone();
+        let (left, right) = tokio::join!(
+            async move {
+                storage_a
+                    .load_and_consume_pending_welcome(guild, channel, user)
+                    .await
+                    .expect("left consume")
+            },
+            async move {
+                storage_b
+                    .load_and_consume_pending_welcome(guild, channel, user)
+                    .await
+                    .expect("right consume")
+            }
+        );
+
+        let consumed = [left, right].into_iter().flatten().count();
+        assert_eq!(consumed, 1, "exactly one fetch should consume the welcome");
     }
 
     #[tokio::test]

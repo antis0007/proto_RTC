@@ -79,6 +79,8 @@ pub struct WelcomeResponse {
     pub channel_id: ChannelId,
     pub user_id: UserId,
     pub welcome_b64: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consumed_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
