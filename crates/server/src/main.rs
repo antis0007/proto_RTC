@@ -22,7 +22,7 @@ use server_api::{
 use shared::{
     domain::{ChannelId, ChannelKind, FileId, GuildId, UserId},
     error::{ApiError, ErrorCode},
-    protocol::{AttachmentPayload, KeyPackageResponse, ServerEvent, UploadKeyPackageResponse},
+    protocol::{AttachmentPayload, ServerEvent},
 };
 use storage::Storage;
 use tokio::sync::broadcast;
