@@ -931,6 +931,25 @@ impl DesktopGuiApp {
         human_readable_bytes(bytes)
     }
 
+    fn try_send_current_composer(&mut self, response: &egui::Response) {
+        let has_text = !self.composer.trim().is_empty();
+        let has_attachment = self.pending_attachment.is_some();
+        if has_text || has_attachment {
+            let text = self.composer.trim_end_matches('\n').to_string();
+            self.composer.clear();
+            let attachment_path = self.pending_attachment.take();
+            queue_command(
+                &self.cmd_tx,
+                BackendCommand::SendMessage {
+                    text,
+                    attachment_path,
+                },
+                &mut self.status,
+            );
+            response.request_focus();
+        }
+    }
+
     fn copy_image_to_clipboard(&mut self, bytes: &[u8], label: &str) {
         match decode_image_for_clipboard(bytes)
             .and_then(|(rgba, width, height)| write_clipboard_image(&rgba, width, height))
@@ -1541,21 +1560,8 @@ impl DesktopGuiApp {
                         let clicked_send = ui
                             .add_sized([80.0, 72.0], egui::Button::new("⬆ Send"))
                             .clicked();
-                        let has_text = !self.composer.trim().is_empty();
-                        let has_attachment = self.pending_attachment.is_some();
-                        if (send_shortcut || clicked_send) && (has_text || has_attachment) {
-                            let text = self.composer.trim_end_matches('\n').to_string();
-                            self.composer.clear();
-                            let attachment_path = self.pending_attachment.take();
-                            queue_command(
-                                &self.cmd_tx,
-                                BackendCommand::SendMessage {
-                                    text,
-                                    attachment_path,
-                                },
-                                &mut self.status,
-                            );
-                            response.request_focus();
+                        if send_shortcut || clicked_send {
+                            self.try_send_current_composer(&response);
                         }
                     });
                     if let Some(path) = self.pending_attachment.clone() {
@@ -1615,39 +1621,6 @@ impl DesktopGuiApp {
                         }
                         ui.add_space(6.0);
                     }
-
-                    ui.horizontal(|ui| {
-                        if ui.button("📎").on_hover_text("Attach file").clicked() {
-                            self.pending_attachment = rfd::FileDialog::new().pick_file();
-                        }
-                        let response = ui.add_sized(
-                            [ui.available_width() - 130.0, 72.0],
-                            egui::TextEdit::multiline(&mut self.composer).hint_text(
-                                "Message #channel (Enter to send, Shift+Enter for newline)",
-                            ),
-                        );
-                        let send_shortcut = response.has_focus()
-                            && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
-                        let clicked_send = ui
-                            .add_sized([80.0, 72.0], egui::Button::new("⬆ Send"))
-                            .clicked();
-                        let has_text = !self.composer.trim().is_empty();
-                        let has_attachment = self.pending_attachment.is_some();
-                        if (send_shortcut || clicked_send) && (has_text || has_attachment) {
-                            let text = self.composer.trim_end_matches('\n').to_string();
-                            self.composer.clear();
-                            let attachment_path = self.pending_attachment.take();
-                            queue_command(
-                                &self.cmd_tx,
-                                BackendCommand::SendMessage {
-                                    text,
-                                    attachment_path,
-                                },
-                                &mut self.status,
-                            );
-                            response.request_focus();
-                        }
-                    });
                 });
                 if !can_send {
                     ui.centered_and_justified(|ui| {
