@@ -70,6 +70,7 @@ struct ThemeSettings {
     preset: ThemePreset,
     accent_color: egui::Color32,
     panel_rounding: u8,
+    list_row_shading: bool,
 }
 
 impl ThemeSettings {
@@ -78,6 +79,7 @@ impl ThemeSettings {
             preset: ThemePreset::DiscordDark,
             accent_color: egui::Color32::from_rgb(88, 101, 242),
             panel_rounding: 6,
+            list_row_shading: true,
         }
     }
 }
@@ -262,6 +264,10 @@ impl DesktopGuiApp {
                     egui::Slider::new(&mut self.theme.panel_rounding, 0..=16)
                         .text("Panel rounding"),
                 );
+                ui.checkbox(
+                    &mut self.theme.list_row_shading,
+                    "Use shaded backgrounds for guild/channel rows",
+                );
 
                 if ui.button("Reset to Discord default").clicked() {
                     self.theme = ThemeSettings::discord_default();
@@ -437,7 +443,35 @@ impl DesktopGuiApp {
                 }
                 for guild in &self.guilds {
                     let selected = self.selected_guild == Some(guild.guild_id);
-                    if ui.selectable_label(selected, &guild.name).clicked() {
+                    let base_bg = if self.theme.list_row_shading {
+                        ui.visuals().faint_bg_color
+                    } else {
+                        egui::Color32::TRANSPARENT
+                    };
+                    let selected_bg = ui.visuals().selection.bg_fill.gamma_multiply(
+                        if self.theme.list_row_shading {
+                            0.35
+                        } else {
+                            0.22
+                        },
+                    );
+                    let row_fill = if selected { selected_bg } else { base_bg };
+                    let row_stroke = if selected {
+                        egui::Stroke::new(1.0, ui.visuals().selection.bg_fill.gamma_multiply(0.9))
+                    } else if self.theme.list_row_shading {
+                        egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color)
+                    } else {
+                        egui::Stroke::NONE
+                    };
+
+                    let response = egui::Frame::none()
+                        .fill(row_fill)
+                        .stroke(row_stroke)
+                        .rounding(egui::Rounding::same(6.0))
+                        .inner_margin(egui::Margin::symmetric(8.0, 6.0))
+                        .show(ui, |ui| ui.selectable_label(selected, &guild.name))
+                        .inner;
+                    if response.clicked() {
                         self.selected_guild = Some(guild.guild_id);
                         self.selected_channel = None;
                         self.channels.clear();
@@ -449,6 +483,7 @@ impl DesktopGuiApp {
                             &mut self.status,
                         );
                     }
+                    ui.add_space(4.0);
                 }
             });
 
@@ -474,9 +509,45 @@ impl DesktopGuiApp {
                         ChannelKind::Text => "#",
                         ChannelKind::Voice => "🔊",
                     };
-                    let label = format!("{icon} {}", channel.name);
                     let selected = self.selected_channel == Some(channel.channel_id);
-                    if ui.selectable_label(selected, label).clicked() {
+                    let base_bg = if self.theme.list_row_shading {
+                        ui.visuals().faint_bg_color
+                    } else {
+                        egui::Color32::TRANSPARENT
+                    };
+                    let selected_bg = ui.visuals().selection.bg_fill.gamma_multiply(
+                        if self.theme.list_row_shading {
+                            0.35
+                        } else {
+                            0.22
+                        },
+                    );
+                    let row_fill = if selected { selected_bg } else { base_bg };
+                    let row_stroke = if selected {
+                        egui::Stroke::new(1.0, ui.visuals().selection.bg_fill.gamma_multiply(0.9))
+                    } else if self.theme.list_row_shading {
+                        egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color)
+                    } else {
+                        egui::Stroke::NONE
+                    };
+
+                    let response = egui::Frame::none()
+                        .fill(row_fill)
+                        .stroke(row_stroke)
+                        .rounding(egui::Rounding::same(6.0))
+                        .inner_margin(egui::Margin::symmetric(8.0, 6.0))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.add_sized(
+                                    [18.0, 18.0],
+                                    egui::Label::new(egui::RichText::new(icon).monospace()),
+                                );
+                                ui.selectable_label(selected, &channel.name)
+                            })
+                            .inner
+                        })
+                        .inner;
+                    if response.clicked() {
                         self.selected_channel = Some(channel.channel_id);
                         queue_command(
                             &self.cmd_tx,
@@ -486,6 +557,7 @@ impl DesktopGuiApp {
                             &mut self.status,
                         );
                     }
+                    ui.add_space(4.0);
                 }
             });
 
