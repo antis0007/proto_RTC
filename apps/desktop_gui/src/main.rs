@@ -321,15 +321,23 @@ impl eframe::App for DesktopGuiApp {
                 if ui.button("⚙ Settings").clicked() {
                     self.settings_open = true;
                 }
+
+                ui.menu_button("Account", |ui| {
+                    ui.label("Signed in as current user");
+                });
             });
 
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label("Server:");
                 ui.text_edit_singleline(&mut self.server_url);
                 ui.label("Username:");
                 ui.text_edit_singleline(&mut self.username);
+            });
+
+            ui.horizontal_wrapped(|ui| {
                 ui.label("Invite/Password:");
                 ui.text_edit_singleline(&mut self.password_or_invite);
+
                 if ui.button("Login").clicked() {
                     queue_command(
                         &self.cmd_tx,
@@ -341,23 +349,56 @@ impl eframe::App for DesktopGuiApp {
                         &mut self.status,
                     );
                 }
-                if ui.button("Refresh Guilds").clicked() {
-                    queue_command(&self.cmd_tx, BackendCommand::ListGuilds, &mut self.status);
-                }
-                if ui.button("Join Invite").clicked() {
-                    let invite_code = self.password_or_invite.trim().to_string();
-                    if invite_code.is_empty() {
-                        self.status = "Enter an invite code first".to_string();
-                    } else {
-                        queue_command(
-                            &self.cmd_tx,
-                            BackendCommand::JoinWithInvite { invite_code },
-                            &mut self.status,
-                        );
+
+                let constrained = ui.available_width() < 220.0;
+                if constrained {
+                    ui.menu_button("⋯ More", |ui| {
+                        if ui.button("Refresh Guilds").clicked() {
+                            queue_command(
+                                &self.cmd_tx,
+                                BackendCommand::ListGuilds,
+                                &mut self.status,
+                            );
+                            ui.close_menu();
+                        }
+
+                        if ui.button("Join Invite").clicked() {
+                            let invite_code = self.password_or_invite.trim().to_string();
+                            if invite_code.is_empty() {
+                                self.status = "Enter an invite code first".to_string();
+                            } else {
+                                queue_command(
+                                    &self.cmd_tx,
+                                    BackendCommand::JoinWithInvite { invite_code },
+                                    &mut self.status,
+                                );
+                            }
+                            ui.close_menu();
+                        }
+                    });
+                } else {
+                    if ui.button("🔄").on_hover_text("Refresh Guilds").clicked() {
+                        queue_command(&self.cmd_tx, BackendCommand::ListGuilds, &mut self.status);
+                    }
+
+                    if ui.button("➕").on_hover_text("Join Invite").clicked() {
+                        let invite_code = self.password_or_invite.trim().to_string();
+                        if invite_code.is_empty() {
+                            self.status = "Enter an invite code first".to_string();
+                        } else {
+                            queue_command(
+                                &self.cmd_tx,
+                                BackendCommand::JoinWithInvite { invite_code },
+                                &mut self.status,
+                            );
+                        }
                     }
                 }
             });
-            ui.label(&self.status);
+
+            ui.horizontal_wrapped(|ui| {
+                ui.label(&self.status);
+            });
         });
 
         self.show_settings_window(ctx);
