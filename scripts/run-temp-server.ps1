@@ -32,7 +32,8 @@ if (-not $env:SERVER_PUBLIC_URL) { $env:SERVER_PUBLIC_URL = 'http://127.0.0.1:84
 # FIX: avoid sqlite:///C:/... which becomes "/C:/" in some parsers on Windows
 $env:DATABASE_URL = "sqlite:$($env:TEMP_DB)"
 
-if (-not $env:APP__BIND_ADDR) { $env:APP__BIND_ADDR = $env:SERVER_BIND }
+if ($env:SERVER_BIND) { $env:APP__BIND_ADDR = $env:SERVER_BIND }
+elseif (-not $env:APP__BIND_ADDR) { $env:APP__BIND_ADDR = '127.0.0.1:8443' }
 $env:APP__DATABASE_URL = $env:DATABASE_URL
 if (-not $env:APP__LIVEKIT_API_KEY) { $env:APP__LIVEKIT_API_KEY = $(if ($env:LIVEKIT_API_KEY) { $env:LIVEKIT_API_KEY } else { 'devkey' }) }
 if (-not $env:APP__LIVEKIT_API_SECRET) { $env:APP__LIVEKIT_API_SECRET = $(if ($env:LIVEKIT_API_SECRET) { $env:LIVEKIT_API_SECRET } else { 'devsecret' }) }
