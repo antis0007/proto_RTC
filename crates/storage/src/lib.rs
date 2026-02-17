@@ -1,6 +1,10 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use sqlx::{sqlite::SqlitePoolOptions, Pool, Sqlite};
+use sqlx::{
+    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
+    Pool, Sqlite,
+};
+use std::str::FromStr;
 
 use shared::domain::{ChannelId, ChannelKind, FileId, GuildId, MessageId, Role, UserId};
 
@@ -20,9 +24,10 @@ pub struct StoredMessage {
 
 impl Storage {
     pub async fn new(database_url: &str) -> Result<Self> {
+        let connect_options = SqliteConnectOptions::from_str(database_url)?.create_if_missing(true);
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
-            .connect(database_url)
+            .connect_with(connect_options)
             .await?;
         sqlx::migrate!("./migrations").run(&pool).await?;
         Ok(Self { pool })
@@ -222,6 +227,28 @@ mod tests {
             .expect("guild list");
         assert_eq!(guilds.len(), 1);
         assert_eq!(guilds[0].0, guild);
+    }
+
+    #[tokio::test]
+    async fn creates_database_file_when_missing() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let temp_root = std::env::temp_dir().join(format!("proto_rtc_storage_test_{suffix}"));
+        let db_path = temp_root.join("nested").join("storage.db");
+        let database_url = format!("sqlite://{}", db_path.to_string_lossy().replace('\\', "/"));
+
+        let storage = Storage::new(&database_url).await.expect("db");
+        drop(storage);
+
+        assert!(
+            db_path.exists(),
+            "database file should exist: {}",
+            db_path.display()
+        );
+
+        std::fs::remove_dir_all(temp_root).expect("cleanup");
     }
 
     #[tokio::test]
