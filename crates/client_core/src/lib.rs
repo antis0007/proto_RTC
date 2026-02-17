@@ -2,8 +2,13 @@ use std::{collections::HashMap, sync::Arc};
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
-use base64::{engine::general_purpose::STANDARD, Engine as _};
+use base64::{
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+    Engine as _,
+};
 use futures::StreamExt;
+use mls::MlsIdentity;
+use openmls_rust_crypto::OpenMlsRustCrypto;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use shared::{
@@ -57,6 +62,18 @@ struct JoinGuildRequest {
 #[derive(Debug, Deserialize)]
 struct InviteResponse {
     invite_code: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct KeyPackageUploadResponse {
+    key_package_id: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct KeyPackageFetchResponse {
+    guild_id: i64,
+    user_id: i64,
+    key_package_b64: String,
 }
 
 pub struct CommunityClient<C: CryptoProvider> {
@@ -246,6 +263,53 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
             .ok_or_else(|| anyhow!("not logged in: missing user_id"))?;
         Ok((server_url, user_id))
     }
+
+    async fn upload_key_package_for_guild(&self, guild_id: GuildId) -> Result<i64> {
+        let (server_url, user_id) = self.session().await?;
+        let identity = MlsIdentity::new_with_name(format!("user-{user_id}"))?;
+        let key_package_bytes = identity.key_package_bytes(&OpenMlsRustCrypto::default())?;
+
+        let response: KeyPackageUploadResponse = self
+            .http
+            .post(format!("{server_url}/mls/key_packages"))
+            .query(&[("user_id", user_id), ("guild_id", guild_id.0)])
+            .body(key_package_bytes)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+
+        Ok(response.key_package_id)
+    }
+
+    pub async fn fetch_key_package(&self, user_id: i64, guild_id: GuildId) -> Result<Vec<u8>> {
+        let (server_url, _current_user_id) = self.session().await?;
+        let response: KeyPackageFetchResponse = self
+            .http
+            .get(format!("{server_url}/mls/key_packages"))
+            .query(&[("user_id", user_id), ("guild_id", guild_id.0)])
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+
+        if response.user_id != user_id || response.guild_id != guild_id.0 {
+            return Err(anyhow!("server returned mismatched key package metadata"));
+        }
+
+        STANDARD
+            .decode(response.key_package_b64)
+            .map_err(|e| anyhow!("invalid key package payload from server: {e}"))
+    }
+
+    fn guild_id_from_invite(invite_code: &str) -> Option<GuildId> {
+        let decoded = URL_SAFE_NO_PAD.decode(invite_code.as_bytes()).ok()?;
+        let decoded_text = String::from_utf8(decoded).ok()?;
+        let guild_id = decoded_text.strip_prefix("guild:")?.parse::<i64>().ok()?;
+        Some(GuildId(guild_id))
+    }
 }
 
 #[async_trait]
@@ -277,7 +341,23 @@ impl<C: CryptoProvider + 'static> ClientHandle for Arc<RealtimeClient<C>> {
             guard.channel_guilds.clear();
         }
 
-        self.spawn_ws_events(server_url, body.user_id).await
+        self.spawn_ws_events(server_url, body.user_id).await?;
+
+        let guilds: Vec<GuildSummary> = self
+            .http
+            .get(format!("{server_url}/guilds"))
+            .query(&[("user_id", body.user_id)])
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+
+        for guild in guilds {
+            self.upload_key_package_for_guild(guild.guild_id).await?;
+        }
+
+        Ok(())
     }
 
     async fn list_guilds(&self) -> Result<()> {
@@ -441,6 +521,11 @@ impl<C: CryptoProvider + 'static> ClientHandle for Arc<RealtimeClient<C>> {
             .send()
             .await?
             .error_for_status()?;
+
+        if let Some(guild_id) = RealtimeClient::<C>::guild_id_from_invite(invite_code) {
+            self.upload_key_package_for_guild(guild_id).await?;
+        }
+
         Ok(())
     }
 

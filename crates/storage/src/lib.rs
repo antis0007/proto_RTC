@@ -270,6 +270,45 @@ impl Storage {
             .await?;
         Ok(row.map(|r| r.get::<Vec<u8>, _>(0)))
     }
+
+    pub async fn insert_key_package(
+        &self,
+        guild_id: GuildId,
+        user_id: UserId,
+        key_package_bytes: &[u8],
+    ) -> Result<i64> {
+        let rec = sqlx::query(
+            "INSERT INTO mls_key_packages (guild_id, user_id, key_package_bytes)
+             VALUES (?, ?, ?)
+             RETURNING id",
+        )
+        .bind(guild_id.0)
+        .bind(user_id.0)
+        .bind(key_package_bytes)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(rec.get::<i64, _>(0))
+    }
+
+    pub async fn load_latest_key_package(
+        &self,
+        guild_id: GuildId,
+        user_id: UserId,
+    ) -> Result<Option<(i64, Vec<u8>)>> {
+        let row = sqlx::query(
+            "SELECT id, key_package_bytes
+             FROM mls_key_packages
+             WHERE guild_id = ? AND user_id = ?
+             ORDER BY id DESC
+             LIMIT 1",
+        )
+        .bind(guild_id.0)
+        .bind(user_id.0)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(|r| (r.get::<i64, _>(0), r.get::<Vec<u8>, _>(1))))
+    }
 }
 
 fn ensure_sqlite_parent_dir_exists(database_url: &str) -> Result<()> {
@@ -468,5 +507,30 @@ mod tests {
             .expect("messages");
         assert_eq!(older.len(), 1);
         assert_eq!(older[0].message_id, first);
+    }
+
+    #[tokio::test]
+    async fn stores_latest_key_package_per_user_per_guild() {
+        let storage = Storage::new("sqlite::memory:").await.expect("db");
+        let user = storage.create_user("carol").await.expect("user");
+        let guild = storage.create_guild("security", user).await.expect("guild");
+
+        let first_id = storage
+            .insert_key_package(guild, user, b"kp-1")
+            .await
+            .expect("insert key package");
+        let second_id = storage
+            .insert_key_package(guild, user, b"kp-2")
+            .await
+            .expect("insert key package");
+        assert!(second_id > first_id);
+
+        let latest = storage
+            .load_latest_key_package(guild, user)
+            .await
+            .expect("latest")
+            .expect("some latest");
+        assert_eq!(latest.0, second_id);
+        assert_eq!(latest.1, b"kp-2");
     }
 }
