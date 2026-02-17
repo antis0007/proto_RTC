@@ -1703,7 +1703,7 @@ impl DesktopGuiApp {
                             let frame = if self.readability.message_bubble_backgrounds {
                                 egui::Frame::none().fill(base_message_bg)
                             } else {
-                                14.0
+                                egui::Frame::none()
                             };
                             let message_response = frame
                                 .rounding(egui::Rounding::same(f32::from(
@@ -1737,43 +1737,6 @@ impl DesktopGuiApp {
                                                         },
                                                         &mut self.status,
                                                     );
-                                                    if self.readability.show_timestamps {
-                                                        ui.label(
-                                                            egui::RichText::new(sent_at)
-                                                                .small()
-                                                                .weak(),
-                                                        );
-                                                    }
-                                                });
-                                                ui.label(&msg.plaintext);
-                                                if let Some(attachment) = &msg.wire.attachment {
-                                                    if attachment_is_image(attachment) {
-                                                        self.render_image_attachment_preview(
-                                                            ui, attachment,
-                                                        );
-                                                    } else {
-                                                        ui.horizontal(|ui| {
-                                                            ui.label(format!(
-                                                                "📎 {} ({})",
-                                                                attachment.filename,
-                                                                human_readable_bytes(
-                                                                    attachment.size_bytes,
-                                                                )
-                                                            ));
-                                                            if ui.button("Download").clicked() {
-                                                                queue_command(
-                                                                    &self.cmd_tx,
-                                                                    BackendCommand::DownloadAttachment {
-                                                                        file_id: attachment.file_id,
-                                                                        filename: attachment
-                                                                            .filename
-                                                                            .clone(),
-                                                                    },
-                                                                    &mut self.status,
-                                                                );
-                                                            }
-                                                        });
-                                                    }
                                                 }
                                             });
                                         }
@@ -1808,11 +1771,14 @@ impl DesktopGuiApp {
                             egui::Layout::centered_and_justified(egui::Direction::TopDown),
                             |ui| {
                                 ui.heading("Select a channel");
-                                ui.weak("Choose a channel from the left to view and send messages.");
+                                ui.weak(
+                                    "Choose a channel from the left to view and send messages.",
+                                );
                             },
                         );
                     }
-                });
+                }
+            });
 
             if !self.auth_session_established {
                 ui.separator();
