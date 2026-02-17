@@ -99,6 +99,7 @@ enum AttachmentPreviewState {
     Ready {
         image: PreviewImage,
         original_bytes: Vec<u8>,
+        preview_png: Option<Vec<u8>>,
         texture: Option<egui::TextureHandle>,
     },
     Error(String),
@@ -425,11 +426,13 @@ impl DesktopGuiApp {
                     image,
                     original_bytes,
                 } => {
+                    let preview_png = encode_rgba_png(&image.rgba, image.width, image.height).ok();
                     self.attachment_previews.insert(
                         file_id,
                         AttachmentPreviewState::Ready {
                             image,
                             original_bytes,
+                            preview_png,
                             texture: None,
                         },
                     );
@@ -1502,6 +1505,7 @@ impl DesktopGuiApp {
             AttachmentPreviewState::Ready {
                 image,
                 original_bytes,
+                preview_png,
                 texture,
             } => {
                 if texture.is_none() {
@@ -1519,6 +1523,7 @@ impl DesktopGuiApp {
                 let texture_handle = texture.as_ref().cloned();
                 let preview_image = image.clone();
                 let full_bytes = original_bytes.clone();
+                let preview_bytes = preview_png.clone();
 
                 if let Some(texture) = texture_handle {
                     let max_width = (ui.available_width() * 0.75).clamp(120.0, 360.0);
@@ -1541,12 +1546,6 @@ impl DesktopGuiApp {
                         self.expanded_preview = Some(attachment.file_id);
                     }
 
-                    let preview_bytes = encode_rgba_png(
-                        &preview_image.rgba,
-                        preview_image.width,
-                        preview_image.height,
-                    )
-                    .ok();
                     let metadata = format!(
                         "name: {}\nsize: {} bytes\npreview: {}x{}",
                         attachment.filename,
