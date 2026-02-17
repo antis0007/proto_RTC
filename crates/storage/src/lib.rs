@@ -25,7 +25,27 @@ pub struct StoredMessage {
     pub channel_id: ChannelId,
     pub sender_id: UserId,
     pub ciphertext: Vec<u8>,
+    pub attachment: Option<StoredAttachment>,
     pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct StoredAttachment {
+    pub file_id: FileId,
+    pub filename: String,
+    pub size_bytes: u64,
+    pub mime_type: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct StoredFile {
+    pub file_id: FileId,
+    pub guild_id: GuildId,
+    pub channel_id: ChannelId,
+    pub ciphertext: Vec<u8>,
+    pub mime_type: Option<String>,
+    pub filename: Option<String>,
+    pub size_bytes: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -222,13 +242,18 @@ impl Storage {
         channel_id: ChannelId,
         sender_id: UserId,
         ciphertext: &[u8],
+        attachment: Option<&StoredAttachment>,
     ) -> Result<MessageId> {
         let rec = sqlx::query(
-            "INSERT INTO messages (channel_id, sender_user_id, ciphertext) VALUES (?, ?, ?) RETURNING id",
+            "INSERT INTO messages (channel_id, sender_user_id, ciphertext, attachment_file_id, attachment_filename, attachment_size_bytes, attachment_mime_type) VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id",
         )
         .bind(channel_id.0)
         .bind(sender_id.0)
         .bind(ciphertext)
+        .bind(attachment.map(|a| a.file_id.0))
+        .bind(attachment.map(|a| a.filename.as_str()))
+        .bind(attachment.map(|a| i64::try_from(a.size_bytes).unwrap_or(i64::MAX)))
+        .bind(attachment.and_then(|a| a.mime_type.as_deref()))
         .fetch_one(&self.pool)
         .await?;
         Ok(MessageId(rec.get::<i64, _>(0)))
@@ -250,7 +275,7 @@ impl Storage {
     ) -> Result<Vec<StoredMessage>> {
         let mut rows = if let Some(before_id) = before {
             sqlx::query(
-                "SELECT id, channel_id, sender_user_id, ciphertext, created_at
+                "SELECT id, channel_id, sender_user_id, ciphertext, created_at, attachment_file_id, attachment_filename, attachment_size_bytes, attachment_mime_type
                  FROM messages
                  WHERE channel_id = ? AND id < ?
                  ORDER BY id DESC
@@ -263,7 +288,7 @@ impl Storage {
             .await?
         } else {
             sqlx::query(
-                "SELECT id, channel_id, sender_user_id, ciphertext, created_at
+                "SELECT id, channel_id, sender_user_id, ciphertext, created_at, attachment_file_id, attachment_filename, attachment_size_bytes, attachment_mime_type
                  FROM messages
                  WHERE channel_id = ?
                  ORDER BY id DESC
@@ -283,6 +308,14 @@ impl Storage {
                 channel_id: ChannelId(r.get::<i64, _>(1)),
                 sender_id: UserId(r.get::<i64, _>(2)),
                 ciphertext: r.get::<Vec<u8>, _>(3),
+                attachment: r.get::<Option<i64>, _>(5).map(|file_id| StoredAttachment {
+                    file_id: FileId(file_id),
+                    filename: r
+                        .get::<Option<String>, _>(6)
+                        .unwrap_or_else(|| "attachment.bin".to_string()),
+                    size_bytes: r.get::<Option<i64>, _>(7).unwrap_or_default() as u64,
+                    mime_type: r.get::<Option<String>, _>(8),
+                }),
                 created_at: r.get::<DateTime<Utc>, _>(4),
             })
             .collect())
@@ -295,26 +328,40 @@ impl Storage {
         channel_id: ChannelId,
         ciphertext: &[u8],
         mime: Option<&str>,
+        filename: Option<&str>,
     ) -> Result<FileId> {
+        let size_bytes = i64::try_from(ciphertext.len()).unwrap_or(i64::MAX);
         let rec = sqlx::query(
-            "INSERT INTO files (uploader_user_id, guild_id, channel_id, ciphertext, mime_type) VALUES (?, ?, ?, ?, ?) RETURNING id",
+            "INSERT INTO files (uploader_user_id, guild_id, channel_id, ciphertext, mime_type, filename, size_bytes) VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id",
         )
         .bind(uploader_id.0)
         .bind(guild_id.0)
         .bind(channel_id.0)
         .bind(ciphertext)
         .bind(mime)
+        .bind(filename)
+        .bind(size_bytes)
         .fetch_one(&self.pool)
         .await?;
         Ok(FileId(rec.get::<i64, _>(0)))
     }
 
-    pub async fn load_file_ciphertext(&self, file_id: FileId) -> Result<Option<Vec<u8>>> {
-        let row = sqlx::query("SELECT ciphertext FROM files WHERE id = ?")
+    pub async fn load_file(&self, file_id: FileId) -> Result<Option<StoredFile>> {
+        let row = sqlx::query(
+            "SELECT id, guild_id, channel_id, ciphertext, mime_type, filename, size_bytes FROM files WHERE id = ?",
+        )
             .bind(file_id.0)
             .fetch_optional(&self.pool)
             .await?;
-        Ok(row.map(|r| r.get::<Vec<u8>, _>(0)))
+        Ok(row.map(|r| StoredFile {
+            file_id: FileId(r.get::<i64, _>(0)),
+            guild_id: GuildId(r.get::<i64, _>(1)),
+            channel_id: ChannelId(r.get::<i64, _>(2)),
+            ciphertext: r.get::<Vec<u8>, _>(3),
+            mime_type: r.get::<Option<String>, _>(4),
+            filename: r.get::<Option<String>, _>(5),
+            size_bytes: r.get::<Option<i64>, _>(6).unwrap_or_default() as u64,
+        }))
     }
 
     pub async fn insert_key_package(
@@ -511,7 +558,7 @@ mod tests {
             .await
             .expect("channel");
         let message = storage
-            .insert_message_ciphertext(channel, user, b"opaque")
+            .insert_message_ciphertext(channel, user, b"opaque", None)
             .await
             .expect("message");
         assert!(message.0 > 0);
@@ -528,15 +575,15 @@ mod tests {
             .expect("channel");
 
         let first = storage
-            .insert_message_ciphertext(channel, user, b"first")
+            .insert_message_ciphertext(channel, user, b"first", None)
             .await
             .expect("first");
         let second = storage
-            .insert_message_ciphertext(channel, user, b"second")
+            .insert_message_ciphertext(channel, user, b"second", None)
             .await
             .expect("second");
         let _third = storage
-            .insert_message_ciphertext(channel, user, b"third")
+            .insert_message_ciphertext(channel, user, b"third", None)
             .await
             .expect("third");
 
@@ -578,5 +625,52 @@ mod tests {
             .expect("some latest");
         assert_eq!(latest.0, second_id);
         assert_eq!(latest.1, b"kp-2");
+    }
+
+    #[tokio::test]
+    async fn stores_message_attachment_metadata() {
+        let storage = Storage::new("sqlite::memory:").await.expect("db");
+        let user = storage.create_user("dave").await.expect("user");
+        let guild = storage.create_guild("files", user).await.expect("guild");
+        let channel = storage
+            .create_channel(guild, "uploads", ChannelKind::Text)
+            .await
+            .expect("channel");
+
+        let file_id = storage
+            .store_file_ciphertext(
+                user,
+                guild,
+                channel,
+                b"encrypted-bytes",
+                Some("text/plain"),
+                Some("hello.txt"),
+            )
+            .await
+            .expect("file");
+
+        storage
+            .insert_message_ciphertext(
+                channel,
+                user,
+                b"see attachment",
+                Some(&StoredAttachment {
+                    file_id,
+                    filename: "hello.txt".to_string(),
+                    size_bytes: 15,
+                    mime_type: Some("text/plain".to_string()),
+                }),
+            )
+            .await
+            .expect("message");
+
+        let messages = storage
+            .list_channel_messages(channel, 10, None)
+            .await
+            .expect("messages");
+        let attachment = messages[0].attachment.as_ref().expect("attachment");
+        assert_eq!(attachment.file_id, file_id);
+        assert_eq!(attachment.filename, "hello.txt");
+        assert_eq!(attachment.size_bytes, 15);
     }
 }

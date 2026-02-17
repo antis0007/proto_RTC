@@ -1,10 +1,11 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
+    path::PathBuf,
     thread,
 };
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use client_core::{ClientEvent, ClientHandle, PassthroughCrypto, RealtimeClient};
+use client_core::{AttachmentUpload, ClientEvent, ClientHandle, PassthroughCrypto, RealtimeClient};
 use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 use eframe::egui;
 use serde::{Deserialize, Serialize};
@@ -39,6 +40,11 @@ enum BackendCommand {
     },
     SendMessage {
         text: String,
+        attachment_path: Option<PathBuf>,
+    },
+    DownloadAttachment {
+        file_id: shared::domain::FileId,
+        filename: String,
     },
     CreateInvite {
         guild_id: GuildId,
@@ -242,6 +248,7 @@ struct DesktopGuiApp {
     auth_action: AuthAction,
     auth_session_established: bool,
     composer: String,
+    pending_attachment: Option<PathBuf>,
     guilds: Vec<GuildSummary>,
     channels: Vec<ChannelSummary>,
     selected_guild: Option<GuildId>,
@@ -284,6 +291,7 @@ impl DesktopGuiApp {
             auth_action: AuthAction::SignIn,
             auth_session_established: false,
             composer: String::new(),
+            pending_attachment: None,
             guilds: Vec::new(),
             channels: Vec::new(),
             selected_guild: None,
@@ -927,8 +935,11 @@ impl DesktopGuiApp {
                 let can_send = self.selected_channel.is_some();
                 ui.add_enabled_ui(can_send && self.auth_session_established, |ui| {
                     ui.horizontal(|ui| {
+                        if ui.button("📎").on_hover_text("Attach file").clicked() {
+                            self.pending_attachment = rfd::FileDialog::new().pick_file();
+                        }
                         let response = ui.add_sized(
-                            [ui.available_width() - 90.0, 72.0],
+                            [ui.available_width() - 130.0, 72.0],
                             egui::TextEdit::multiline(&mut self.composer).hint_text(
                                 "Message #channel (Enter to send, Shift+Enter for newline)",
                             ),
@@ -939,17 +950,25 @@ impl DesktopGuiApp {
                             .add_sized([80.0, 72.0], egui::Button::new("⬆ Send"))
                             .clicked();
                         let has_text = !self.composer.trim().is_empty();
-                        if (send_shortcut || clicked_send) && has_text {
+                        let has_attachment = self.pending_attachment.is_some();
+                        if (send_shortcut || clicked_send) && (has_text || has_attachment) {
                             let text = self.composer.trim_end_matches('\n').to_string();
                             self.composer.clear();
+                            let attachment_path = self.pending_attachment.take();
                             queue_command(
                                 &self.cmd_tx,
-                                BackendCommand::SendMessage { text },
+                                BackendCommand::SendMessage {
+                                    text,
+                                    attachment_path,
+                                },
                                 &mut self.status,
                             );
                             response.request_focus();
                         }
                     });
+                    if let Some(path) = &self.pending_attachment {
+                        ui.small(format!("Attached: {}", path.display()));
+                    }
                 });
                 if !can_send {
                     ui.centered_and_justified(|ui| {
@@ -1016,6 +1035,24 @@ impl DesktopGuiApp {
                                         }
                                     });
                                     ui.label(decoded);
+                                    if let Some(attachment) = &msg.attachment {
+                                        ui.horizontal(|ui| {
+                                            ui.label(format!(
+                                                "📎 {} ({} bytes)",
+                                                attachment.filename, attachment.size_bytes
+                                            ));
+                                            if ui.button("Download").clicked() {
+                                                queue_command(
+                                                    &self.cmd_tx,
+                                                    BackendCommand::DownloadAttachment {
+                                                        file_id: attachment.file_id,
+                                                        filename: attachment.filename.clone(),
+                                                    },
+                                                    &mut self.status,
+                                                );
+                                            }
+                                        });
+                                    }
                                 });
                             ui.add_space(if self.readability.compact_density {
                                 4.0
@@ -1220,9 +1257,68 @@ fn spawn_backend_thread(cmd_rx: Receiver<BackendCommand>, ui_tx: Sender<UiEvent>
                             let _ = ui_tx.try_send(UiEvent::Error(err.to_string()));
                         }
                     }
-                    BackendCommand::SendMessage { text } => {
-                        if let Err(err) = client.send_message(&text).await {
+                    BackendCommand::SendMessage {
+                        text,
+                        attachment_path,
+                    } => {
+                        let result = if let Some(path) = attachment_path {
+                            let filename = path
+                                .file_name()
+                                .and_then(|name| name.to_str())
+                                .unwrap_or("attachment.bin")
+                                .to_string();
+                            match tokio::fs::read(&path).await {
+                                Ok(bytes) => {
+                                    let mime_type = mime_guess::from_path(&path)
+                                        .first_raw()
+                                        .map(str::to_string);
+                                    client
+                                        .send_message_with_attachment(
+                                            &text,
+                                            AttachmentUpload {
+                                                filename,
+                                                mime_type,
+                                                ciphertext: bytes,
+                                            },
+                                        )
+                                        .await
+                                }
+                                Err(err) => Err(err.into()),
+                            }
+                        } else {
+                            client.send_message(&text).await
+                        };
+
+                        if let Err(err) = result {
                             let _ = ui_tx.try_send(UiEvent::Error(err.to_string()));
+                        }
+                    }
+                    BackendCommand::DownloadAttachment { file_id, filename } => {
+                        match client.download_file(file_id).await {
+                            Ok(bytes) => {
+                                let save_path =
+                                    rfd::FileDialog::new().set_file_name(&filename).save_file();
+                                if let Some(path) = save_path {
+                                    match tokio::fs::write(&path, bytes).await {
+                                        Ok(()) => {
+                                            let _ = ui_tx.try_send(UiEvent::Info(format!(
+                                                "Saved attachment to {}",
+                                                path.display()
+                                            )));
+                                        }
+                                        Err(err) => {
+                                            let _ = ui_tx.try_send(UiEvent::Error(format!(
+                                                "Failed to save attachment: {err}"
+                                            )));
+                                        }
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                let _ = ui_tx.try_send(UiEvent::Error(format!(
+                                    "Failed to download attachment: {err}"
+                                )));
+                            }
                         }
                     }
                     BackendCommand::CreateInvite { guild_id } => {

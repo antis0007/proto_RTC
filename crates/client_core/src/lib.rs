@@ -12,9 +12,10 @@ use openmls_rust_crypto::OpenMlsRustCrypto;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use shared::{
-    domain::{ChannelId, GuildId, MessageId},
+    domain::{ChannelId, FileId, GuildId, MessageId},
     protocol::{
-        ChannelSummary, ClientRequest, GuildSummary, MemberSummary, MessagePayload, ServerEvent,
+        AttachmentPayload, ChannelSummary, ClientRequest, GuildSummary, MemberSummary,
+        MessagePayload, ServerEvent,
     },
 };
 use tokio::sync::{broadcast, Mutex};
@@ -141,6 +142,19 @@ pub enum ClientEvent {
     Error(String),
 }
 
+#[derive(Debug, Clone)]
+pub struct AttachmentUpload {
+    pub filename: String,
+    pub mime_type: Option<String>,
+    pub ciphertext: Vec<u8>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FileUploadResponse {
+    file_id: i64,
+    size_bytes: usize,
+}
+
 #[async_trait]
 pub trait ClientHandle: Send + Sync {
     async fn login(&self, server_url: &str, username: &str, password_or_invite: &str)
@@ -156,6 +170,12 @@ pub trait ClientHandle: Send + Sync {
         before: Option<MessageId>,
     ) -> Result<Vec<MessagePayload>>;
     async fn send_message(&self, text: &str) -> Result<()>;
+    async fn send_message_with_attachment(
+        &self,
+        text: &str,
+        attachment: AttachmentUpload,
+    ) -> Result<()>;
+    async fn download_file(&self, file_id: FileId) -> Result<Vec<u8>>;
     async fn create_invite(&self, guild_id: GuildId) -> Result<String>;
     async fn join_with_invite(&self, invite_code: &str) -> Result<()>;
     async fn sender_directory(&self) -> HashMap<i64, String>;
@@ -193,6 +213,8 @@ struct SendMessageHttpRequest {
     guild_id: i64,
     channel_id: i64,
     ciphertext_b64: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    attachment: Option<AttachmentPayload>,
 }
 
 impl<C: CryptoProvider + 'static> RealtimeClient<C> {
@@ -343,6 +365,82 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
         let decoded_text = String::from_utf8(decoded).ok()?;
         let guild_id = decoded_text.strip_prefix("guild:")?.parse::<i64>().ok()?;
         Some(GuildId(guild_id))
+    }
+
+    async fn upload_attachment(&self, attachment: AttachmentUpload) -> Result<AttachmentPayload> {
+        let (server_url, user_id, guild_id, channel_id) = self.active_context().await?;
+        let response: FileUploadResponse = self
+            .http
+            .post(format!("{server_url}/files/upload"))
+            .query(&[
+                ("user_id", user_id.to_string()),
+                ("guild_id", guild_id.0.to_string()),
+                ("channel_id", channel_id.0.to_string()),
+                ("filename", attachment.filename.clone()),
+                (
+                    "mime_type",
+                    attachment
+                        .mime_type
+                        .clone()
+                        .unwrap_or_else(|| "application/octet-stream".to_string()),
+                ),
+            ])
+            .body(attachment.ciphertext)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+
+        Ok(AttachmentPayload {
+            file_id: FileId(response.file_id),
+            filename: attachment.filename,
+            size_bytes: response.size_bytes as u64,
+            mime_type: attachment.mime_type,
+        })
+    }
+
+    async fn active_context(&self) -> Result<(String, i64, GuildId, ChannelId)> {
+        let guard = self.inner.lock().await;
+        let server_url = guard
+            .server_url
+            .clone()
+            .ok_or_else(|| anyhow!("not logged in: missing server_url"))?;
+        let user_id = guard
+            .user_id
+            .ok_or_else(|| anyhow!("not logged in: missing user_id"))?;
+        let channel_id = guard
+            .selected_channel
+            .ok_or_else(|| anyhow!("no channel selected"))?;
+        let guild_id = guard
+            .selected_guild
+            .or_else(|| guard.channel_guilds.get(&channel_id).copied())
+            .ok_or_else(|| anyhow!("no guild selected"))?;
+        Ok((server_url, user_id, guild_id, channel_id))
+    }
+
+    async fn send_message_with_attachment_impl(
+        &self,
+        text: &str,
+        attachment: Option<AttachmentPayload>,
+    ) -> Result<()> {
+        let (server_url, user_id, guild_id, channel_id) = self.active_context().await?;
+        let ciphertext = self.crypto.encrypt_message(text.as_bytes());
+        let payload = SendMessageHttpRequest {
+            user_id,
+            guild_id: guild_id.0,
+            channel_id: channel_id.0,
+            ciphertext_b64: STANDARD.encode(ciphertext),
+            attachment,
+        };
+
+        self.http
+            .post(format!("{server_url}/messages"))
+            .json(&payload)
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
     }
 }
 
@@ -521,40 +619,31 @@ impl<C: CryptoProvider + 'static> ClientHandle for Arc<RealtimeClient<C>> {
     }
 
     async fn send_message(&self, text: &str) -> Result<()> {
-        let (server_url, user_id, guild_id, channel_id) = {
-            let guard = self.inner.lock().await;
-            let server_url = guard
-                .server_url
-                .clone()
-                .ok_or_else(|| anyhow!("not logged in: missing server_url"))?;
-            let user_id = guard
-                .user_id
-                .ok_or_else(|| anyhow!("not logged in: missing user_id"))?;
-            let channel_id = guard
-                .selected_channel
-                .ok_or_else(|| anyhow!("no channel selected"))?;
-            let guild_id = guard
-                .selected_guild
-                .or_else(|| guard.channel_guilds.get(&channel_id).copied())
-                .ok_or_else(|| anyhow!("no guild selected"))?;
-            (server_url, user_id, guild_id, channel_id)
-        };
+        self.send_message_with_attachment_impl(text, None).await
+    }
 
-        let ciphertext = self.crypto.encrypt_message(text.as_bytes());
-        let payload = SendMessageHttpRequest {
-            user_id,
-            guild_id: guild_id.0,
-            channel_id: channel_id.0,
-            ciphertext_b64: STANDARD.encode(ciphertext),
-        };
+    async fn send_message_with_attachment(
+        &self,
+        text: &str,
+        attachment: AttachmentUpload,
+    ) -> Result<()> {
+        let uploaded = self.upload_attachment(attachment).await?;
+        self.send_message_with_attachment_impl(text, Some(uploaded))
+            .await
+    }
 
-        self.http
-            .post(format!("{server_url}/messages"))
-            .json(&payload)
+    async fn download_file(&self, file_id: FileId) -> Result<Vec<u8>> {
+        let (server_url, user_id) = self.session().await?;
+        let bytes = self
+            .http
+            .get(format!("{server_url}/files/{}", file_id.0))
+            .query(&[("user_id", user_id)])
             .send()
             .await?
-            .error_for_status()?;
-        Ok(())
+            .error_for_status()?
+            .bytes()
+            .await?;
+        Ok(bytes.to_vec())
     }
 
     async fn create_invite(&self, guild_id: GuildId) -> Result<String> {

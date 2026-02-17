@@ -3,7 +3,7 @@ use std::{net::SocketAddr, sync::Arc};
 use axum::{
     body::Bytes,
     extract::{Path, Query, State, WebSocketUpgrade},
-    http::StatusCode,
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
@@ -20,7 +20,7 @@ use server_api::{
 use shared::{
     domain::{ChannelId, ChannelKind, FileId, GuildId, UserId},
     error::{ApiError, ErrorCode},
-    protocol::ServerEvent,
+    protocol::{AttachmentPayload, ServerEvent},
 };
 use storage::Storage;
 use tokio::sync::broadcast;
@@ -51,6 +51,8 @@ struct FileUploadQuery {
     user_id: i64,
     guild_id: i64,
     channel_id: i64,
+    filename: Option<String>,
+    mime_type: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -60,6 +62,11 @@ struct WsQuery {
 
 #[derive(Debug, Deserialize)]
 struct UserQuery {
+    user_id: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct FileDownloadQuery {
     user_id: i64,
 }
 
@@ -112,7 +119,12 @@ struct SendMessageRequest {
     guild_id: i64,
     channel_id: i64,
     ciphertext_b64: String,
+    #[serde(default)]
+    attachment: Option<AttachmentPayload>,
 }
+
+const MAX_ATTACHMENT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_FILENAME_BYTES: usize = 180;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -139,7 +151,17 @@ async fn main() -> anyhow::Result<()> {
     let (events, _) = broadcast::channel(256);
 
     let state = AppState { api, events };
-    let app = Router::new()
+    let app = build_router(Arc::new(state));
+
+    let addr: SocketAddr = settings.server_bind.parse()?;
+    info!(%addr, "server listening");
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+fn build_router(state: Arc<AppState>) -> Router {
+    Router::new()
         .route("/healthz", get(healthz))
         .route("/login", post(login))
         .route("/guilds", get(http_list_guilds))
@@ -154,13 +176,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/mls/key_packages", post(upload_key_package))
         .route("/mls/key_packages", get(fetch_key_package))
         .route("/ws", get(ws_handler))
-        .with_state(Arc::new(state));
-
-    let addr: SocketAddr = settings.server_bind.parse()?;
-    info!(%addr, "server listening");
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
-    Ok(())
+        .with_state(state)
 }
 
 async fn healthz() -> &'static str {
@@ -229,6 +245,93 @@ async fn upload_file(
     Query(q): Query<FileUploadQuery>,
     body: Bytes,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
+    if body.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError::new(
+                ErrorCode::Validation,
+                "attachment body cannot be empty",
+            )),
+        ));
+    }
+    if body.len() > MAX_ATTACHMENT_BYTES {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(ApiError::new(
+                ErrorCode::Validation,
+                format!("attachment exceeds {} bytes", MAX_ATTACHMENT_BYTES),
+            )),
+        ));
+    }
+
+    let filename = q
+        .filename
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty());
+    if let Some(name) = filename {
+        if name.len() > MAX_FILENAME_BYTES {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ApiError::new(ErrorCode::Validation, "filename is too long")),
+            ));
+        }
+        if name.contains('/') || name.contains('\\') {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ApiError::new(
+                    ErrorCode::Validation,
+                    "filename must not contain path separators",
+                )),
+            ));
+        }
+    }
+
+    state
+        .api
+        .storage
+        .membership_status(GuildId(q.guild_id), UserId(q.user_id))
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError::new(ErrorCode::Internal, e.to_string())),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::FORBIDDEN,
+                Json(ApiError::new(ErrorCode::Forbidden, "user is not a member")),
+            )
+        })?;
+
+    let channel_guild = state
+        .api
+        .storage
+        .guild_for_channel(ChannelId(q.channel_id))
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError::new(ErrorCode::Internal, e.to_string())),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ApiError::new(ErrorCode::NotFound, "channel not found")),
+            )
+        })?;
+    if channel_guild != GuildId(q.guild_id) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError::new(
+                ErrorCode::Validation,
+                "channel does not belong to guild",
+            )),
+        ));
+    }
+
     let file_id = state
         .api
         .storage
@@ -237,7 +340,10 @@ async fn upload_file(
             GuildId(q.guild_id),
             ChannelId(q.channel_id),
             &body,
-            Some("application/octet-stream"),
+            q.mime_type
+                .as_deref()
+                .filter(|mime| !mime.trim().is_empty()),
+            filename,
         )
         .await
         .map_err(|e| {
@@ -246,17 +352,21 @@ async fn upload_file(
                 Json(ApiError::new(ErrorCode::Internal, e.to_string())),
             )
         })?;
-    Ok(Json(serde_json::json!({ "file_id": file_id.0 })))
+    let _ = state.events.send(ServerEvent::FileStored { file_id });
+    Ok(Json(
+        serde_json::json!({ "file_id": file_id.0, "size_bytes": body.len() }),
+    ))
 }
 
 async fn download_file(
     State(state): State<Arc<AppState>>,
     Path(file_id): Path<i64>,
+    Query(q): Query<FileDownloadQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiError>)> {
-    let bytes = state
+    let file = state
         .api
         .storage
-        .load_file_ciphertext(FileId(file_id))
+        .load_file(FileId(file_id))
         .await
         .map_err(|e| {
             (
@@ -270,7 +380,41 @@ async fn download_file(
                 Json(ApiError::new(ErrorCode::NotFound, "file not found")),
             )
         })?;
-    Ok((StatusCode::OK, bytes))
+    state
+        .api
+        .storage
+        .membership_status(file.guild_id, UserId(q.user_id))
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError::new(ErrorCode::Internal, e.to_string())),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::FORBIDDEN,
+                Json(ApiError::new(ErrorCode::Forbidden, "user is not a member")),
+            )
+        })?;
+
+    let mut headers = HeaderMap::new();
+    let content_type = file
+        .mime_type
+        .as_deref()
+        .unwrap_or("application/octet-stream");
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_str(content_type)
+            .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream")),
+    );
+    if let Some(filename) = file.filename {
+        if let Ok(value) = HeaderValue::from_str(&format!("attachment; filename=\"{filename}\"")) {
+            headers.insert(header::CONTENT_DISPOSITION, value);
+        }
+    }
+
+    Ok((StatusCode::OK, headers, file.ciphertext))
 }
 
 async fn upload_key_package(
@@ -535,9 +679,57 @@ async fn http_send_message(
         GuildId(req.guild_id),
         ChannelId(req.channel_id),
         &req.ciphertext_b64,
+        req.attachment,
     )
     .await
     .map_err(|e| (StatusCode::BAD_REQUEST, Json(e)))?;
     let _ = state.events.send(event.clone());
     Ok(Json(event))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{body::Body, http::Request};
+    use tower::ServiceExt;
+
+    async fn test_app() -> (Router, i64, i64, i64) {
+        let storage = Storage::new("sqlite::memory:").await.expect("db");
+        let user = storage.create_user("alice").await.expect("user");
+        let guild = storage.create_guild("general", user).await.expect("guild");
+        let channel = storage
+            .create_channel(guild, "general", ChannelKind::Text)
+            .await
+            .expect("channel");
+
+        let api = ApiContext {
+            storage,
+            livekit: LiveKitConfig {
+                api_key: "k".to_string(),
+                api_secret: "s".to_string(),
+                ttl_seconds: 60,
+            },
+        };
+        let (events, _) = broadcast::channel(32);
+        let app = build_router(Arc::new(AppState { api, events }));
+        (app, user.0, guild.0, channel.0)
+    }
+
+    #[tokio::test]
+    async fn file_upload_and_download_requires_membership() {
+        let (app, user_id, guild_id, channel_id) = test_app().await;
+        let upload = Request::post(format!(
+            "/files/upload?user_id={user_id}&guild_id={guild_id}&channel_id={channel_id}&filename=test.bin"
+        ))
+        .body(Body::from("ciphertext"))
+        .expect("request");
+        let response = app.clone().oneshot(upload).await.expect("upload response");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let download = Request::get("/files/1?user_id=999")
+            .body(Body::empty())
+            .expect("request");
+        let response = app.oneshot(download).await.expect("download response");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
 }
