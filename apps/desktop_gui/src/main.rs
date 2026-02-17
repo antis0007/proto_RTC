@@ -204,6 +204,7 @@ impl AuthAction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ThemePreset {
     DiscordDark,
+    DiscordLegacy,
     AtomOneDark,
     EguiLight,
 }
@@ -212,6 +213,7 @@ impl ThemePreset {
     fn label(self) -> &'static str {
         match self {
             ThemePreset::DiscordDark => "Discord (Dark)",
+            ThemePreset::DiscordLegacy => "Discord (Legacy)",
             ThemePreset::AtomOneDark => "Atom One Dark",
             ThemePreset::EguiLight => "Egui Light",
         }
@@ -259,6 +261,7 @@ impl UiReadabilitySettings {
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 enum PersistedThemePreset {
     DiscordDark,
+    DiscordLegacy,
     AtomOneDark,
     EguiLight,
 }
@@ -267,6 +270,7 @@ impl From<ThemePreset> for PersistedThemePreset {
     fn from(value: ThemePreset) -> Self {
         match value {
             ThemePreset::DiscordDark => Self::DiscordDark,
+            ThemePreset::DiscordLegacy => Self::DiscordLegacy,
             ThemePreset::AtomOneDark => Self::AtomOneDark,
             ThemePreset::EguiLight => Self::EguiLight,
         }
@@ -277,6 +281,7 @@ impl From<PersistedThemePreset> for ThemePreset {
     fn from(value: PersistedThemePreset) -> Self {
         match value {
             PersistedThemePreset::DiscordDark => Self::DiscordDark,
+            PersistedThemePreset::DiscordLegacy => Self::DiscordLegacy,
             PersistedThemePreset::AtomOneDark => Self::AtomOneDark,
             PersistedThemePreset::EguiLight => Self::EguiLight,
         }
@@ -692,6 +697,11 @@ impl DesktopGuiApp {
                             &mut self.theme.preset,
                             ThemePreset::DiscordDark,
                             ThemePreset::DiscordDark.label(),
+                        );
+                        ui.selectable_value(
+                            &mut self.theme.preset,
+                            ThemePreset::DiscordLegacy,
+                            ThemePreset::DiscordLegacy.label(),
                         );
                         ui.selectable_value(
                             &mut self.theme.preset,
@@ -1177,19 +1187,25 @@ impl DesktopGuiApp {
 
                     for guild in &self.guilds {
                         let selected = self.selected_guild == Some(guild.guild_id);
-                        let base_bg = if self.theme.list_row_shading {
-                            ui.visuals().faint_bg_color
-                        } else {
-                            egui::Color32::TRANSPARENT
-                        };
-                        let selected_bg = ui.visuals().selection.bg_fill.gamma_multiply(
+                        let discord_dark = theme_discord_dark_palette(self.theme);
+                        let base_bg = discord_dark.map(|p| p.guild_list_bg).unwrap_or_else(|| {
                             if self.theme.list_row_shading {
-                                0.35
+                                ui.visuals().faint_bg_color
                             } else {
-                                0.22
-                            },
-                        );
-                        let row_fill = if selected { selected_bg } else { base_bg };
+                                egui::Color32::TRANSPARENT
+                            }
+                        });
+                        let selected_bg = discord_dark
+                            .map(|p| p.guild_entry_active)
+                            .unwrap_or_else(|| {
+                                ui.visuals().selection.bg_fill.gamma_multiply(
+                                    if self.theme.list_row_shading {
+                                        0.35
+                                    } else {
+                                        0.22
+                                    },
+                                )
+                            });
                         let row_stroke = if selected {
                             egui::Stroke::new(
                                 1.0,
@@ -1204,13 +1220,42 @@ impl DesktopGuiApp {
                             egui::Stroke::NONE
                         };
 
+                        let text_color = if selected {
+                            discord_dark
+                                .map(|p| p.guild_text_highlighted)
+                                .unwrap_or(ui.visuals().strong_text_color())
+                        } else {
+                            discord_dark
+                                .map(|p| p.guild_text_unhighlighted)
+                                .unwrap_or(ui.visuals().text_color())
+                        };
+
                         let response = egui::Frame::none()
-                            .fill(row_fill)
+                            .fill(if selected { selected_bg } else { base_bg })
                             .stroke(row_stroke)
                             .rounding(egui::Rounding::same(f32::from(self.theme.panel_rounding)))
                             .inner_margin(egui::Margin::symmetric(8.0, 6.0))
-                            .show(ui, |ui| ui.selectable_label(selected, &guild.name))
+                            .show(ui, |ui| {
+                                ui.selectable_label(
+                                    selected,
+                                    egui::RichText::new(&guild.name).color(text_color),
+                                )
+                            })
                             .inner;
+                        if response.hovered() && !selected {
+                            if let Some(palette) = discord_dark {
+                                ui.ctx()
+                                    .layer_painter(egui::LayerId::new(
+                                        egui::Order::Background,
+                                        egui::Id::new("guild_hover_row"),
+                                    ))
+                                    .rect_filled(
+                                        response.rect,
+                                        egui::Rounding::same(f32::from(self.theme.panel_rounding)),
+                                        palette.guild_entry_hover,
+                                    );
+                            }
+                        }
                         if response.clicked() {
                             self.selected_guild = Some(guild.guild_id);
                             self.selected_channel = None;
@@ -1473,6 +1518,46 @@ impl DesktopGuiApp {
                 ui.add_space(6.0);
                 let can_send = self.selected_channel.is_some();
                 ui.add_enabled_ui(can_send && self.auth_session_established, |ui| {
+                    ui.horizontal(|ui| {
+                        if ui.button("📎").on_hover_text("Attach file").clicked() {
+                            self.pending_attachment = rfd::FileDialog::new().pick_file();
+                        }
+                        let response = ui
+                            .scope(|ui| {
+                                if let Some(palette) = theme_discord_dark_palette(self.theme) {
+                                    ui.visuals_mut().extreme_bg_color =
+                                        palette.message_box_background;
+                                }
+                                ui.add_sized(
+                                    [ui.available_width() - 130.0, 72.0],
+                                    egui::TextEdit::multiline(&mut self.composer).hint_text(
+                                        "Message #channel (Enter to send, Shift+Enter for newline)",
+                                    ),
+                                )
+                            })
+                            .inner;
+                        let send_shortcut = response.has_focus()
+                            && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
+                        let clicked_send = ui
+                            .add_sized([80.0, 72.0], egui::Button::new("⬆ Send"))
+                            .clicked();
+                        let has_text = !self.composer.trim().is_empty();
+                        let has_attachment = self.pending_attachment.is_some();
+                        if (send_shortcut || clicked_send) && (has_text || has_attachment) {
+                            let text = self.composer.trim_end_matches('\n').to_string();
+                            self.composer.clear();
+                            let attachment_path = self.pending_attachment.take();
+                            queue_command(
+                                &self.cmd_tx,
+                                BackendCommand::SendMessage {
+                                    text,
+                                    attachment_path,
+                                },
+                                &mut self.status,
+                            );
+                            response.request_focus();
+                        }
+                    });
                     if let Some(path) = self.pending_attachment.clone() {
                         ui.horizontal_wrapped(|ui| {
                             ui.small(format!("Attached: {}", path.display()));
@@ -1589,125 +1674,96 @@ impl DesktopGuiApp {
             });
             ui.separator();
 
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    ui.set_min_width(ui.available_width());
-                    if let Some(channel_id) = self.selected_channel {
-                        if let Some(messages) = self.messages.get(&channel_id).cloned() {
-                            let pane_width = ui.available_width();
-                            let bubble_horizontal_padding = if pane_width < 480.0 {
-                                6.0
-                            } else if pane_width < 900.0 {
-                                10.0
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                if let Some(channel_id) = self.selected_channel {
+                    if let Some(messages) = self.messages.get(&channel_id).cloned() {
+                        for msg in &messages {
+                            let sender_display = msg
+                                .wire
+                                .sender_username
+                                .clone()
+                                .or_else(|| {
+                                    self.sender_directory.get(&msg.wire.sender_id.0).cloned()
+                                })
+                                .unwrap_or_else(|| msg.wire.sender_id.0.to_string());
+                            let sent_at =
+                                msg.wire.sent_at.format("%Y-%m-%d %H:%M:%S UTC").to_string();
+
+                            let message_margin = if self.readability.compact_density {
+                                egui::Margin::symmetric(6.0, 4.0)
                             } else {
-                                14.0
+                                egui::Margin::symmetric(8.0, 6.0)
                             };
-                            let bubble_text_max_width = (pane_width * 0.78).clamp(200.0, 760.0);
-
-                            for msg in &messages {
-                                let sender_display = msg
-                                    .wire
-                                    .sender_username
-                                    .clone()
-                                    .or_else(|| {
-                                        self.sender_directory.get(&msg.wire.sender_id.0).cloned()
-                                    })
-                                    .unwrap_or_else(|| msg.wire.sender_id.0.to_string());
-                                let sent_at =
-                                    msg.wire.sent_at.format("%Y-%m-%d %H:%M:%S UTC").to_string();
-
-                                let message_margin = if self.readability.compact_density {
-                                    egui::Margin::symmetric(6.0, 4.0)
-                                } else {
-                                    egui::Margin::symmetric(8.0, 6.0)
-                                };
-                                let frame = if self.readability.message_bubble_backgrounds {
-                                    egui::Frame::none()
-                                        .fill(ui.visuals().faint_bg_color.gamma_multiply(0.45))
-                                } else {
-                                    egui::Frame::none()
-                                };
-
-                                ui.allocate_ui_with_layout(
-                                    egui::vec2(ui.available_width(), 0.0),
-                                    egui::Layout::left_to_right(egui::Align::Min),
-                                    |ui| {
-                                        ui.set_min_width(ui.available_width());
-                                        ui.add_space(bubble_horizontal_padding);
-
-                                        let bubble_width =
-                                            (ui.available_width() - bubble_horizontal_padding)
-                                                .clamp(120.0, bubble_text_max_width);
-                                        frame
-                                            .rounding(egui::Rounding::same(f32::from(
-                                                self.theme.panel_rounding,
-                                            )))
-                                            .inner_margin(message_margin)
-                                            .show(ui, |ui| {
-                                                ui.set_max_width(bubble_width);
-                                                ui.horizontal_wrapped(|ui| {
-                                                    ui.label(
-                                                        egui::RichText::new(sender_display)
-                                                            .strong(),
+                            let discord_dark = theme_discord_dark_palette(self.theme);
+                            let base_message_bg = discord_dark
+                                .map(|p| p.message_box_background)
+                                .unwrap_or_else(|| {
+                                    ui.visuals().faint_bg_color.gamma_multiply(0.45)
+                                });
+                            let frame = if self.readability.message_bubble_backgrounds {
+                                egui::Frame::none().fill(base_message_bg)
+                            } else {
+                                egui::Frame::none()
+                            };
+                            let message_response = frame
+                                .rounding(egui::Rounding::same(f32::from(
+                                    self.theme.panel_rounding,
+                                )))
+                                .inner_margin(message_margin)
+                                .show(ui, |ui| {
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.label(egui::RichText::new(sender_display).strong());
+                                        if self.readability.show_timestamps {
+                                            ui.label(egui::RichText::new(sent_at).small().weak());
+                                        }
+                                    });
+                                    ui.label(&msg.plaintext);
+                                    if let Some(attachment) = &msg.wire.attachment {
+                                        if attachment_is_image(attachment) {
+                                            self.render_image_attachment_preview(ui, attachment);
+                                        } else {
+                                            ui.horizontal(|ui| {
+                                                ui.label(format!(
+                                                    "📎 {} ({})",
+                                                    attachment.filename,
+                                                    human_readable_bytes(attachment.size_bytes)
+                                                ));
+                                                if ui.button("Download").clicked() {
+                                                    queue_command(
+                                                        &self.cmd_tx,
+                                                        BackendCommand::DownloadAttachment {
+                                                            file_id: attachment.file_id,
+                                                            filename: attachment.filename.clone(),
+                                                        },
+                                                        &mut self.status,
                                                     );
-                                                    if self.readability.show_timestamps {
-                                                        ui.label(
-                                                            egui::RichText::new(sent_at)
-                                                                .small()
-                                                                .weak(),
-                                                        );
-                                                    }
-                                                });
-                                                ui.label(&msg.plaintext);
-                                                if let Some(attachment) = &msg.wire.attachment {
-                                                    if attachment_is_image(attachment) {
-                                                        self.render_image_attachment_preview(
-                                                            ui, attachment,
-                                                        );
-                                                    } else {
-                                                        ui.horizontal(|ui| {
-                                                            ui.label(format!(
-                                                                "📎 {} ({})",
-                                                                attachment.filename,
-                                                                human_readable_bytes(
-                                                                    attachment.size_bytes,
-                                                                )
-                                                            ));
-                                                            if ui.button("Download").clicked() {
-                                                                queue_command(
-                                                                    &self.cmd_tx,
-                                                                    BackendCommand::DownloadAttachment {
-                                                                        file_id: attachment.file_id,
-                                                                        filename: attachment
-                                                                            .filename
-                                                                            .clone(),
-                                                                    },
-                                                                    &mut self.status,
-                                                                );
-                                                            }
-                                                        });
-                                                    }
                                                 }
                                             });
-                                    },
-                                );
-
-                                ui.add_space(if self.readability.compact_density {
-                                    4.0
-                                } else {
-                                    6.0
-                                });
+                                        }
+                                    }
+                                })
+                                .response;
+                            if message_response.hovered() {
+                                if let Some(palette) = discord_dark {
+                                    ui.ctx()
+                                        .layer_painter(egui::LayerId::new(
+                                            egui::Order::Background,
+                                            egui::Id::new("message_hover_row"),
+                                        ))
+                                        .rect_filled(
+                                            message_response.rect,
+                                            egui::Rounding::same(f32::from(
+                                                self.theme.panel_rounding,
+                                            )),
+                                            palette.message_row_hover,
+                                        );
+                                }
                             }
-                        } else {
-                            ui.allocate_ui_with_layout(
-                                ui.available_size(),
-                                egui::Layout::centered_and_justified(egui::Direction::TopDown),
-                                |ui| {
-                                    ui.heading("No messages");
-                                    ui.weak("This conversation is quiet for now.");
-                                },
-                            );
+                            ui.add_space(if self.readability.compact_density {
+                                4.0
+                            } else {
+                                6.0
+                            });
                         }
                     } else {
                         ui.allocate_ui_with_layout(
@@ -1715,11 +1771,14 @@ impl DesktopGuiApp {
                             egui::Layout::centered_and_justified(egui::Direction::TopDown),
                             |ui| {
                                 ui.heading("Select a channel");
-                                ui.weak("Choose a channel from the left to view and send messages.");
+                                ui.weak(
+                                    "Choose a channel from the left to view and send messages.",
+                                );
                             },
                         );
                     }
-                });
+                }
+            });
 
             if !self.auth_session_established {
                 ui.separator();
@@ -1997,9 +2056,41 @@ fn queue_command(cmd_tx: &Sender<BackendCommand>, cmd: BackendCommand, status: &
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct DiscordDarkPalette {
+    message_box_background: egui::Color32,
+    message_row_hover: egui::Color32,
+    guild_list_bg: egui::Color32,
+    guild_entry_hover: egui::Color32,
+    guild_entry_active: egui::Color32,
+    guild_text_unhighlighted: egui::Color32,
+    guild_text_highlighted: egui::Color32,
+}
+
+fn theme_discord_dark_palette(theme: ThemeSettings) -> Option<DiscordDarkPalette> {
+    (theme.preset == ThemePreset::DiscordDark).then_some(DiscordDarkPalette {
+        message_box_background: egui::Color32::from_rgb(26, 26, 30),
+        message_row_hover: egui::Color32::from_rgb(36, 36, 40),
+        guild_list_bg: egui::Color32::from_rgb(18, 18, 20),
+        guild_entry_hover: egui::Color32::from_rgb(29, 29, 30),
+        guild_entry_active: egui::Color32::from_rgb(44, 44, 48),
+        guild_text_unhighlighted: egui::Color32::from_rgb(129, 130, 138),
+        guild_text_highlighted: egui::Color32::from_rgb(251, 251, 251),
+    })
+}
+
 fn visuals_for_theme(theme: ThemeSettings) -> egui::Visuals {
     let mut visuals = match theme.preset {
         ThemePreset::DiscordDark => {
+            let mut v = egui::Visuals::dark();
+            v.override_text_color = Some(egui::Color32::from_rgb(251, 251, 251));
+            v.window_fill = egui::Color32::from_rgb(18, 18, 20);
+            v.panel_fill = egui::Color32::from_rgb(18, 18, 20);
+            v.extreme_bg_color = egui::Color32::from_rgb(26, 26, 30);
+            v.faint_bg_color = egui::Color32::from_rgb(29, 29, 30);
+            v
+        }
+        ThemePreset::DiscordLegacy => {
             let mut v = egui::Visuals::dark();
             v.override_text_color = Some(egui::Color32::from_rgb(220, 221, 222));
             v.window_fill = egui::Color32::from_rgb(54, 57, 63);
