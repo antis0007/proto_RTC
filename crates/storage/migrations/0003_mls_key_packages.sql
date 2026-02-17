@@ -1,0 +1,7 @@
+CREATE TABLE IF NOT EXISTS mls_key_packages (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  guild_id INTEGER NOT NULL REFERENCES guilds(id),
+  user_id INTEGER NOT NULL REFERENCES users(id),
+  key_package_bytes BLOB NOT NULL,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
