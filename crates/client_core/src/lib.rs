@@ -1065,14 +1065,27 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
     }
 
     async fn emit_decrypted_message(&self, message: &MessagePayload) -> Result<()> {
-        let guild_id = self
-            .inner
-            .lock()
-            .await
-            .channel_guilds
-            .get(&message.channel_id)
-            .copied()
-            .ok_or_else(|| anyhow!("missing guild mapping for channel {}", message.channel_id.0))?;
+        let guild_id = {
+            let mut guard = self.inner.lock().await;
+            if let Some(guild_id) = guard.channel_guilds.get(&message.channel_id).copied() {
+                guild_id
+            } else if guard.selected_channel == Some(message.channel_id) {
+                if let Some(guild_id) = guard.selected_guild {
+                    guard.channel_guilds.insert(message.channel_id, guild_id);
+                    guild_id
+                } else {
+                    return Err(anyhow!(
+                        "missing guild mapping for channel {}",
+                        message.channel_id.0
+                    ));
+                }
+            } else {
+                return Err(anyhow!(
+                    "missing guild mapping for channel {}",
+                    message.channel_id.0
+                ));
+            }
+        };
         self.mls_session_manager
             .open_or_create_group(guild_id, message.channel_id)
             .await?;
@@ -1156,7 +1169,7 @@ fn map_export_error(
     source: anyhow::Error,
 ) -> LiveKitE2eeKeyError {
     let msg = source.to_string();
-    if msg.contains("no active MLS group") || msg.contains("group not initialized") {
+    if is_missing_mls_group_error(&msg) {
         LiveKitE2eeKeyError::MissingMlsGroup {
             guild_id: guild_id.0,
             channel_id: channel_id.0,
@@ -1168,6 +1181,13 @@ fn map_export_error(
             source,
         }
     }
+}
+
+fn is_missing_mls_group_error(message: &str) -> bool {
+    message.contains("no active MLS group")
+        || message.contains("group not initialized")
+        || message.contains("MLS group not opened")
+        || message.contains("MLS session missing")
 }
 
 #[async_trait]
@@ -1317,6 +1337,14 @@ impl<C: CryptoProvider + 'static> ClientHandle for Arc<RealtimeClient<C>> {
         before: Option<MessageId>,
     ) -> Result<Vec<MessagePayload>> {
         let (server_url, user_id) = self.session().await?;
+        {
+            let mut guard = self.inner.lock().await;
+            if !guard.channel_guilds.contains_key(&channel_id) {
+                if let Some(guild_id) = guard.selected_guild {
+                    guard.channel_guilds.insert(channel_id, guild_id);
+                }
+            }
+        }
         let limit = limit.clamp(1, 100);
         let messages: Vec<MessagePayload> = self
             .http
@@ -1649,6 +1677,42 @@ mod tests {
             attachment: None,
             sent_at: "2024-01-01T00:00:00Z".parse().expect("timestamp"),
         }
+    }
+
+    #[test]
+    fn classify_missing_mls_group_errors_from_all_backends() {
+        assert!(is_missing_mls_group_error(
+            "no active MLS group available for channel 9"
+        ));
+        assert!(is_missing_mls_group_error(
+            "MLS group not opened for channel 9"
+        ));
+        assert!(is_missing_mls_group_error(
+            "MLS session missing for guild 1 channel 9"
+        ));
+        assert!(is_missing_mls_group_error("MLS group not initialized"));
+        assert!(!is_missing_mls_group_error("failed to connect to server"));
+    }
+
+    #[tokio::test]
+    async fn emit_decrypted_message_backfills_channel_mapping_from_selected_context() {
+        let client = RealtimeClient::new_with_mls_session_manager(
+            PassthroughCrypto,
+            Arc::new(TestMlsSessionManager::ok(Vec::new(), b"hello".to_vec())),
+        );
+        {
+            let mut inner = client.inner.lock().await;
+            inner.selected_guild = Some(GuildId(11));
+            inner.selected_channel = Some(ChannelId(3));
+        }
+
+        client
+            .emit_decrypted_message(&sample_message())
+            .await
+            .expect("decrypt should succeed with selected channel fallback");
+
+        let inner = client.inner.lock().await;
+        assert_eq!(inner.channel_guilds.get(&ChannelId(3)), Some(&GuildId(11)));
     }
 
     #[tokio::test]

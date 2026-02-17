@@ -2168,9 +2168,13 @@ fn queue_command(cmd_tx: &Sender<BackendCommand>, cmd: BackendCommand, status: &
         Ok(()) => {}
         Err(TrySendError::Full(_)) => {
             *status = "UI command queue is full; please retry".to_string();
+            tracing::warn!("ui->backend command queue is full");
         }
         Err(TrySendError::Disconnected(_)) => {
-            *status = "Backend is unavailable".to_string();
+            *status =
+                "Backend command processor disconnected (possible startup/runtime failure); retry sign-in"
+                    .to_string();
+            tracing::error!("ui->backend command queue disconnected");
         }
     }
 }
@@ -2284,33 +2288,71 @@ impl eframe::App for DesktopGuiApp {
 
 fn spawn_backend_thread(cmd_rx: Receiver<BackendCommand>, ui_tx: Sender<UiEvent>) {
     thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
+        let runtime = match tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
-            .expect("failed to build tokio runtime");
+        {
+            Ok(runtime) => runtime,
+            Err(err) => {
+                let _ = ui_tx.try_send(UiEvent::Error(UiError::from_message(
+                    UiErrorContext::General,
+                    format!("failed to build backend runtime: {err}"),
+                )));
+                tracing::error!("failed to build backend runtime: {err}");
+                return;
+            }
+        };
 
         runtime.block_on(async move {
             let mls_db_url = match std::env::var("HOME") {
                 Ok(home) => {
                     let base = PathBuf::from(home).join(".proto_rtc");
                     if let Err(err) = std::fs::create_dir_all(&base) {
-                        panic!(
+                        let _ = ui_tx.try_send(UiEvent::Error(UiError::from_message(
+                            UiErrorContext::General,
+                            format!(
+                                "failed to create MLS state directory '{}': {err}",
+                                base.display()
+                            ),
+                        )));
+                        tracing::error!(
                             "failed to create MLS state directory '{}': {err}",
                             base.display()
                         );
+                        return;
                     }
                     DurableMlsSessionManager::sqlite_url_for_gui_data_dir(&base)
                 }
                 Err(err) => {
-                    panic!("HOME environment variable is required to initialize MLS backend: {err}")
+                    let _ = ui_tx.try_send(UiEvent::Error(UiError::from_message(
+                        UiErrorContext::General,
+                        format!(
+                            "HOME environment variable is required to initialize MLS backend: {err}"
+                        ),
+                    )));
+                    tracing::error!(
+                        "HOME environment variable is required to initialize MLS backend: {err}"
+                    );
+                    return;
                 }
             };
 
-            let mls_manager = DurableMlsSessionManager::initialize(&mls_db_url, 0, "desktop-gui")
-                .await
-                .unwrap_or_else(|err| {
-                    panic!("failed to initialize persistent MLS backend ({mls_db_url}): {err:#}")
-                });
+            let mls_manager =
+                match DurableMlsSessionManager::initialize(&mls_db_url, 0, "desktop-gui").await {
+                    Ok(manager) => manager,
+                    Err(err) => {
+                        let _ = ui_tx.try_send(UiEvent::Error(UiError::from_message(
+                            UiErrorContext::General,
+                            format!(
+                            "failed to initialize persistent MLS backend ({mls_db_url}): {err:#}"
+                        ),
+                        )));
+                        tracing::error!(
+                            "failed to initialize persistent MLS backend ({mls_db_url}): {err:#}"
+                        );
+                        return;
+                    }
+                };
 
             let client =
                 RealtimeClient::new_with_mls_session_manager(PassthroughCrypto, mls_manager);
@@ -2606,7 +2648,7 @@ fn main() -> eframe::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{human_readable_bytes, DisplayMessage};
+    use super::{human_readable_bytes, DisplayMessage, UiError, UiErrorCategory, UiErrorContext};
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     use shared::domain::{ChannelId, MessageId, UserId};
     use shared::protocol::MessagePayload;
@@ -2620,6 +2662,16 @@ mod tests {
         assert_eq!(human_readable_bytes(2 * 1024 * 1024), "2 MB");
         assert_eq!(human_readable_bytes(1572864), "1.5 MB");
         assert_eq!(human_readable_bytes(3 * 1024 * 1024 * 1024), "3 GB");
+    }
+
+    #[test]
+    fn classifies_backend_command_processor_disconnect_as_transport_error() {
+        let err = UiError::from_message(
+            UiErrorContext::General,
+            "Backend command processor disconnected (possible startup/runtime failure)",
+        );
+        assert_eq!(err.category, UiErrorCategory::Transport);
+        assert!(!err.requires_reauth());
     }
 
     #[test]
