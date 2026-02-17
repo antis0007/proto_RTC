@@ -616,7 +616,13 @@ fn main() -> eframe::Result<()> {
     let (ui_tx, ui_rx) = bounded::<UiEvent>(2048);
     spawn_backend_thread(cmd_rx, ui_tx);
 
-    let options = eframe::NativeOptions::default();
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_title("Prototype RTC Desktop GUI")
+            .with_inner_size([1280.0, 800.0])
+            .with_min_inner_size([980.0, 640.0]),
+        ..Default::default()
+    };
     eframe::run_native(
         "Prototype RTC Desktop GUI",
         options,
