@@ -1,6 +1,7 @@
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use chrono::Utc;
 use livekit_integration::{mint_token, room_name_for_voice_channel, LiveKitConfig};
+use serde::{Deserialize, Serialize};
 use shared::{
     domain::{ChannelId, ChannelKind, GuildId, Role, UserId},
     error::{ApiError, ErrorCode},
@@ -14,6 +15,48 @@ use storage::{Storage, StoredAttachment};
 pub struct ApiContext {
     pub storage: Storage,
     pub livekit: LiveKitConfig,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct MlsKeyPackageQuery {
+    pub guild_id: i64,
+    pub user_id: i64,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct MlsWelcomeQuery {
+    pub user_id: i64,
+    pub guild_id: i64,
+    pub channel_id: i64,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct UploadKeyPackageResponse {
+    pub key_package_id: i64,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct KeyPackageResponse {
+    pub key_package_id: i64,
+    pub guild_id: i64,
+    pub user_id: i64,
+    pub key_package_b64: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct MlsWelcomeResponse {
+    pub user_id: i64,
+    pub guild_id: i64,
+    pub channel_id: i64,
+    pub welcome_b64: String,
+}
+
+pub fn mls_key_packages_route() -> &'static str {
+    "/mls/key_packages"
+}
+
+pub fn mls_welcome_route() -> &'static str {
+    "/mls/welcome"
 }
 
 #[derive(Default)]
@@ -234,6 +277,28 @@ pub async fn request_livekit_token(
         room_name,
         token,
     })
+}
+
+pub async fn ensure_active_membership_in_channel(
+    ctx: &ApiContext,
+    user_id: UserId,
+    guild_id: GuildId,
+    channel_id: ChannelId,
+) -> Result<(), ApiError> {
+    ensure_active_membership(ctx, guild_id, user_id).await?;
+    let actual_guild_id = ctx
+        .storage
+        .guild_for_channel(channel_id)
+        .await
+        .map_err(internal)?
+        .ok_or_else(|| ApiError::new(ErrorCode::NotFound, "channel not found"))?;
+    if actual_guild_id != guild_id {
+        return Err(ApiError::new(
+            ErrorCode::Validation,
+            "channel does not belong to guild",
+        ));
+    }
+    Ok(())
 }
 
 async fn ensure_active_membership(
