@@ -402,6 +402,55 @@ impl Storage {
 
         Ok(row.map(|r| (r.get::<i64, _>(0), r.get::<Vec<u8>, _>(1))))
     }
+
+    pub async fn insert_pending_welcome(
+        &self,
+        guild_id: GuildId,
+        channel_id: ChannelId,
+        user_id: UserId,
+        welcome_bytes: &[u8],
+    ) -> Result<i64> {
+        let rec = sqlx::query(
+            "INSERT INTO pending_welcomes (guild_id, channel_id, user_id, welcome_bytes)
+             VALUES (?, ?, ?, ?)
+             RETURNING id",
+        )
+        .bind(guild_id.0)
+        .bind(channel_id.0)
+        .bind(user_id.0)
+        .bind(welcome_bytes)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(rec.get::<i64, _>(0))
+    }
+
+    pub async fn load_and_consume_pending_welcome(
+        &self,
+        guild_id: GuildId,
+        channel_id: ChannelId,
+        user_id: UserId,
+    ) -> Result<Option<Vec<u8>>> {
+        let row = sqlx::query(
+            "UPDATE pending_welcomes
+             SET consumed_at = CURRENT_TIMESTAMP
+             WHERE id = (
+                SELECT id
+                FROM pending_welcomes
+                WHERE guild_id = ? AND channel_id = ? AND user_id = ? AND consumed_at IS NULL
+                ORDER BY id DESC
+                LIMIT 1
+             )
+             RETURNING welcome_bytes",
+        )
+        .bind(guild_id.0)
+        .bind(channel_id.0)
+        .bind(user_id.0)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(|r| r.get::<Vec<u8>, _>(0)))
+    }
 }
 
 fn ensure_sqlite_parent_dir_exists(database_url: &str) -> Result<()> {
@@ -625,6 +674,148 @@ mod tests {
             .expect("some latest");
         assert_eq!(latest.0, second_id);
         assert_eq!(latest.1, b"kp-2");
+    }
+
+    #[tokio::test]
+    async fn loads_latest_unconsumed_pending_welcome() {
+        let storage = Storage::new("sqlite::memory:").await.expect("db");
+        let user = storage.create_user("erin").await.expect("user");
+        let guild = storage
+            .create_guild("onboarding", user)
+            .await
+            .expect("guild");
+        let channel = storage
+            .create_channel(guild, "general", ChannelKind::Text)
+            .await
+            .expect("channel");
+
+        storage
+            .insert_pending_welcome(guild, channel, user, b"welcome-v1")
+            .await
+            .expect("insert welcome");
+        storage
+            .insert_pending_welcome(guild, channel, user, b"welcome-v2")
+            .await
+            .expect("insert welcome");
+
+        let welcome = storage
+            .load_and_consume_pending_welcome(guild, channel, user)
+            .await
+            .expect("load welcome")
+            .expect("welcome exists");
+        assert_eq!(welcome, b"welcome-v2");
+    }
+
+    #[tokio::test]
+    async fn consumed_pending_welcome_is_not_returned_again() {
+        let storage = Storage::new("sqlite::memory:").await.expect("db");
+        let user = storage.create_user("frank").await.expect("user");
+        let guild = storage
+            .create_guild("onboarding", user)
+            .await
+            .expect("guild");
+        let channel = storage
+            .create_channel(guild, "general", ChannelKind::Text)
+            .await
+            .expect("channel");
+
+        storage
+            .insert_pending_welcome(guild, channel, user, b"single-use")
+            .await
+            .expect("insert welcome");
+
+        let first = storage
+            .load_and_consume_pending_welcome(guild, channel, user)
+            .await
+            .expect("first load");
+        assert_eq!(first.as_deref(), Some(b"single-use".as_ref()));
+
+        let second = storage
+            .load_and_consume_pending_welcome(guild, channel, user)
+            .await
+            .expect("second load");
+        assert!(second.is_none());
+    }
+
+    #[tokio::test]
+    async fn pending_welcome_lookup_is_isolated_by_guild_channel_and_user() {
+        let storage = Storage::new("sqlite::memory:").await.expect("db");
+
+        let alice = storage.create_user("alice-isolation").await.expect("alice");
+        let bob = storage.create_user("bob-isolation").await.expect("bob");
+
+        let guild_a = storage
+            .create_guild("guild-a", alice)
+            .await
+            .expect("guild a");
+        storage
+            .add_membership(guild_a, bob, Role::Member, false, false)
+            .await
+            .expect("membership");
+
+        let guild_b = storage.create_guild("guild-b", bob).await.expect("guild b");
+        storage
+            .add_membership(guild_b, alice, Role::Member, false, false)
+            .await
+            .expect("membership");
+
+        let channel_a1 = storage
+            .create_channel(guild_a, "general", ChannelKind::Text)
+            .await
+            .expect("channel a1");
+        let channel_a2 = storage
+            .create_channel(guild_a, "random", ChannelKind::Text)
+            .await
+            .expect("channel a2");
+        let channel_b1 = storage
+            .create_channel(guild_b, "general", ChannelKind::Text)
+            .await
+            .expect("channel b1");
+
+        storage
+            .insert_pending_welcome(guild_a, channel_a1, alice, b"target")
+            .await
+            .expect("insert target");
+        storage
+            .insert_pending_welcome(guild_a, channel_a1, bob, b"other-user")
+            .await
+            .expect("insert other user");
+        storage
+            .insert_pending_welcome(guild_a, channel_a2, alice, b"other-channel")
+            .await
+            .expect("insert other channel");
+        storage
+            .insert_pending_welcome(guild_b, channel_b1, alice, b"other-guild")
+            .await
+            .expect("insert other guild");
+
+        let welcome = storage
+            .load_and_consume_pending_welcome(guild_a, channel_a1, alice)
+            .await
+            .expect("load target")
+            .expect("target exists");
+        assert_eq!(welcome, b"target");
+
+        let other_user = storage
+            .load_and_consume_pending_welcome(guild_a, channel_a1, bob)
+            .await
+            .expect("load other user")
+            .expect("other user exists");
+        assert_eq!(other_user, b"other-user");
+
+        let other_channel = storage
+            .load_and_consume_pending_welcome(guild_a, channel_a2, alice)
+            .await
+            .expect("load other channel")
+            .expect("other channel exists");
+        assert_eq!(other_channel, b"other-channel");
+
+        let other_guild = storage
+            .load_and_consume_pending_welcome(guild_b, channel_b1, alice)
+            .await
+            .expect("load other guild")
+            .expect("other guild exists");
+        assert_eq!(other_guild, b"other-guild");
     }
 
     #[tokio::test]
