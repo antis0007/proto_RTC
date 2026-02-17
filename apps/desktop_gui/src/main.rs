@@ -1473,38 +1473,6 @@ impl DesktopGuiApp {
                 ui.add_space(6.0);
                 let can_send = self.selected_channel.is_some();
                 ui.add_enabled_ui(can_send && self.auth_session_established, |ui| {
-                    ui.horizontal(|ui| {
-                        if ui.button("📎").on_hover_text("Attach file").clicked() {
-                            self.pending_attachment = rfd::FileDialog::new().pick_file();
-                        }
-                        let response = ui.add_sized(
-                            [ui.available_width() - 130.0, 72.0],
-                            egui::TextEdit::multiline(&mut self.composer).hint_text(
-                                "Message #channel (Enter to send, Shift+Enter for newline)",
-                            ),
-                        );
-                        let send_shortcut = response.has_focus()
-                            && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
-                        let clicked_send = ui
-                            .add_sized([80.0, 72.0], egui::Button::new("⬆ Send"))
-                            .clicked();
-                        let has_text = !self.composer.trim().is_empty();
-                        let has_attachment = self.pending_attachment.is_some();
-                        if (send_shortcut || clicked_send) && (has_text || has_attachment) {
-                            let text = self.composer.trim_end_matches('\n').to_string();
-                            self.composer.clear();
-                            let attachment_path = self.pending_attachment.take();
-                            queue_command(
-                                &self.cmd_tx,
-                                BackendCommand::SendMessage {
-                                    text,
-                                    attachment_path,
-                                },
-                                &mut self.status,
-                            );
-                            response.request_focus();
-                        }
-                    });
                     if let Some(path) = self.pending_attachment.clone() {
                         ui.horizontal_wrapped(|ui| {
                             ui.small(format!("Attached: {}", path.display()));
@@ -1560,7 +1528,41 @@ impl DesktopGuiApp {
                                 });
                             }
                         }
+                        ui.add_space(6.0);
                     }
+
+                    ui.horizontal(|ui| {
+                        if ui.button("📎").on_hover_text("Attach file").clicked() {
+                            self.pending_attachment = rfd::FileDialog::new().pick_file();
+                        }
+                        let response = ui.add_sized(
+                            [ui.available_width() - 130.0, 72.0],
+                            egui::TextEdit::multiline(&mut self.composer).hint_text(
+                                "Message #channel (Enter to send, Shift+Enter for newline)",
+                            ),
+                        );
+                        let send_shortcut = response.has_focus()
+                            && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
+                        let clicked_send = ui
+                            .add_sized([80.0, 72.0], egui::Button::new("⬆ Send"))
+                            .clicked();
+                        let has_text = !self.composer.trim().is_empty();
+                        let has_attachment = self.pending_attachment.is_some();
+                        if (send_shortcut || clicked_send) && (has_text || has_attachment) {
+                            let text = self.composer.trim_end_matches('\n').to_string();
+                            self.composer.clear();
+                            let attachment_path = self.pending_attachment.take();
+                            queue_command(
+                                &self.cmd_tx,
+                                BackendCommand::SendMessage {
+                                    text,
+                                    attachment_path,
+                                },
+                                &mut self.status,
+                            );
+                            response.request_focus();
+                        }
+                    });
                 });
                 if !can_send {
                     ui.centered_and_justified(|ui| {
@@ -1587,96 +1589,137 @@ impl DesktopGuiApp {
             });
             ui.separator();
 
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                if let Some(channel_id) = self.selected_channel {
-                    if let Some(messages) = self.messages.get(&channel_id).cloned() {
-                        for msg in &messages {
-                            let sender_display = msg
-                                .wire
-                                .sender_username
-                                .clone()
-                                .or_else(|| {
-                                    self.sender_directory.get(&msg.wire.sender_id.0).cloned()
-                                })
-                                .unwrap_or_else(|| msg.wire.sender_id.0.to_string());
-                            let sent_at =
-                                msg.wire.sent_at.format("%Y-%m-%d %H:%M:%S UTC").to_string();
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    if let Some(channel_id) = self.selected_channel {
+                        if let Some(messages) = self.messages.get(&channel_id).cloned() {
+                            let pane_width = ui.available_width();
+                            let bubble_horizontal_padding = if pane_width < 480.0 {
+                                6.0
+                            } else if pane_width < 900.0 {
+                                10.0
+                            } else {
+                                14.0
+                            };
+                            let bubble_text_max_width = (pane_width * 0.78).clamp(200.0, 760.0);
 
-                            let message_margin = if self.readability.compact_density {
-                                egui::Margin::symmetric(6.0, 4.0)
-                            } else {
-                                egui::Margin::symmetric(8.0, 6.0)
-                            };
-                            let frame = if self.readability.message_bubble_backgrounds {
-                                egui::Frame::none()
-                                    .fill(ui.visuals().faint_bg_color.gamma_multiply(0.45))
-                            } else {
-                                egui::Frame::none()
-                            };
-                            frame
-                                .rounding(egui::Rounding::same(f32::from(
-                                    self.theme.panel_rounding,
-                                )))
-                                .inner_margin(message_margin)
-                                .show(ui, |ui| {
-                                    ui.horizontal_wrapped(|ui| {
-                                        ui.label(egui::RichText::new(sender_display).strong());
-                                        if self.readability.show_timestamps {
-                                            ui.label(egui::RichText::new(sent_at).small().weak());
-                                        }
-                                    });
-                                    ui.label(&msg.plaintext);
-                                    if let Some(attachment) = &msg.wire.attachment {
-                                        if attachment_is_image(attachment) {
-                                            self.render_image_attachment_preview(ui, attachment);
-                                        } else {
-                                            ui.horizontal(|ui| {
-                                                ui.label(format!(
-                                                    "📎 {} ({})",
-                                                    attachment.filename,
-                                                    human_readable_bytes(attachment.size_bytes)
-                                                ));
-                                                if ui.button("Download").clicked() {
-                                                    queue_command(
-                                                        &self.cmd_tx,
-                                                        BackendCommand::DownloadAttachment {
-                                                            file_id: attachment.file_id,
-                                                            filename: attachment.filename.clone(),
-                                                        },
-                                                        &mut self.status,
+                            for msg in &messages {
+                                let sender_display = msg
+                                    .wire
+                                    .sender_username
+                                    .clone()
+                                    .or_else(|| {
+                                        self.sender_directory.get(&msg.wire.sender_id.0).cloned()
+                                    })
+                                    .unwrap_or_else(|| msg.wire.sender_id.0.to_string());
+                                let sent_at =
+                                    msg.wire.sent_at.format("%Y-%m-%d %H:%M:%S UTC").to_string();
+
+                                let message_margin = if self.readability.compact_density {
+                                    egui::Margin::symmetric(6.0, 4.0)
+                                } else {
+                                    egui::Margin::symmetric(8.0, 6.0)
+                                };
+                                let frame = if self.readability.message_bubble_backgrounds {
+                                    egui::Frame::none()
+                                        .fill(ui.visuals().faint_bg_color.gamma_multiply(0.45))
+                                } else {
+                                    egui::Frame::none()
+                                };
+
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(ui.available_width(), 0.0),
+                                    egui::Layout::left_to_right(egui::Align::Min),
+                                    |ui| {
+                                        ui.set_min_width(ui.available_width());
+                                        ui.add_space(bubble_horizontal_padding);
+
+                                        let bubble_width =
+                                            (ui.available_width() - bubble_horizontal_padding)
+                                                .clamp(120.0, bubble_text_max_width);
+                                        frame
+                                            .rounding(egui::Rounding::same(f32::from(
+                                                self.theme.panel_rounding,
+                                            )))
+                                            .inner_margin(message_margin)
+                                            .show(ui, |ui| {
+                                                ui.set_max_width(bubble_width);
+                                                ui.horizontal_wrapped(|ui| {
+                                                    ui.label(
+                                                        egui::RichText::new(sender_display)
+                                                            .strong(),
                                                     );
+                                                    if self.readability.show_timestamps {
+                                                        ui.label(
+                                                            egui::RichText::new(sent_at)
+                                                                .small()
+                                                                .weak(),
+                                                        );
+                                                    }
+                                                });
+                                                ui.label(&msg.plaintext);
+                                                if let Some(attachment) = &msg.wire.attachment {
+                                                    if attachment_is_image(attachment) {
+                                                        self.render_image_attachment_preview(
+                                                            ui, attachment,
+                                                        );
+                                                    } else {
+                                                        ui.horizontal(|ui| {
+                                                            ui.label(format!(
+                                                                "📎 {} ({})",
+                                                                attachment.filename,
+                                                                human_readable_bytes(
+                                                                    attachment.size_bytes,
+                                                                )
+                                                            ));
+                                                            if ui.button("Download").clicked() {
+                                                                queue_command(
+                                                                    &self.cmd_tx,
+                                                                    BackendCommand::DownloadAttachment {
+                                                                        file_id: attachment.file_id,
+                                                                        filename: attachment
+                                                                            .filename
+                                                                            .clone(),
+                                                                    },
+                                                                    &mut self.status,
+                                                                );
+                                                            }
+                                                        });
+                                                    }
                                                 }
                                             });
-                                        }
-                                    }
+                                    },
+                                );
+
+                                ui.add_space(if self.readability.compact_density {
+                                    4.0
+                                } else {
+                                    6.0
                                 });
-                            ui.add_space(if self.readability.compact_density {
-                                4.0
-                            } else {
-                                6.0
-                            });
+                            }
+                        } else {
+                            ui.allocate_ui_with_layout(
+                                ui.available_size(),
+                                egui::Layout::centered_and_justified(egui::Direction::TopDown),
+                                |ui| {
+                                    ui.heading("No messages");
+                                    ui.weak("This conversation is quiet for now.");
+                                },
+                            );
                         }
                     } else {
                         ui.allocate_ui_with_layout(
                             ui.available_size(),
                             egui::Layout::centered_and_justified(egui::Direction::TopDown),
                             |ui| {
-                                ui.heading("No messages");
-                                ui.weak("This conversation is quiet for now.");
+                                ui.heading("Select a channel");
+                                ui.weak("Choose a channel from the left to view and send messages.");
                             },
                         );
                     }
-                } else {
-                    ui.allocate_ui_with_layout(
-                        ui.available_size(),
-                        egui::Layout::centered_and_justified(egui::Direction::TopDown),
-                        |ui| {
-                            ui.heading("Select a channel");
-                            ui.weak("Choose a channel from the left to view and send messages.");
-                        },
-                    );
-                }
-            });
+                });
 
             if !self.auth_session_established {
                 ui.separator();
