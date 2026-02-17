@@ -15,6 +15,7 @@ if [[ $# -gt 0 ]]; then
 fi
 
 export SERVER_BIND="0.0.0.0:${PORT}"
+export APP__BIND_ADDR="$SERVER_BIND"
 export SERVER_PUBLIC_URL="http://${LAN_HOST}:${PORT}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
