@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -7,8 +7,8 @@ use futures::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use shared::{
-    domain::{ChannelId, GuildId},
-    protocol::{ChannelSummary, ClientRequest, GuildSummary, ServerEvent},
+    domain::{ChannelId, GuildId, MessageId},
+    protocol::{ChannelSummary, ClientRequest, GuildSummary, MessagePayload, ServerEvent},
 };
 use tokio::sync::{broadcast, Mutex};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
@@ -128,6 +128,12 @@ pub trait ClientHandle: Send + Sync {
     async fn list_guilds(&self) -> Result<()>;
     async fn list_channels(&self, guild_id: GuildId) -> Result<()>;
     async fn select_channel(&self, channel_id: ChannelId) -> Result<()>;
+    async fn fetch_messages(
+        &self,
+        channel_id: ChannelId,
+        limit: u32,
+        before: Option<MessageId>,
+    ) -> Result<Vec<MessagePayload>>;
     async fn send_message(&self, text: &str) -> Result<()>;
     async fn create_invite(&self, guild_id: GuildId) -> Result<String>;
     async fn join_with_invite(&self, invite_code: &str) -> Result<()>;
@@ -147,6 +153,15 @@ struct RealtimeClientState {
     selected_guild: Option<GuildId>,
     selected_channel: Option<ChannelId>,
     ws_started: bool,
+    channel_guilds: HashMap<ChannelId, GuildId>,
+}
+
+#[derive(Serialize)]
+struct ListMessagesQuery {
+    user_id: i64,
+    limit: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    before: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -169,6 +184,7 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
                 selected_guild: None,
                 selected_channel: None,
                 ws_started: false,
+                channel_guilds: HashMap::new(),
             }),
             events,
         })
@@ -258,6 +274,7 @@ impl<C: CryptoProvider + 'static> ClientHandle for Arc<RealtimeClient<C>> {
             guard.selected_guild = None;
             guard.selected_channel = None;
             guard.ws_started = true;
+            guard.channel_guilds.clear();
         }
 
         self.spawn_ws_events(server_url, body.user_id).await
@@ -300,6 +317,15 @@ impl<C: CryptoProvider + 'static> ClientHandle for Arc<RealtimeClient<C>> {
             .json()
             .await?;
 
+        {
+            let mut guard = self.inner.lock().await;
+            for channel in &channels {
+                guard
+                    .channel_guilds
+                    .insert(channel.channel_id, channel.guild_id);
+            }
+        }
+
         for channel in channels {
             let _ = self
                 .events
@@ -309,9 +335,48 @@ impl<C: CryptoProvider + 'static> ClientHandle for Arc<RealtimeClient<C>> {
     }
 
     async fn select_channel(&self, channel_id: ChannelId) -> Result<()> {
-        let mut guard = self.inner.lock().await;
-        guard.selected_channel = Some(channel_id);
+        {
+            let mut guard = self.inner.lock().await;
+            guard.selected_channel = Some(channel_id);
+            if let Some(guild_id) = guard.channel_guilds.get(&channel_id).copied() {
+                guard.selected_guild = Some(guild_id);
+            }
+        }
+        self.fetch_messages(channel_id, 100, None).await?;
         Ok(())
+    }
+
+    async fn fetch_messages(
+        &self,
+        channel_id: ChannelId,
+        limit: u32,
+        before: Option<MessageId>,
+    ) -> Result<Vec<MessagePayload>> {
+        let (server_url, user_id) = self.session().await?;
+        let limit = limit.clamp(1, 100);
+        let messages: Vec<MessagePayload> = self
+            .http
+            .get(format!("{server_url}/channels/{}/messages", channel_id.0))
+            .query(&ListMessagesQuery {
+                user_id,
+                limit,
+                before: before.map(|id| id.0),
+            })
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+
+        for message in &messages {
+            let _ = self
+                .events
+                .send(ClientEvent::Server(ServerEvent::MessageReceived {
+                    message: message.clone(),
+                }));
+        }
+
+        Ok(messages)
     }
 
     async fn send_message(&self, text: &str) -> Result<()> {
@@ -324,10 +389,13 @@ impl<C: CryptoProvider + 'static> ClientHandle for Arc<RealtimeClient<C>> {
             let user_id = guard
                 .user_id
                 .ok_or_else(|| anyhow!("not logged in: missing user_id"))?;
-            let guild_id = guard.selected_guild.unwrap_or(GuildId(1));
             let channel_id = guard
                 .selected_channel
                 .ok_or_else(|| anyhow!("no channel selected"))?;
+            let guild_id = guard
+                .selected_guild
+                .or_else(|| guard.channel_guilds.get(&channel_id).copied())
+                .ok_or_else(|| anyhow!("no guild selected"))?;
             (server_url, user_id, guild_id, channel_id)
         };
 

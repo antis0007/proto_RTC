@@ -186,6 +186,60 @@ impl Storage {
         Ok(MessageId(rec.get::<i64, _>(0)))
     }
 
+    pub async fn guild_for_channel(&self, channel_id: ChannelId) -> Result<Option<GuildId>> {
+        let row = sqlx::query("SELECT guild_id FROM channels WHERE id = ?")
+            .bind(channel_id.0)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|r| GuildId(r.get::<i64, _>(0))))
+    }
+
+    pub async fn list_channel_messages(
+        &self,
+        channel_id: ChannelId,
+        limit: u32,
+        before: Option<i64>,
+    ) -> Result<Vec<StoredMessage>> {
+        let mut rows = if let Some(before_id) = before {
+            sqlx::query(
+                "SELECT id, channel_id, sender_user_id, ciphertext, created_at
+                 FROM messages
+                 WHERE channel_id = ? AND id < ?
+                 ORDER BY id DESC
+                 LIMIT ?",
+            )
+            .bind(channel_id.0)
+            .bind(before_id)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query(
+                "SELECT id, channel_id, sender_user_id, ciphertext, created_at
+                 FROM messages
+                 WHERE channel_id = ?
+                 ORDER BY id DESC
+                 LIMIT ?",
+            )
+            .bind(channel_id.0)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?
+        };
+
+        rows.reverse();
+        Ok(rows
+            .into_iter()
+            .map(|r| StoredMessage {
+                message_id: MessageId(r.get::<i64, _>(0)),
+                channel_id: ChannelId(r.get::<i64, _>(1)),
+                sender_id: UserId(r.get::<i64, _>(2)),
+                ciphertext: r.get::<Vec<u8>, _>(3),
+                created_at: r.get::<DateTime<Utc>, _>(4),
+            })
+            .collect())
+    }
+
     pub async fn store_file_ciphertext(
         &self,
         uploader_id: UserId,
@@ -309,5 +363,43 @@ mod tests {
             .await
             .expect("message");
         assert!(message.0 > 0);
+    }
+
+    #[tokio::test]
+    async fn paginates_channel_messages() {
+        let storage = Storage::new("sqlite::memory:").await.expect("db");
+        let user = storage.create_user("bob").await.expect("user");
+        let guild = storage.create_guild("ops", user).await.expect("guild");
+        let channel = storage
+            .create_channel(guild, "general", ChannelKind::Text)
+            .await
+            .expect("channel");
+
+        let first = storage
+            .insert_message_ciphertext(channel, user, b"first")
+            .await
+            .expect("first");
+        let second = storage
+            .insert_message_ciphertext(channel, user, b"second")
+            .await
+            .expect("second");
+        let _third = storage
+            .insert_message_ciphertext(channel, user, b"third")
+            .await
+            .expect("third");
+
+        let newest_two = storage
+            .list_channel_messages(channel, 2, None)
+            .await
+            .expect("messages");
+        assert_eq!(newest_two.len(), 2);
+        assert_eq!(newest_two[0].message_id, second);
+
+        let older = storage
+            .list_channel_messages(channel, 2, Some(second.0))
+            .await
+            .expect("messages");
+        assert_eq!(older.len(), 1);
+        assert_eq!(older[0].message_id, first);
     }
 }

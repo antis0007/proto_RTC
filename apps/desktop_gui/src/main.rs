@@ -1,11 +1,14 @@
-use std::{collections::HashMap, thread};
+use std::{
+    collections::{HashMap, HashSet},
+    thread,
+};
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use client_core::{ClientEvent, ClientHandle, PassthroughCrypto, RealtimeClient};
 use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 use eframe::egui;
 use shared::{
-    domain::{ChannelId, ChannelKind, GuildId},
+    domain::{ChannelId, ChannelKind, GuildId, MessageId},
     protocol::{ChannelSummary, GuildSummary, MessagePayload, ServerEvent},
 };
 
@@ -21,6 +24,10 @@ enum BackendCommand {
     },
     SelectChannel {
         channel_id: ChannelId,
+    },
+    LoadMoreMessages {
+        channel_id: ChannelId,
+        before: MessageId,
     },
     SendMessage {
         text: String,
@@ -87,6 +94,7 @@ struct DesktopGuiApp {
     selected_guild: Option<GuildId>,
     selected_channel: Option<ChannelId>,
     messages: HashMap<ChannelId, Vec<MessagePayload>>,
+    message_ids: HashMap<ChannelId, HashSet<MessageId>>,
     status: String,
     settings_open: bool,
     theme: ThemeSettings,
@@ -107,6 +115,7 @@ impl DesktopGuiApp {
             selected_guild: None,
             selected_channel: None,
             messages: HashMap::new(),
+            message_ids: HashMap::new(),
             status: "Not logged in".to_string(),
             settings_open: false,
             theme: ThemeSettings::discord_default(),
@@ -118,7 +127,13 @@ impl DesktopGuiApp {
         while let Ok(event) = self.ui_rx.try_recv() {
             match event {
                 UiEvent::LoginOk => {
-                    self.status = "Logged in".to_string();
+                    self.status = "Logged in - syncing guilds".to_string();
+                    self.guilds.clear();
+                    self.channels.clear();
+                    self.messages.clear();
+                    self.message_ids.clear();
+                    self.selected_guild = None;
+                    self.selected_channel = None;
                     queue_command(&self.cmd_tx, BackendCommand::ListGuilds, &mut self.status);
                 }
                 UiEvent::Info(message) => {
@@ -154,14 +169,25 @@ impl DesktopGuiApp {
                             .iter()
                             .any(|c| c.channel_id == channel.channel_id)
                         {
+                            let channel_id = channel.channel_id;
                             self.channels.push(channel);
+                            if self.selected_channel.is_none() {
+                                self.selected_channel = Some(channel_id);
+                                queue_command(
+                                    &self.cmd_tx,
+                                    BackendCommand::SelectChannel { channel_id },
+                                    &mut self.status,
+                                );
+                            }
                         }
                     }
                     ServerEvent::MessageReceived { message } => {
-                        self.messages
-                            .entry(message.channel_id)
-                            .or_default()
-                            .push(message);
+                        let ids = self.message_ids.entry(message.channel_id).or_default();
+                        if ids.insert(message.message_id) {
+                            let messages = self.messages.entry(message.channel_id).or_default();
+                            messages.push(message);
+                            messages.sort_by_key(|m| m.message_id.0);
+                        }
                     }
                     ServerEvent::Error(err) => {
                         self.status = format!("Server error: {}", err.message);
@@ -170,6 +196,13 @@ impl DesktopGuiApp {
                 },
             }
         }
+    }
+
+    fn oldest_message_id(&self, channel_id: ChannelId) -> Option<MessageId> {
+        self.messages
+            .get(&channel_id)
+            .and_then(|messages| messages.first())
+            .map(|message| message.message_id)
     }
 
     fn apply_theme_if_needed(&mut self, ctx: &egui::Context) {
@@ -346,6 +379,7 @@ impl eframe::App for DesktopGuiApp {
                     let selected = self.selected_guild == Some(guild.guild_id);
                     if ui.selectable_label(selected, &guild.name).clicked() {
                         self.selected_guild = Some(guild.guild_id);
+                        self.selected_channel = None;
                         self.channels.clear();
                         queue_command(
                             &self.cmd_tx,
@@ -406,7 +440,20 @@ impl eframe::App for DesktopGuiApp {
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("Messages");
+            ui.horizontal(|ui| {
+                ui.heading("Messages");
+                if let Some(channel_id) = self.selected_channel {
+                    if ui.button("Load older").clicked() {
+                        if let Some(before) = self.oldest_message_id(channel_id) {
+                            queue_command(
+                                &self.cmd_tx,
+                                BackendCommand::LoadMoreMessages { channel_id, before },
+                                &mut self.status,
+                            );
+                        }
+                    }
+                }
+            });
             ui.separator();
 
             egui::ScrollArea::vertical().show(ui, |ui| {
@@ -429,22 +476,26 @@ impl eframe::App for DesktopGuiApp {
             });
 
             ui.separator();
-            let response = ui.add(
-                egui::TextEdit::singleline(&mut self.composer)
-                    .hint_text("Type a message and press Enter"),
-            );
-            let should_send = response.lost_focus()
-                && ui.input(|i| i.key_pressed(egui::Key::Enter))
-                && !self.composer.trim().is_empty();
-            if should_send {
-                let text = std::mem::take(&mut self.composer);
-                queue_command(
-                    &self.cmd_tx,
-                    BackendCommand::SendMessage { text },
-                    &mut self.status,
+            ui.horizontal(|ui| {
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut self.composer)
+                        .hint_text("Type a message and press Enter"),
                 );
-                response.request_focus();
-            }
+                let pressed_enter =
+                    response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                let clicked_send = ui.button("Send").clicked();
+                let should_send =
+                    (pressed_enter || clicked_send) && !self.composer.trim().is_empty();
+                if should_send {
+                    let text = std::mem::take(&mut self.composer);
+                    queue_command(
+                        &self.cmd_tx,
+                        BackendCommand::SendMessage { text },
+                        &mut self.status,
+                    );
+                    response.request_focus();
+                }
+            });
         });
 
         ctx.request_repaint();
@@ -513,6 +564,12 @@ fn spawn_backend_thread(cmd_rx: Receiver<BackendCommand>, ui_tx: Sender<UiEvent>
                     }
                     BackendCommand::SelectChannel { channel_id } => {
                         if let Err(err) = client.select_channel(channel_id).await {
+                            let _ = ui_tx.try_send(UiEvent::Error(err.to_string()));
+                        }
+                    }
+                    BackendCommand::LoadMoreMessages { channel_id, before } => {
+                        if let Err(err) = client.fetch_messages(channel_id, 100, Some(before)).await
+                        {
                             let _ = ui_tx.try_send(UiEvent::Error(err.to_string()));
                         }
                     }
