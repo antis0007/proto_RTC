@@ -765,10 +765,7 @@ impl DesktopGuiApp {
             color_image,
             egui::TextureOptions::LINEAR,
         );
-        let preview_png = match encode_rgba_png(rgba.as_raw(), w, h) {
-            Ok(bytes) => bytes,
-            Err(_) => Vec::new(),
-        };
+        let preview_png = encode_rgba_png(rgba.as_raw(), w, h).unwrap_or_default();
         let preview = AttachmentPreview::Image {
             texture,
             size: egui::vec2(w as f32, h as f32),
