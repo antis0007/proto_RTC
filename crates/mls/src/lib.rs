@@ -120,7 +120,7 @@ impl<S: MlsStore> MlsGroupHandle<S> {
         key_package_bytes: &[u8],
     ) -> Result<(Vec<u8>, Option<Vec<u8>>)> {
         let mut bytes = key_package_bytes;
-        let key_package = <KeyPackage as TlsDeserializeTrait>::tls_deserialize(&mut bytes)?;
+        let key_package = <KeyPackage as tls_codec::Deserialize>::tls_deserialize(&mut bytes)?;
         if !bytes.is_empty() {
             return Err(anyhow!("key package bytes had trailing data"));
         }
