@@ -29,13 +29,22 @@ SERVER_LOG="logs/test-local-server.log"
 CLIENT1_LOG="logs/test-local-client-1.log"
 CLIENT2_LOG="logs/test-local-client-2.log"
 ARTIFACT_DIR="artifacts/local-stack"
+RUN_SUMMARY="$ARTIFACT_DIR/run-summary.log"
 
+rm -f "$ARTIFACT_DIR"/*
 : >"$SERVER_LOG"
 : >"$CLIENT1_LOG"
 : >"$CLIENT2_LOG"
+: >"$RUN_SUMMARY"
 
 echo "[client1] local stack smoke run" >>"$CLIENT1_LOG"
 echo "[client2] local stack smoke run" >>"$CLIENT2_LOG"
+echo "[run] local stack smoke run" >>"$RUN_SUMMARY"
+
+mark_ok() {
+  local step="$1"; shift
+  echo "[OK] $step" | tee -a "$RUN_SUMMARY"
+}
 
 cleanup() {
   local status=$?
@@ -122,6 +131,7 @@ echo "Started server (pid=$SERVER_PID). Waiting for /healthz on $SERVER_PUBLIC_U
 for _ in {1..180}; do
   if curl --silent --show-error --fail "$SERVER_PUBLIC_URL/healthz" >"$ARTIFACT_DIR/healthz.txt"; then
     echo "[OK] healthz" | tee -a "$CLIENT1_LOG" "$CLIENT2_LOG"
+    mark_ok "server boot + /healthz"
     break
   fi
   sleep 1
@@ -143,6 +153,7 @@ request POST "$SERVER_PUBLIC_URL/login" 200 "$ARTIFACT_DIR/client2-login.json" \
   --data "{\"username\":\"$CLIENT2_USERNAME\"}"
 USER2_ID="$(extract_json "$ARTIFACT_DIR/client2-login.json" "user_id")"
 echo "[OK] client2 login user_id=$USER2_ID" | tee -a "$CLIENT2_LOG"
+mark_ok "two-user login"
 
 request GET "$SERVER_PUBLIC_URL/guilds?user_id=$USER1_ID" 200 "$ARTIFACT_DIR/client1-guilds.json"
 GUILD_ID="$(extract_json "$ARTIFACT_DIR/client1-guilds.json" "0.guild_id")"
@@ -163,6 +174,7 @@ echo "[OK] client1 channel selected channel_id=$CHANNEL_ID" | tee -a "$CLIENT1_L
 
 request GET "$SERVER_PUBLIC_URL/guilds/$GUILD_ID/channels?user_id=$USER2_ID" 200 "$ARTIFACT_DIR/client2-channels.json"
 echo "[OK] client2 channel selected channel_id=$CHANNEL_ID" | tee -a "$CLIENT2_LOG"
+mark_ok "channel selection"
 
 MESSAGE_B64="$(printf 'pre-e2ee-local-smoke-message' | base64 | tr -d '\n')"
 request POST "$SERVER_PUBLIC_URL/messages" 200 "$ARTIFACT_DIR/client1-send-message.json" \
@@ -173,6 +185,7 @@ echo "[OK] client1 sent message" | tee -a "$CLIENT1_LOG"
 request GET "$SERVER_PUBLIC_URL/channels/$CHANNEL_ID/messages?user_id=$USER2_ID&limit=20" 200 "$ARTIFACT_DIR/client2-messages.json"
 contains_message "$ARTIFACT_DIR/client2-messages.json" "$USER1_ID" "$MESSAGE_B64"
 echo "[OK] client2 received message" | tee -a "$CLIENT2_LOG"
+mark_ok "message send/receive"
 
 UPLOAD_FILE="$ARTIFACT_DIR/upload.bin"
 printf 'pre-e2ee-upload-download-smoke' >"$UPLOAD_FILE"
@@ -184,3 +197,4 @@ echo "[OK] upload file_id=$FILE_ID" | tee -a "$CLIENT1_LOG"
 request GET "$SERVER_PUBLIC_URL/files/$FILE_ID?user_id=$USER2_ID" 200 "$ARTIFACT_DIR/client2-download.bin"
 cmp -s "$UPLOAD_FILE" "$ARTIFACT_DIR/client2-download.bin"
 echo "[OK] download content verified" | tee -a "$CLIENT2_LOG"
+mark_ok "upload/download byte-equality"
