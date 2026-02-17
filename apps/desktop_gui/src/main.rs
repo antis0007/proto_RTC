@@ -2215,9 +2215,15 @@ fn queue_command(cmd_tx: &Sender<BackendCommand>, cmd: BackendCommand, status: &
             tracing::warn!(command = cmd_name, "ui->backend command queue is full");
         }
         Err(TrySendError::Disconnected(_)) => {
-            *status =
-                "Backend command processor disconnected (possible startup/runtime failure); retry sign-in"
-                    .to_string();
+            let preserving_startup_error = cmd_name == "login"
+                && status
+                    .to_ascii_lowercase()
+                    .contains("backend worker startup failure");
+            if !preserving_startup_error {
+                *status =
+                    "Backend command processor disconnected (possible startup/runtime failure); retry sign-in"
+                        .to_string();
+            }
             tracing::error!(command = cmd_name, "ui->backend command queue disconnected");
         }
     }
@@ -2349,38 +2355,78 @@ fn spawn_backend_thread(cmd_rx: Receiver<BackendCommand>, ui_tx: Sender<UiEvent>
         };
 
         runtime.block_on(async move {
-            let mls_db_url = match std::env::var("HOME") {
-                Ok(home) => {
-                    let base = PathBuf::from(home).join(".proto_rtc");
-                    if let Err(err) = std::fs::create_dir_all(&base) {
+            #[cfg(target_os = "windows")]
+            let mut attempted_dir_strategy = vec!["HOME/.proto_rtc".to_string()];
+            #[cfg(not(target_os = "windows"))]
+            let attempted_dir_strategy = vec!["HOME/.proto_rtc".to_string()];
+            let mls_state_dir = if let Ok(home) = std::env::var("HOME") {
+                PathBuf::from(home).join(".proto_rtc")
+            } else {
+                #[cfg(target_os = "windows")]
+                {
+                    attempted_dir_strategy.push("USERPROFILE/.proto_rtc".to_string());
+                    attempted_dir_strategy
+                        .push("HOMEDRIVE + HOMEPATH/.proto_rtc".to_string());
+                    attempted_dir_strategy.push("LOCALAPPDATA/proto_rtc".to_string());
+
+                    if let Ok(userprofile) = std::env::var("USERPROFILE") {
+                        PathBuf::from(userprofile).join(".proto_rtc")
+                    } else if let (Ok(home_drive), Ok(home_path)) =
+                        (std::env::var("HOMEDRIVE"), std::env::var("HOMEPATH"))
+                    {
+                        PathBuf::from(format!("{home_drive}{home_path}")).join(".proto_rtc")
+                    } else if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+                        PathBuf::from(local_app_data).join("proto_rtc")
+                    } else {
+                        let attempted = attempted_dir_strategy.join(" -> ");
+                        let user_message = format!(
+                            "backend worker startup failure: could not resolve a writable MLS state directory. On Windows, set USERPROFILE (or LOCALAPPDATA) and relaunch the app. Fallback resolution failed unexpectedly after trying: {attempted}."
+                        );
                         let _ = ui_tx.try_send(UiEvent::Error(UiError::from_message(
                             UiErrorContext::BackendStartup,
-                            format!(
-                                "backend worker startup failure: failed to create MLS state directory '{}': {err}",
-                                base.display()
-                            ),
+                            user_message.clone(),
                         )));
                         tracing::error!(
-                            "failed to create MLS state directory '{}': {err}",
-                            base.display()
+                            "unable to initialize MLS state directory. Please set USERPROFILE or LOCALAPPDATA on Windows and relaunch. attempted strategy: {attempted}"
                         );
                         return;
                     }
-                    DurableMlsSessionManager::sqlite_url_for_gui_data_dir(&base)
                 }
-                Err(err) => {
+
+                #[cfg(not(target_os = "windows"))]
+                {
+                    let attempted = attempted_dir_strategy.join(" -> ");
+                    let user_message = format!(
+                        "backend worker startup failure: could not resolve a writable MLS state directory. Set HOME and relaunch the app. Fallback resolution failed unexpectedly after trying: {attempted}."
+                    );
                     let _ = ui_tx.try_send(UiEvent::Error(UiError::from_message(
                         UiErrorContext::BackendStartup,
-                        format!(
-                            "backend worker startup failure: HOME environment variable is required to initialize MLS backend: {err}"
-                        ),
+                        user_message.clone(),
                     )));
                     tracing::error!(
-                        "HOME environment variable is required to initialize MLS backend: {err}"
+                        "unable to initialize MLS state directory. Please set HOME and relaunch. attempted strategy: {attempted}"
                     );
                     return;
                 }
             };
+
+            let attempted = attempted_dir_strategy.join(" -> ");
+            if let Err(err) = std::fs::create_dir_all(&mls_state_dir) {
+                let _ = ui_tx.try_send(UiEvent::Error(UiError::from_message(
+                    UiErrorContext::BackendStartup,
+                    format!(
+                        "backend worker startup failure: could not prepare MLS state directory '{}' (strategy: {attempted}). Ensure the configured user profile directory is writable and relaunch: {err}",
+                        mls_state_dir.display()
+                    ),
+                )));
+                tracing::error!(
+                    "failed to create MLS state directory '{}' using strategy [{attempted}]. Ensure profile/app-data directory is writable: {err}",
+                    mls_state_dir.display()
+                );
+                return;
+            }
+
+            let mls_db_url = DurableMlsSessionManager::sqlite_url_for_gui_data_dir(&mls_state_dir);
 
             let mls_manager =
                 match DurableMlsSessionManager::initialize(&mls_db_url, 0, "desktop-gui").await {
