@@ -142,6 +142,18 @@ pub async fn send_message(
     attachment: Option<AttachmentPayload>,
 ) -> Result<ServerEvent, ApiError> {
     let (_, _, muted) = ensure_active_membership(ctx, guild_id, user_id).await?;
+    let actual_guild_id = ctx
+        .storage
+        .guild_for_channel(channel_id)
+        .await
+        .map_err(internal)?
+        .ok_or_else(|| ApiError::new(ErrorCode::NotFound, "channel not found"))?;
+    if actual_guild_id != guild_id {
+        return Err(ApiError::new(
+            ErrorCode::Validation,
+            "channel does not belong to guild",
+        ));
+    }
     if muted {
         return Err(ApiError::new(ErrorCode::Forbidden, "user is muted"));
     }
@@ -301,6 +313,15 @@ pub async fn ensure_active_membership_in_channel(
     Ok(())
 }
 
+pub async fn ensure_active_membership_in_guild(
+    ctx: &ApiContext,
+    user_id: UserId,
+    guild_id: GuildId,
+) -> Result<(), ApiError> {
+    ensure_active_membership(ctx, guild_id, user_id).await?;
+    Ok(())
+}
+
 async fn ensure_active_membership(
     ctx: &ApiContext,
     guild_id: GuildId,
@@ -435,5 +456,20 @@ mod tests {
             listed[0].attachment.as_ref().expect("attachment").file_id,
             file_id
         );
+    }
+
+    #[tokio::test]
+    async fn send_message_rejects_channel_from_another_guild() {
+        let (ctx, user, _guild, channel) = setup().await;
+        let other_guild = ctx
+            .storage
+            .create_guild("other", user)
+            .await
+            .expect("guild");
+
+        let err = send_message(&ctx, user, other_guild, channel, "aGVsbG8=", None)
+            .await
+            .expect_err("should fail");
+        assert!(matches!(err.code, ErrorCode::Validation));
     }
 }
