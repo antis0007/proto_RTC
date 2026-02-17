@@ -61,6 +61,27 @@ pub struct ChannelSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UploadKeyPackageResponse {
+    pub key_package_id: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeyPackageResponse {
+    pub key_package_id: i64,
+    pub guild_id: i64,
+    pub user_id: i64,
+    pub key_package_b64: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WelcomeResponse {
+    pub guild_id: GuildId,
+    pub channel_id: ChannelId,
+    pub user_id: UserId,
+    pub welcome_b64: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessagePayload {
     pub message_id: MessageId,
     pub channel_id: ChannelId,
@@ -124,6 +145,10 @@ pub enum ServerEvent {
         channel_id: ChannelId,
         room_name: String,
         token: String,
+    },
+    MlsWelcomeAvailable {
+        guild_id: GuildId,
+        channel_id: ChannelId,
     },
     FileStored {
         file_id: FileId,
