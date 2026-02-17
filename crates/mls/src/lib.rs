@@ -4,11 +4,14 @@ use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::OpenMlsRustCrypto;
 use shared::domain::{ChannelId, GuildId};
-use tls_codec::{Deserialize as TlsDeserializeTrait, Serialize as TlsSerializeTrait};
+use tls_codec::{
+    Deserialize as TlsDeserializeTrait, DeserializeBytes as TlsDeserializeBytesTrait,
+    Serialize as TlsSerializeTrait,
+};
 
 const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct MlsIdentity {
     credential_with_key: CredentialWithKey,
     signer: SignatureKeyPair,
@@ -108,11 +111,7 @@ impl<S: MlsStore> MlsGroupHandle<S> {
     }
 
     pub async fn join_group_from_welcome(&mut self, welcome_bytes: &[u8]) -> Result<()> {
-        let mut bytes = welcome_bytes;
-        let welcome_message = MlsMessageIn::tls_deserialize(&mut bytes)?;
-        let welcome = welcome_message
-            .into_welcome()
-            .map_err(|_| anyhow!("welcome bytes did not contain a welcome message"))?;
+        let welcome = Welcome::tls_deserialize_exact_bytes(welcome_bytes)?;
         let config = MlsGroupJoinConfig::builder().build();
         let staged = StagedWelcome::new_from_welcome(&self.provider, &config, welcome, None)?;
         self.group = Some(staged.into_group(&self.provider)?);
@@ -123,31 +122,43 @@ impl<S: MlsStore> MlsGroupHandle<S> {
         &mut self,
         key_package_bytes: &[u8],
     ) -> Result<(Vec<u8>, Option<Vec<u8>>)> {
-        let mut key_package_bytes = key_package_bytes;
-        let key_package = KeyPackage::tls_deserialize(&mut key_package_bytes)?;
-        let group = self.group_mut()?;
-        let (commit, welcome, _group_info) =
-            group.add_members(&self.provider, &self.identity.signer, &[key_package])?;
+        let key_package = KeyPackage::tls_deserialize_exact_bytes(key_package_bytes)?;
+        let provider = &self.provider;
+        let signer = &self.identity.signer;
+        let group = self
+            .group
+            .as_mut()
+            .ok_or_else(|| anyhow!("group not initialized"))?;
+        let (commit, welcome, _group_info) = group.add_members(provider, signer, &[key_package])?;
         let commit_bytes = commit.tls_serialize_detached()?;
         let welcome_bytes = Some(welcome.tls_serialize_detached()?);
-        group.merge_pending_commit(&self.provider)?;
+        group.merge_pending_commit(provider)?;
         self.persist_group().await?;
         Ok((commit_bytes, welcome_bytes))
     }
 
     pub async fn remove_member(&mut self, member: LeafNodeIndex) -> Result<Vec<u8>> {
-        let group = self.group_mut()?;
-        let (commit, _welcome, _group_info) =
-            group.remove_members(&self.provider, &self.identity.signer, &[member])?;
+        let provider = &self.provider;
+        let signer = &self.identity.signer;
+        let group = self
+            .group
+            .as_mut()
+            .ok_or_else(|| anyhow!("group not initialized"))?;
+        let (commit, _welcome, _group_info) = group.remove_members(provider, signer, &[member])?;
         let bytes = commit.tls_serialize_detached()?;
-        group.merge_pending_commit(&self.provider)?;
+        group.merge_pending_commit(provider)?;
         self.persist_group().await?;
         Ok(bytes)
     }
 
     pub fn encrypt_application(&mut self, plaintext_bytes: &[u8]) -> Result<Vec<u8>> {
-        let group = self.group_mut()?;
-        let msg = group.create_message(&self.provider, &self.identity.signer, plaintext_bytes)?;
+        let provider = &self.provider;
+        let signer = &self.identity.signer;
+        let group = self
+            .group
+            .as_mut()
+            .ok_or_else(|| anyhow!("group not initialized"))?;
+        let msg = group.create_message(provider, signer, plaintext_bytes)?;
         Ok(msg.tls_serialize_detached()?)
     }
 
@@ -157,13 +168,17 @@ impl<S: MlsStore> MlsGroupHandle<S> {
         let protocol_message: ProtocolMessage = message_in
             .try_into_protocol_message()
             .map_err(|_| anyhow!("ciphertext did not contain a protocol message"))?;
-        let group = self.group_mut()?;
-        let processed = group.process_message(&self.provider, protocol_message)?;
+        let provider = &self.provider;
+        let group = self
+            .group
+            .as_mut()
+            .ok_or_else(|| anyhow!("group not initialized"))?;
+        let processed = group.process_message(provider, protocol_message)?;
 
         match processed.into_content() {
             ProcessedMessageContent::ApplicationMessage(app_msg) => Ok(app_msg.into_bytes()),
             ProcessedMessageContent::StagedCommitMessage(staged_commit) => {
-                group.merge_staged_commit(&self.provider, *staged_commit)?;
+                group.merge_staged_commit(provider, *staged_commit)?;
                 Ok(Vec::new())
             }
             _ => Err(anyhow!("message was not an application message")),
@@ -176,12 +191,6 @@ impl<S: MlsStore> MlsGroupHandle<S> {
             .as_ref()
             .ok_or_else(|| anyhow!("group not initialized"))?;
         Ok(group.export_secret(&self.provider, label, &[], len)?)
-    }
-
-    fn group_mut(&mut self) -> Result<&mut MlsGroup> {
-        self.group
-            .as_mut()
-            .ok_or_else(|| anyhow!("group not initialized"))
     }
 
     async fn persist_group(&self) -> Result<()> {
