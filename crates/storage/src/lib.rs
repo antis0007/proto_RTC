@@ -57,6 +57,14 @@ impl Storage {
         Ok(UserId(rec.get::<i64, _>(0)))
     }
 
+    pub async fn username_for_user(&self, user_id: UserId) -> Result<Option<String>> {
+        let row = sqlx::query("SELECT username FROM users WHERE id = ?")
+            .bind(user_id.0)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|r| r.get::<String, _>(0)))
+    }
+
     pub async fn create_guild(&self, name: &str, owner_user_id: UserId) -> Result<GuildId> {
         let rec =
             sqlx::query("INSERT INTO guilds (name, owner_user_id) VALUES (?, ?) RETURNING id")

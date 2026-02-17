@@ -65,6 +65,8 @@ pub struct MessagePayload {
     pub message_id: MessageId,
     pub channel_id: ChannelId,
     pub sender_id: UserId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_username: Option<String>,
     pub ciphertext_b64: String,
     pub sent_at: DateTime<Utc>,
 }

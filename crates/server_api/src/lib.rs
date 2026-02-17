@@ -84,11 +84,17 @@ pub async fn send_message(
         .insert_message_ciphertext(channel_id, user_id, &ciphertext)
         .await
         .map_err(internal)?;
+    let sender_username = ctx
+        .storage
+        .username_for_user(user_id)
+        .await
+        .map_err(internal)?;
     Ok(ServerEvent::MessageReceived {
         message: MessagePayload {
             message_id,
             channel_id,
             sender_id: user_id,
+            sender_username,
             ciphertext_b64: ciphertext_b64.to_string(),
             sent_at: Utc::now(),
         },
@@ -116,16 +122,33 @@ pub async fn list_messages(
         .await
         .map_err(internal)?;
 
-    Ok(messages
-        .into_iter()
-        .map(|message| MessagePayload {
+    let mut username_cache: std::collections::HashMap<UserId, Option<String>> =
+        std::collections::HashMap::new();
+    let mut payloads = Vec::with_capacity(messages.len());
+    for message in messages {
+        let sender_username = if let Some(cached) = username_cache.get(&message.sender_id) {
+            cached.clone()
+        } else {
+            let resolved = ctx
+                .storage
+                .username_for_user(message.sender_id)
+                .await
+                .map_err(internal)?;
+            username_cache.insert(message.sender_id, resolved.clone());
+            resolved
+        };
+
+        payloads.push(MessagePayload {
             message_id: message.message_id,
             channel_id: message.channel_id,
             sender_id: message.sender_id,
+            sender_username,
             ciphertext_b64: STANDARD.encode(message.ciphertext),
             sent_at: message.created_at,
-        })
-        .collect())
+        });
+    }
+
+    Ok(payloads)
 }
 
 pub async fn request_livekit_token(

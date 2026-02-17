@@ -44,6 +44,7 @@ enum UiEvent {
     LoginOk,
     Info(String),
     InviteCreated(String),
+    SenderDirectoryUpdated { user_id: i64, username: String },
     Error(String),
     Server(ServerEvent),
 }
@@ -96,6 +97,7 @@ struct DesktopGuiApp {
     messages: HashMap<ChannelId, Vec<MessagePayload>>,
     message_ids: HashMap<ChannelId, HashSet<MessageId>>,
     status: String,
+    sender_directory: HashMap<i64, String>,
     settings_open: bool,
     theme: ThemeSettings,
     applied_theme: Option<ThemeSettings>,
@@ -117,6 +119,7 @@ impl DesktopGuiApp {
             messages: HashMap::new(),
             message_ids: HashMap::new(),
             status: "Not logged in".to_string(),
+            sender_directory: HashMap::new(),
             settings_open: false,
             theme: ThemeSettings::discord_default(),
             applied_theme: None,
@@ -134,6 +137,7 @@ impl DesktopGuiApp {
                     self.message_ids.clear();
                     self.selected_guild = None;
                     self.selected_channel = None;
+                    self.sender_directory.clear();
                     queue_command(&self.cmd_tx, BackendCommand::ListGuilds, &mut self.status);
                 }
                 UiEvent::Info(message) => {
@@ -143,6 +147,9 @@ impl DesktopGuiApp {
                     self.password_or_invite = invite_code;
                     self.status =
                         "Invite code created; share this code with another user".to_string();
+                }
+                UiEvent::SenderDirectoryUpdated { user_id, username } => {
+                    self.sender_directory.insert(user_id, username);
                 }
                 UiEvent::Error(err) => {
                     self.status = format!("Error: {err}");
@@ -182,6 +189,11 @@ impl DesktopGuiApp {
                         }
                     }
                     ServerEvent::MessageReceived { message } => {
+                        if let Some(username) = &message.sender_username {
+                            self.sender_directory
+                                .insert(message.sender_id.0, username.clone());
+                        }
+
                         let ids = self.message_ids.entry(message.channel_id).or_default();
                         if ids.insert(message.message_id) {
                             let messages = self.messages.entry(message.channel_id).or_default();
@@ -465,7 +477,19 @@ impl eframe::App for DesktopGuiApp {
                                 .ok()
                                 .and_then(|bytes| String::from_utf8(bytes).ok())
                                 .unwrap_or_else(|| "<binary message>".to_string());
-                            ui.label(format!("{}: {}", msg.sender_id.0, decoded));
+                            let sender_display = msg
+                                .sender_username
+                                .clone()
+                                .or_else(|| self.sender_directory.get(&msg.sender_id.0).cloned())
+                                .unwrap_or_else(|| msg.sender_id.0.to_string());
+                            let sent_at = msg.sent_at.format("%Y-%m-%d %H:%M:%S UTC").to_string();
+
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(egui::RichText::new(sender_display).strong());
+                                ui.label(egui::RichText::new(sent_at).small().weak());
+                            });
+                            ui.label(decoded);
+                            ui.add_space(6.0);
                         }
                     } else {
                         ui.label("No messages yet");
@@ -533,6 +557,13 @@ fn spawn_backend_thread(cmd_rx: Receiver<BackendCommand>, ui_tx: Sender<UiEvent>
                                         while let Ok(event) = events.recv().await {
                                             let evt = match event {
                                                 ClientEvent::Server(evt) => UiEvent::Server(evt),
+                                                ClientEvent::UserDirectoryUpdated {
+                                                    user_id,
+                                                    username,
+                                                } => UiEvent::SenderDirectoryUpdated {
+                                                    user_id,
+                                                    username,
+                                                },
                                                 ClientEvent::Error(err) => UiEvent::Error(err),
                                             };
                                             let _ = ui_tx_clone.try_send(evt);
