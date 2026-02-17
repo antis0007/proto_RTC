@@ -1861,6 +1861,16 @@ fn spawn_backend_thread(cmd_rx: Receiver<BackendCommand>, ui_tx: Sender<UiEvent>
                                                 } => {
                                                     UiEvent::MessageDecrypted { message, plaintext }
                                                 }
+                                                ClientEvent::VoiceSessionStateChanged(_) => {
+                                                    UiEvent::Info(
+                                                        "Voice session state changed".to_string(),
+                                                    )
+                                                }
+                                                ClientEvent::VoiceParticipantsUpdated {
+                                                    ..
+                                                } => UiEvent::Info(
+                                                    "Voice participants updated".to_string(),
+                                                ),
                                                 ClientEvent::Error(err) => UiEvent::Error(err),
                                             };
                                             let _ = ui_tx_clone.try_send(evt);
