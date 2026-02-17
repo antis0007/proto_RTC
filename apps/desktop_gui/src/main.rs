@@ -126,7 +126,8 @@ impl DesktopGuiApp {
                 }
                 UiEvent::InviteCreated(invite_code) => {
                     self.password_or_invite = invite_code;
-                    self.status = "Invite code created; share this code with another user".to_string();
+                    self.status =
+                        "Invite code created; share this code with another user".to_string();
                 }
                 UiEvent::Error(err) => {
                     self.status = format!("Error: {err}");
@@ -534,7 +535,9 @@ fn spawn_backend_thread(cmd_rx: Receiver<BackendCommand>, ui_tx: Sender<UiEvent>
                     BackendCommand::JoinWithInvite { invite_code } => {
                         match client.join_with_invite(&invite_code).await {
                             Ok(()) => {
-                                let _ = ui_tx.try_send(UiEvent::Info("Joined guild from invite".to_string()));
+                                let _ = ui_tx.try_send(UiEvent::Info(
+                                    "Joined guild from invite".to_string(),
+                                ));
                                 if let Err(err) = client.list_guilds().await {
                                     let _ = ui_tx.try_send(UiEvent::Error(err.to_string()));
                                 }

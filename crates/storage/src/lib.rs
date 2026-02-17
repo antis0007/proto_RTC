@@ -38,9 +38,9 @@ impl Storage {
              ON CONFLICT(username) DO UPDATE SET username=excluded.username
              RETURNING id",
         )
-            .bind(username)
-            .fetch_one(&self.pool)
-            .await?;
+        .bind(username)
+        .fetch_one(&self.pool)
+        .await?;
         Ok(UserId(rec.get::<i64, _>(0)))
     }
 

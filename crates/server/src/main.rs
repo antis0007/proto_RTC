@@ -8,8 +8,8 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use livekit_integration::LiveKitConfig;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use livekit_integration::LiveKitConfig;
 use serde::{Deserialize, Serialize};
 use server_api::{list_channels, list_guilds, send_message, ApiContext};
 use shared::{
@@ -352,7 +352,13 @@ async fn http_join_guild(
     state
         .api
         .storage
-        .add_membership(guild_id, UserId(req.user_id), shared::domain::Role::Member, false, false)
+        .add_membership(
+            guild_id,
+            UserId(req.user_id),
+            shared::domain::Role::Member,
+            false,
+            false,
+        )
         .await
         .map_err(|e| {
             (

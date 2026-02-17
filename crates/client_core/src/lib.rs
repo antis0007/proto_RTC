@@ -364,8 +364,7 @@ impl<C: CryptoProvider + 'static> ClientHandle for Arc<RealtimeClient<C>> {
 
     async fn join_with_invite(&self, invite_code: &str) -> Result<()> {
         let (server_url, user_id) = self.session().await?;
-        self
-            .http
+        self.http
             .post(format!("{server_url}/guilds/join"))
             .json(&JoinGuildRequest {
                 user_id,
