@@ -33,9 +33,12 @@ $ServerLog = 'logs/test-local-server.log'
 $Client1Log = 'logs/test-local-client-1.log'
 $Client2Log = 'logs/test-local-client-2.log'
 $ArtifactDir = 'artifacts/local-stack'
+Get-ChildItem -Path $ArtifactDir -File -ErrorAction SilentlyContinue | Remove-Item -Force
+$RunSummary = Join-Path $ArtifactDir 'run-summary.log'
 Set-Content -Path $ServerLog -Value ''
 Set-Content -Path $Client1Log -Value '[client1] local stack smoke run'
 Set-Content -Path $Client2Log -Value '[client2] local stack smoke run'
+Set-Content -Path $RunSummary -Value '[run] local stack smoke run'
 
 function Write-ClientLog {
   param(
@@ -44,6 +47,12 @@ function Write-ClientLog {
   )
   Add-Content -Path $Path -Value $Message
   Write-Host $Message
+}
+
+function Write-RunOk {
+  param([string]$Step)
+  Add-Content -Path $RunSummary -Value "[OK] $Step"
+  Write-Host "[OK] $Step"
 }
 
 function Invoke-ApiRequest {
@@ -119,6 +128,7 @@ try {
   if (-not $healthy) {
     throw "Server never became healthy. See $ServerLog"
   }
+  Write-RunOk -Step 'server boot + /healthz'
 
   $client1 = if ($env:CLIENT1_USERNAME) { $env:CLIENT1_USERNAME } else { 'local-user-1' }
   $client2 = if ($env:CLIENT2_USERNAME) { $env:CLIENT2_USERNAME } else { 'local-user-2' }
@@ -132,6 +142,7 @@ try {
   $login2 = Invoke-ApiRequest -Method 'POST' -Uri "$($env:SERVER_PUBLIC_URL)/login" -ExpectedStatus 200 -OutFile $login2File -Body (@{ username = $client2 } | ConvertTo-Json -Compress) -ContentType 'application/json'
   $user2Id = ((Get-Content $login2File -Raw) | ConvertFrom-Json).user_id
   Write-ClientLog -Path $Client2Log -Message "[OK] client2 login user_id=$user2Id"
+  Write-RunOk -Step 'two-user login'
 
   $guilds1File = Join-Path $ArtifactDir 'client1-guilds.json'
   Invoke-ApiRequest -Method 'GET' -Uri "$($env:SERVER_PUBLIC_URL)/guilds?user_id=$user1Id" -ExpectedStatus 200 -OutFile $guilds1File | Out-Null
@@ -155,6 +166,7 @@ try {
   $channels2File = Join-Path $ArtifactDir 'client2-channels.json'
   Invoke-ApiRequest -Method 'GET' -Uri "$($env:SERVER_PUBLIC_URL)/guilds/$guildId/channels?user_id=$user2Id" -ExpectedStatus 200 -OutFile $channels2File | Out-Null
   Write-ClientLog -Path $Client2Log -Message "[OK] client2 channel selected channel_id=$channelId"
+  Write-RunOk -Step 'channel selection'
 
   $messageB64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes('pre-e2ee-local-smoke-message'))
   $sendFile = Join-Path $ArtifactDir 'client1-send-message.json'
@@ -175,6 +187,7 @@ try {
     throw 'Message send/receive verification failed.'
   }
   Write-ClientLog -Path $Client2Log -Message '[OK] client2 received message'
+  Write-RunOk -Step 'message send/receive'
 
   $uploadSource = Join-Path $ArtifactDir 'upload.bin'
   $downloadTarget = Join-Path $ArtifactDir 'client2-download.bin'
@@ -196,6 +209,7 @@ try {
     }
   }
   Write-ClientLog -Path $Client2Log -Message '[OK] download content verified'
+  Write-RunOk -Step 'upload/download byte-equality'
 
   $success = $true
 } finally {

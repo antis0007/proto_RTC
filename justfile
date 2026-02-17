@@ -15,7 +15,9 @@ dev: server
 test-local-stack:
     bash scripts/test-local-stack.sh
 
-pre-e2ee-gate: test-local-stack
+pre-e2ee-gate:
+    bash scripts/test-local-stack.sh
+    cargo test --workspace
 
 test:
     cargo test --workspace --all-targets

@@ -2336,6 +2336,63 @@ impl eframe::App for DesktopGuiApp {
     }
 }
 
+fn read_non_empty_env_var(name: &str, attempts: &mut Vec<String>) -> Option<String> {
+    match std::env::var(name) {
+        Ok(value) if value.trim().is_empty() => {
+            attempts.push(format!("{name} was set but empty"));
+            None
+        }
+        Ok(value) => Some(value),
+        Err(err) => {
+            attempts.push(format!("{name} unavailable: {err}"));
+            None
+        }
+    }
+}
+
+fn resolve_mls_gui_data_dir() -> Result<PathBuf, String> {
+    let mut attempts = Vec::new();
+
+    if let Some(home) = read_non_empty_env_var("HOME", &mut attempts) {
+        return Ok(PathBuf::from(home).join(".proto_rtc"));
+    }
+
+    #[cfg(windows)]
+    {
+        if let Some(userprofile) = read_non_empty_env_var("USERPROFILE", &mut attempts) {
+            return Ok(PathBuf::from(userprofile).join(".proto_rtc"));
+        }
+
+        let homedrive = read_non_empty_env_var("HOMEDRIVE", &mut attempts);
+        let homepath = read_non_empty_env_var("HOMEPATH", &mut attempts);
+        match (homedrive, homepath) {
+            (Some(homedrive), Some(homepath)) => {
+                return Ok(PathBuf::from(format!("{homedrive}{homepath}")).join(".proto_rtc"));
+            }
+            _ => {
+                attempts.push(
+                    "HOMEDRIVE+HOMEPATH could not be used because one or both were unavailable"
+                        .to_string(),
+                );
+            }
+        }
+
+        if let Some(appdata) = read_non_empty_env_var("APPDATA", &mut attempts) {
+            return Ok(PathBuf::from(appdata).join("proto_rtc"));
+        }
+    }
+
+    Err(format!(
+        "checked HOME{} and none provided a usable per-user directory ({})",
+        if cfg!(windows) {
+            ", USERPROFILE, HOMEDRIVE+HOMEPATH, APPDATA"
+        } else {
+            ""
+        },
+        attempts.join("; ")
+    ))
+}
+
 fn spawn_backend_thread(cmd_rx: Receiver<BackendCommand>, ui_tx: Sender<UiEvent>) {
     thread::spawn(move || {
         let _ = ui_tx.try_send(UiEvent::Info("Backend worker starting...".to_string()));
@@ -2409,6 +2466,21 @@ fn spawn_backend_thread(cmd_rx: Receiver<BackendCommand>, ui_tx: Sender<UiEvent>
                     return;
                 }
             };
+            if let Err(err) = std::fs::create_dir_all(&base) {
+                let _ = ui_tx.try_send(UiEvent::Error(UiError::from_message(
+                    UiErrorContext::BackendStartup,
+                    format!(
+                        "backend worker startup failure: failed to create MLS state directory '{}': {err}",
+                        base.display()
+                    ),
+                )));
+                tracing::error!(
+                    "failed to create MLS state directory '{}': {err}",
+                    base.display()
+                );
+                return;
+            }
+            let mls_db_url = DurableMlsSessionManager::sqlite_url_for_gui_data_dir(&base);
 
             let attempted = attempted_dir_strategy.join(" -> ");
             if let Err(err) = std::fs::create_dir_all(&mls_state_dir) {
