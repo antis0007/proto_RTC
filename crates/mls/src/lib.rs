@@ -91,10 +91,15 @@ impl<S: MlsStore> MlsGroupHandle<S> {
         }
     }
 
+    pub fn key_package_bytes(&self) -> Result<Vec<u8>> {
+        self.identity.key_package_bytes(&self.provider)
+    }
+
     pub async fn create_group(&mut self, channel_id: ChannelId) -> Result<()> {
         let group_id = GroupId::from_slice(&channel_id.0.to_le_bytes());
         let config = MlsGroupCreateConfig::builder()
             .ciphersuite(CIPHERSUITE)
+            .use_ratchet_tree_extension(true)
             .build();
         let group = MlsGroup::new_with_group_id(
             &self.provider,
@@ -108,7 +113,15 @@ impl<S: MlsStore> MlsGroupHandle<S> {
     }
 
     pub async fn join_group_from_welcome(&mut self, welcome_bytes: &[u8]) -> Result<()> {
-        let welcome = Welcome::tls_deserialize_exact_bytes(welcome_bytes)?;
+        let mut bytes = welcome_bytes;
+        let welcome_message = MlsMessageIn::tls_deserialize(&mut bytes)?;
+        if !bytes.is_empty() {
+            return Err(anyhow!("welcome bytes had trailing data"));
+        }
+        let welcome = match welcome_message.extract() {
+            MlsMessageBodyIn::Welcome(welcome) => welcome,
+            _ => return Err(anyhow!("welcome bytes did not contain a Welcome message")),
+        };
         let config = MlsGroupJoinConfig::builder().build();
         let staged = StagedWelcome::new_from_welcome(&self.provider, &config, welcome, None)?;
         self.group = Some(staged.into_group(&self.provider)?);
@@ -126,7 +139,7 @@ impl<S: MlsStore> MlsGroupHandle<S> {
         }
         let provider = &self.provider;
         let key_package = key_package_in
-            .validate(provider.crypto(), ProtocolVersion::default(), CIPHERSUITE)
+            .validate(provider.crypto(), ProtocolVersion::default())
             .map_err(|e| anyhow!("invalid key package bytes: {e}"))?;
         let signer = &self.identity.signer;
         let group = self
@@ -287,22 +300,25 @@ mod tests {
         let charlie_identity =
             MlsIdentity::new_with_name(b"charlie".to_vec()).expect("charlie identity");
 
-        let provider = OpenMlsRustCrypto::default();
-        let bob_kp = bob_identity
-            .key_package_bytes(&provider)
-            .expect("bob key package bytes");
-        let charlie_kp = charlie_identity
-            .key_package_bytes(&provider)
-            .expect("charlie key package bytes");
-
         let mut alice =
             MlsGroupHandle::new(MemoryStore::default(), guild_id, channel_id, alice_identity);
+        let bob = MlsGroupHandle::new(MemoryStore::default(), guild_id, channel_id, bob_identity);
+        let charlie = MlsGroupHandle::new(
+            MemoryStore::default(),
+            guild_id,
+            channel_id,
+            charlie_identity,
+        );
+
+        let bob_kp = bob.key_package_bytes().expect("bob key package bytes");
+        let charlie_kp = charlie
+            .key_package_bytes()
+            .expect("charlie key package bytes");
         alice.create_group(channel_id).await.expect("create group");
 
         let (commit_to_bob, welcome_for_bob) = alice.add_member(&bob_kp).await.expect("add bob");
 
-        let mut bob =
-            MlsGroupHandle::new(MemoryStore::default(), guild_id, channel_id, bob_identity);
+        let mut bob = bob;
         bob.join_group_from_welcome(&welcome_for_bob.expect("welcome bob"))
             .await
             .expect("bob joins");
@@ -333,20 +349,16 @@ mod tests {
         let alice_identity = MlsIdentity::new_with_name(b"alice".to_vec()).expect("alice identity");
         let bob_identity = MlsIdentity::new_with_name(b"bob".to_vec()).expect("bob identity");
 
-        let bob_provider = OpenMlsRustCrypto::default();
-        let bob_kp = bob_identity
-            .key_package_bytes(&bob_provider)
-            .expect("bob key package bytes");
-
         let mut alice =
             MlsGroupHandle::new(MemoryStore::default(), guild_id, channel_id, alice_identity);
+        let bob = MlsGroupHandle::new(MemoryStore::default(), guild_id, channel_id, bob_identity);
+        let bob_kp = bob.key_package_bytes().expect("bob key package bytes");
         alice.create_group(channel_id).await.expect("create group");
 
         let (_commit, welcome) = alice.add_member(&bob_kp).await.expect("add member");
         let welcome = welcome.expect("welcome message");
 
-        let mut bob =
-            MlsGroupHandle::new(MemoryStore::default(), guild_id, channel_id, bob_identity);
+        let mut bob = bob;
         bob.join_group_from_welcome(&welcome)
             .await
             .expect("bob joins group");
