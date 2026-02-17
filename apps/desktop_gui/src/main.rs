@@ -1613,7 +1613,41 @@ impl DesktopGuiApp {
                                 });
                             }
                         }
+                        ui.add_space(6.0);
                     }
+
+                    ui.horizontal(|ui| {
+                        if ui.button("📎").on_hover_text("Attach file").clicked() {
+                            self.pending_attachment = rfd::FileDialog::new().pick_file();
+                        }
+                        let response = ui.add_sized(
+                            [ui.available_width() - 130.0, 72.0],
+                            egui::TextEdit::multiline(&mut self.composer).hint_text(
+                                "Message #channel (Enter to send, Shift+Enter for newline)",
+                            ),
+                        );
+                        let send_shortcut = response.has_focus()
+                            && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
+                        let clicked_send = ui
+                            .add_sized([80.0, 72.0], egui::Button::new("⬆ Send"))
+                            .clicked();
+                        let has_text = !self.composer.trim().is_empty();
+                        let has_attachment = self.pending_attachment.is_some();
+                        if (send_shortcut || clicked_send) && (has_text || has_attachment) {
+                            let text = self.composer.trim_end_matches('\n').to_string();
+                            self.composer.clear();
+                            let attachment_path = self.pending_attachment.take();
+                            queue_command(
+                                &self.cmd_tx,
+                                BackendCommand::SendMessage {
+                                    text,
+                                    attachment_path,
+                                },
+                                &mut self.status,
+                            );
+                            response.request_focus();
+                        }
+                    });
                 });
                 if !can_send {
                     ui.centered_and_justified(|ui| {
@@ -1669,7 +1703,7 @@ impl DesktopGuiApp {
                             let frame = if self.readability.message_bubble_backgrounds {
                                 egui::Frame::none().fill(base_message_bg)
                             } else {
-                                egui::Frame::none()
+                                14.0
                             };
                             let message_response = frame
                                 .rounding(egui::Rounding::same(f32::from(
@@ -1703,6 +1737,43 @@ impl DesktopGuiApp {
                                                         },
                                                         &mut self.status,
                                                     );
+                                                    if self.readability.show_timestamps {
+                                                        ui.label(
+                                                            egui::RichText::new(sent_at)
+                                                                .small()
+                                                                .weak(),
+                                                        );
+                                                    }
+                                                });
+                                                ui.label(&msg.plaintext);
+                                                if let Some(attachment) = &msg.wire.attachment {
+                                                    if attachment_is_image(attachment) {
+                                                        self.render_image_attachment_preview(
+                                                            ui, attachment,
+                                                        );
+                                                    } else {
+                                                        ui.horizontal(|ui| {
+                                                            ui.label(format!(
+                                                                "📎 {} ({})",
+                                                                attachment.filename,
+                                                                human_readable_bytes(
+                                                                    attachment.size_bytes,
+                                                                )
+                                                            ));
+                                                            if ui.button("Download").clicked() {
+                                                                queue_command(
+                                                                    &self.cmd_tx,
+                                                                    BackendCommand::DownloadAttachment {
+                                                                        file_id: attachment.file_id,
+                                                                        filename: attachment
+                                                                            .filename
+                                                                            .clone(),
+                                                                    },
+                                                                    &mut self.status,
+                                                                );
+                                                            }
+                                                        });
+                                                    }
                                                 }
                                             });
                                         }
@@ -1736,22 +1807,12 @@ impl DesktopGuiApp {
                             ui.available_size(),
                             egui::Layout::centered_and_justified(egui::Direction::TopDown),
                             |ui| {
-                                ui.heading("No messages");
-                                ui.weak("This conversation is quiet for now.");
+                                ui.heading("Select a channel");
+                                ui.weak("Choose a channel from the left to view and send messages.");
                             },
                         );
                     }
-                } else {
-                    ui.allocate_ui_with_layout(
-                        ui.available_size(),
-                        egui::Layout::centered_and_justified(egui::Direction::TopDown),
-                        |ui| {
-                            ui.heading("Select a channel");
-                            ui.weak("Choose a channel from the left to view and send messages.");
-                        },
-                    );
-                }
-            });
+                });
 
             if !self.auth_session_established {
                 ui.separator();
