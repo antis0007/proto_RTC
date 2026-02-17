@@ -229,10 +229,14 @@ mod tests {
     use std::{collections::HashMap, sync::Arc};
     use tokio::sync::Mutex;
 
+    type IdentityKey = (i64, String);
+    type GroupKey = (i64, i64);
+    type BlobMap<K> = Arc<Mutex<HashMap<K, Vec<u8>>>>;
+
     #[derive(Default, Clone)]
     struct MemoryStore {
-        identities: Arc<Mutex<HashMap<(i64, String), Vec<u8>>>>,
-        groups: Arc<Mutex<HashMap<(i64, i64), Vec<u8>>>>,
+        identities: BlobMap<IdentityKey>,
+        groups: BlobMap<GroupKey>,
     }
 
     #[async_trait]
