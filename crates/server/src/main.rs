@@ -8,7 +8,10 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use base64::{
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+    Engine as _,
+};
 use livekit_integration::LiveKitConfig;
 use serde::{Deserialize, Serialize};
 use server_api::{list_channels, list_guilds, list_messages, send_message, ApiContext};
@@ -56,6 +59,31 @@ struct WsQuery {
 #[derive(Debug, Deserialize)]
 struct UserQuery {
     user_id: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct UploadKeyPackageQuery {
+    user_id: i64,
+    guild_id: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct FetchKeyPackageQuery {
+    guild_id: i64,
+    user_id: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct UploadKeyPackageResponse {
+    key_package_id: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct KeyPackageResponse {
+    key_package_id: i64,
+    guild_id: i64,
+    user_id: i64,
+    key_package_b64: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -120,6 +148,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/messages", post(http_send_message))
         .route("/files/upload", post(upload_file))
         .route("/files/:file_id", get(download_file))
+        .route("/mls/key_packages", post(upload_key_package))
+        .route("/mls/key_packages", get(fetch_key_package))
         .route("/ws", get(ws_handler))
         .with_state(Arc::new(state));
 
@@ -238,6 +268,84 @@ async fn download_file(
             )
         })?;
     Ok((StatusCode::OK, bytes))
+}
+
+async fn upload_key_package(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<UploadKeyPackageQuery>,
+    body: Bytes,
+) -> Result<Json<UploadKeyPackageResponse>, (StatusCode, Json<ApiError>)> {
+    if body.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError::new(
+                ErrorCode::Validation,
+                "key package body cannot be empty",
+            )),
+        ));
+    }
+
+    state
+        .api
+        .storage
+        .membership_status(GuildId(q.guild_id), UserId(q.user_id))
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError::new(ErrorCode::Internal, e.to_string())),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::FORBIDDEN,
+                Json(ApiError::new(ErrorCode::Forbidden, "user is not a member")),
+            )
+        })?;
+
+    let key_package_id = state
+        .api
+        .storage
+        .insert_key_package(GuildId(q.guild_id), UserId(q.user_id), &body)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError::new(ErrorCode::Internal, e.to_string())),
+            )
+        })?;
+
+    Ok(Json(UploadKeyPackageResponse { key_package_id }))
+}
+
+async fn fetch_key_package(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<FetchKeyPackageQuery>,
+) -> Result<Json<KeyPackageResponse>, (StatusCode, Json<ApiError>)> {
+    let (key_package_id, key_package_bytes) = state
+        .api
+        .storage
+        .load_latest_key_package(GuildId(q.guild_id), UserId(q.user_id))
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError::new(ErrorCode::Internal, e.to_string())),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ApiError::new(ErrorCode::NotFound, "key package not found")),
+            )
+        })?;
+
+    Ok(Json(KeyPackageResponse {
+        key_package_id,
+        guild_id: q.guild_id,
+        user_id: q.user_id,
+        key_package_b64: STANDARD.encode(key_package_bytes),
+    }))
 }
 
 async fn ws_handler(
