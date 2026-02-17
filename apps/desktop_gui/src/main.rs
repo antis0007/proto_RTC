@@ -15,8 +15,10 @@ use egui::TextureHandle;
 use image::GenericImageView;
 use serde::{Deserialize, Serialize};
 use shared::{
-    domain::{ChannelId, ChannelKind, GuildId, MessageId, Role},
-    protocol::{ChannelSummary, GuildSummary, MemberSummary, MessagePayload, ServerEvent},
+    domain::{ChannelId, ChannelKind, FileId, GuildId, MessageId, Role},
+    protocol::{
+        AttachmentPayload, ChannelSummary, GuildSummary, MemberSummary, MessagePayload, ServerEvent,
+    },
 };
 
 enum BackendCommand {
@@ -48,8 +50,11 @@ enum BackendCommand {
         attachment_path: Option<PathBuf>,
     },
     DownloadAttachment {
-        file_id: shared::domain::FileId,
+        file_id: FileId,
         filename: String,
+    },
+    FetchAttachmentPreview {
+        file_id: FileId,
     },
     CreateInvite {
         guild_id: GuildId,
@@ -63,9 +68,37 @@ enum UiEvent {
     LoginOk,
     Info(String),
     InviteCreated(String),
-    SenderDirectoryUpdated { user_id: i64, username: String },
+    SenderDirectoryUpdated {
+        user_id: i64,
+        username: String,
+    },
     Error(String),
+    AttachmentPreviewLoaded {
+        file_id: FileId,
+        image: PreviewImage,
+    },
+    AttachmentPreviewFailed {
+        file_id: FileId,
+        reason: String,
+    },
     Server(ServerEvent),
+}
+
+#[derive(Clone)]
+struct PreviewImage {
+    width: usize,
+    height: usize,
+    rgba: Vec<u8>,
+}
+
+enum AttachmentPreviewState {
+    NotRequested,
+    Loading,
+    Ready {
+        image: PreviewImage,
+        texture: Option<egui::TextureHandle>,
+    },
+    Error(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -264,6 +297,8 @@ struct DesktopGuiApp {
     message_ids: HashMap<ChannelId, HashSet<MessageId>>,
     status: String,
     sender_directory: HashMap<i64, String>,
+    attachment_previews: HashMap<FileId, AttachmentPreviewState>,
+    expanded_preview: Option<FileId>,
     settings_open: bool,
     view_state: AppViewState,
     theme: ThemeSettings,
@@ -336,6 +371,8 @@ impl DesktopGuiApp {
             message_ids: HashMap::new(),
             status: "Not logged in".to_string(),
             sender_directory: HashMap::new(),
+            attachment_previews: HashMap::new(),
+            expanded_preview: None,
             settings_open: false,
             view_state: AppViewState::Login,
             theme,
@@ -360,6 +397,8 @@ impl DesktopGuiApp {
                     self.selected_guild = None;
                     self.selected_channel = None;
                     self.sender_directory.clear();
+                    self.attachment_previews.clear();
+                    self.expanded_preview = None;
                     queue_command(&self.cmd_tx, BackendCommand::ListGuilds, &mut self.status);
                 }
                 UiEvent::Info(message) => {
@@ -376,6 +415,19 @@ impl DesktopGuiApp {
                 UiEvent::Error(err) => {
                     self.auth_session_established = false;
                     self.status = format!("Error: {err}");
+                }
+                UiEvent::AttachmentPreviewLoaded { file_id, image } => {
+                    self.attachment_previews.insert(
+                        file_id,
+                        AttachmentPreviewState::Ready {
+                            image,
+                            texture: None,
+                        },
+                    );
+                }
+                UiEvent::AttachmentPreviewFailed { file_id, reason } => {
+                    self.attachment_previews
+                        .insert(file_id, AttachmentPreviewState::Error(reason));
                 }
                 UiEvent::Server(server_event) => match server_event {
                     ServerEvent::GuildUpdated { guild } => {
@@ -1164,8 +1216,8 @@ impl DesktopGuiApp {
 
             egui::ScrollArea::vertical().show(ui, |ui| {
                 if let Some(channel_id) = self.selected_channel {
-                    if let Some(messages) = self.messages.get(&channel_id) {
-                        for msg in messages {
+                    if let Some(messages) = self.messages.get(&channel_id).cloned() {
+                        for msg in &messages {
                             let decoded = STANDARD
                                 .decode(msg.ciphertext_b64.as_bytes())
                                 .ok()
@@ -1203,22 +1255,26 @@ impl DesktopGuiApp {
                                     });
                                     ui.label(decoded);
                                     if let Some(attachment) = &msg.attachment {
-                                        ui.horizontal(|ui| {
-                                            ui.label(format!(
-                                                "📎 {} ({} bytes)",
-                                                attachment.filename, attachment.size_bytes
-                                            ));
-                                            if ui.button("Download").clicked() {
-                                                queue_command(
-                                                    &self.cmd_tx,
-                                                    BackendCommand::DownloadAttachment {
-                                                        file_id: attachment.file_id,
-                                                        filename: attachment.filename.clone(),
-                                                    },
-                                                    &mut self.status,
-                                                );
-                                            }
-                                        });
+                                        if attachment_is_image(attachment) {
+                                            self.render_image_attachment_preview(ui, attachment);
+                                        } else {
+                                            ui.horizontal(|ui| {
+                                                ui.label(format!(
+                                                    "📎 {} ({} bytes)",
+                                                    attachment.filename, attachment.size_bytes
+                                                ));
+                                                if ui.button("Download").clicked() {
+                                                    queue_command(
+                                                        &self.cmd_tx,
+                                                        BackendCommand::DownloadAttachment {
+                                                            file_id: attachment.file_id,
+                                                            filename: attachment.filename.clone(),
+                                                        },
+                                                        &mut self.status,
+                                                    );
+                                                }
+                                            });
+                                        }
                                     }
                                 });
                             ui.add_space(if self.readability.compact_density {
@@ -1257,7 +1313,170 @@ impl DesktopGuiApp {
                 );
             }
         });
+
+        self.render_expanded_preview_window(ctx);
     }
+
+    fn render_image_attachment_preview(
+        &mut self,
+        ui: &mut egui::Ui,
+        attachment: &AttachmentPayload,
+    ) {
+        let state = self
+            .attachment_previews
+            .entry(attachment.file_id)
+            .or_insert(AttachmentPreviewState::NotRequested);
+
+        if matches!(state, AttachmentPreviewState::NotRequested) {
+            *state = AttachmentPreviewState::Loading;
+            queue_command(
+                &self.cmd_tx,
+                BackendCommand::FetchAttachmentPreview {
+                    file_id: attachment.file_id,
+                },
+                &mut self.status,
+            );
+        }
+
+        match state {
+            AttachmentPreviewState::Loading => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(format!("Loading preview for {}…", attachment.filename));
+                });
+            }
+            AttachmentPreviewState::Error(reason) => {
+                ui.colored_label(
+                    ui.visuals().error_fg_color,
+                    format!("Couldn't preview {}: {reason}", attachment.filename),
+                );
+                self.render_attachment_download_row(ui, attachment);
+            }
+            AttachmentPreviewState::Ready { image, texture } => {
+                if texture.is_none() {
+                    let color_image = egui::ColorImage::from_rgba_unmultiplied(
+                        [image.width, image.height],
+                        &image.rgba,
+                    );
+                    *texture = Some(ui.ctx().load_texture(
+                        format!("attachment_preview_{}", attachment.file_id.0),
+                        color_image,
+                        egui::TextureOptions::LINEAR,
+                    ));
+                }
+
+                if let Some(texture) = texture.as_ref() {
+                    let max_width = (ui.available_width() * 0.75).clamp(120.0, 360.0);
+                    let mut preview_size = texture.size_vec2();
+                    if preview_size.x > max_width {
+                        preview_size *= max_width / preview_size.x;
+                    }
+                    preview_size.y = preview_size.y.min(240.0);
+                    let clicked = ui
+                        .add(
+                            egui::ImageButton::new(
+                                egui::Image::new(texture).fit_to_exact_size(preview_size),
+                            )
+                            .frame(false),
+                        )
+                        .on_hover_text("Open full preview")
+                        .clicked();
+                    if clicked {
+                        self.expanded_preview = Some(attachment.file_id);
+                    }
+                    ui.small(format!(
+                        "🖼 {} ({} bytes)",
+                        attachment.filename, attachment.size_bytes
+                    ));
+                }
+
+                self.render_attachment_download_row(ui, attachment);
+            }
+            AttachmentPreviewState::NotRequested => {}
+        }
+    }
+
+    fn render_attachment_download_row(
+        &mut self,
+        ui: &mut egui::Ui,
+        attachment: &AttachmentPayload,
+    ) {
+        ui.horizontal(|ui| {
+            if ui.button("Download original").clicked() {
+                queue_command(
+                    &self.cmd_tx,
+                    BackendCommand::DownloadAttachment {
+                        file_id: attachment.file_id,
+                        filename: attachment.filename.clone(),
+                    },
+                    &mut self.status,
+                );
+            }
+        });
+    }
+
+    fn render_expanded_preview_window(&mut self, ctx: &egui::Context) {
+        let Some(file_id) = self.expanded_preview else {
+            return;
+        };
+
+        let mut keep_open = true;
+        egui::Window::new("Attachment preview")
+            .open(&mut keep_open)
+            .resizable(true)
+            .show(ctx, |ui| {
+                if let Some(AttachmentPreviewState::Ready {
+                    texture: Some(texture),
+                    ..
+                }) = self.attachment_previews.get(&file_id)
+                {
+                    let max_size = ui.available_size();
+                    let mut size = texture.size_vec2();
+                    let scale = (max_size.x / size.x).min(max_size.y / size.y).min(1.0);
+                    size *= scale;
+                    ui.add(egui::Image::new(texture).fit_to_exact_size(size));
+                } else {
+                    ui.label("Preview not available.");
+                }
+            });
+
+        if !keep_open {
+            self.expanded_preview = None;
+        }
+    }
+}
+
+fn attachment_is_image(attachment: &AttachmentPayload) -> bool {
+    attachment
+        .mime_type
+        .as_deref()
+        .map(|mime| mime.starts_with("image/"))
+        .unwrap_or_else(|| is_image_filename(&attachment.filename))
+}
+
+fn is_image_filename(filename: &str) -> bool {
+    filename
+        .rsplit('.')
+        .next()
+        .map(|ext| {
+            matches!(
+                ext.to_ascii_lowercase().as_str(),
+                "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "tiff"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn decode_preview_image(bytes: &[u8]) -> Result<PreviewImage, String> {
+    let dynamic = image::load_from_memory(bytes).map_err(|err| err.to_string())?;
+    let resized = dynamic.thumbnail(1024, 1024).to_rgba8();
+    let width = resized.width() as usize;
+    let height = resized.height() as usize;
+    Ok(PreviewImage {
+        width,
+        height,
+        rgba: resized.into_raw(),
+    })
 }
 
 fn queue_command(cmd_tx: &Sender<BackendCommand>, cmd: BackendCommand, status: &mut String) {
@@ -1458,6 +1677,30 @@ fn spawn_backend_thread(cmd_rx: Receiver<BackendCommand>, ui_tx: Sender<UiEvent>
 
                         if let Err(err) = result {
                             let _ = ui_tx.try_send(UiEvent::Error(err.to_string()));
+                        }
+                    }
+                    BackendCommand::FetchAttachmentPreview { file_id } => {
+                        match client.download_file(file_id).await {
+                            Ok(bytes) => match decode_preview_image(&bytes) {
+                                Ok(image) => {
+                                    let _ = ui_tx.try_send(UiEvent::AttachmentPreviewLoaded {
+                                        file_id,
+                                        image,
+                                    });
+                                }
+                                Err(err) => {
+                                    let _ = ui_tx.try_send(UiEvent::AttachmentPreviewFailed {
+                                        file_id,
+                                        reason: err,
+                                    });
+                                }
+                            },
+                            Err(err) => {
+                                let _ = ui_tx.try_send(UiEvent::AttachmentPreviewFailed {
+                                    file_id,
+                                    reason: format!("Failed to download preview: {err}"),
+                                });
+                            }
                         }
                     }
                     BackendCommand::DownloadAttachment { file_id, filename } => {
