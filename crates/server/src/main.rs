@@ -11,7 +11,7 @@ use axum::{
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use livekit_integration::LiveKitConfig;
 use serde::{Deserialize, Serialize};
-use server_api::{list_channels, list_guilds, send_message, ApiContext};
+use server_api::{list_channels, list_guilds, list_messages, send_message, ApiContext};
 use shared::{
     domain::{ChannelId, ChannelKind, FileId, GuildId, UserId},
     error::{ApiError, ErrorCode},
@@ -56,6 +56,13 @@ struct WsQuery {
 #[derive(Debug, Deserialize)]
 struct UserQuery {
     user_id: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct ListMessagesQuery {
+    user_id: i64,
+    limit: Option<u32>,
+    before: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -107,6 +114,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/login", post(login))
         .route("/guilds", get(http_list_guilds))
         .route("/guilds/:guild_id/channels", get(http_list_channels))
+        .route("/channels/:channel_id/messages", get(http_list_messages))
         .route("/guilds/:guild_id/invites", post(http_create_invite))
         .route("/guilds/join", post(http_join_guild))
         .route("/messages", post(http_send_message))
@@ -287,6 +295,24 @@ async fn http_list_channels(
         .await
         .map_err(|e| (StatusCode::BAD_REQUEST, Json(e)))?;
     Ok(Json(channels))
+}
+
+async fn http_list_messages(
+    State(state): State<Arc<AppState>>,
+    Path(channel_id): Path<i64>,
+    Query(q): Query<ListMessagesQuery>,
+) -> Result<Json<Vec<shared::protocol::MessagePayload>>, (StatusCode, Json<ApiError>)> {
+    let limit = q.limit.unwrap_or(100).clamp(1, 100);
+    let messages = list_messages(
+        &state.api,
+        UserId(q.user_id),
+        ChannelId(channel_id),
+        limit,
+        q.before,
+    )
+    .await
+    .map_err(|e| (StatusCode::BAD_REQUEST, Json(e)))?;
+    Ok(Json(messages))
 }
 
 async fn http_create_invite(

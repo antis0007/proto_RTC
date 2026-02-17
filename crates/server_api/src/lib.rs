@@ -95,6 +95,39 @@ pub async fn send_message(
     })
 }
 
+pub async fn list_messages(
+    ctx: &ApiContext,
+    user_id: UserId,
+    channel_id: ChannelId,
+    limit: u32,
+    before: Option<i64>,
+) -> Result<Vec<MessagePayload>, ApiError> {
+    let guild_id = ctx
+        .storage
+        .guild_for_channel(channel_id)
+        .await
+        .map_err(internal)?
+        .ok_or_else(|| ApiError::new(ErrorCode::NotFound, "channel not found"))?;
+    ensure_active_membership(ctx, guild_id, user_id).await?;
+
+    let messages = ctx
+        .storage
+        .list_channel_messages(channel_id, limit, before)
+        .await
+        .map_err(internal)?;
+
+    Ok(messages
+        .into_iter()
+        .map(|message| MessagePayload {
+            message_id: message.message_id,
+            channel_id: message.channel_id,
+            sender_id: message.sender_id,
+            ciphertext_b64: STANDARD.encode(message.ciphertext),
+            sent_at: message.created_at,
+        })
+        .collect())
+}
+
 pub async fn request_livekit_token(
     ctx: &ApiContext,
     user_id: UserId,
