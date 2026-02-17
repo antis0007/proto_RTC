@@ -923,6 +923,7 @@ mod tests {
         add_member_welcome: Vec<u8>,
         fail_with: Option<String>,
         joined_welcomes: Arc<Mutex<Vec<Vec<u8>>>>,
+        decrypted_ciphertexts: Arc<Mutex<Vec<Vec<u8>>>>,
     }
 
     impl TestMlsSessionManager {
@@ -933,6 +934,7 @@ mod tests {
                 add_member_welcome: b"welcome-generated".to_vec(),
                 fail_with: None,
                 joined_welcomes: Arc::new(Mutex::new(Vec::new())),
+                decrypted_ciphertexts: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
@@ -943,6 +945,7 @@ mod tests {
                 add_member_welcome: Vec::new(),
                 fail_with: Some(err.into()),
                 joined_welcomes: Arc::new(Mutex::new(Vec::new())),
+                decrypted_ciphertexts: Arc::new(Mutex::new(Vec::new())),
             }
         }
     }
@@ -966,11 +969,15 @@ mod tests {
         async fn decrypt_application(
             &self,
             _channel_id: ChannelId,
-            _ciphertext: &[u8],
+            ciphertext: &[u8],
         ) -> Result<Vec<u8>> {
             if let Some(err) = &self.fail_with {
                 return Err(anyhow!(err.clone()));
             }
+            self.decrypted_ciphertexts
+                .lock()
+                .await
+                .push(ciphertext.to_vec());
             Ok(self.decrypt_plaintext.clone())
         }
 
@@ -1135,6 +1142,7 @@ mod tests {
     struct OnboardingServerState {
         pending_welcome_b64: Arc<Mutex<Option<String>>>,
         add_member_posts: Arc<Mutex<Vec<(i64, i64, i64)>>>,
+        stored_ciphertexts: Arc<Mutex<Vec<String>>>,
     }
 
     async fn onboarding_list_members() -> Json<Vec<MemberSummary>> {
@@ -1214,8 +1222,37 @@ mod tests {
         }))
     }
 
-    async fn onboarding_messages() -> Json<Vec<MessagePayload>> {
-        Json(vec![])
+    async fn onboarding_send_message(
+        State(state): State<OnboardingServerState>,
+        Json(payload): Json<SendMessageHttpRequest>,
+    ) -> StatusCode {
+        state
+            .stored_ciphertexts
+            .lock()
+            .await
+            .push(payload.ciphertext_b64);
+        StatusCode::NO_CONTENT
+    }
+
+    async fn onboarding_messages_for_channel(
+        State(state): State<OnboardingServerState>,
+    ) -> Json<Vec<MessagePayload>> {
+        let ciphertext_b64 = state
+            .stored_ciphertexts
+            .lock()
+            .await
+            .first()
+            .cloned()
+            .unwrap_or_default();
+        Json(vec![MessagePayload {
+            message_id: MessageId(1),
+            channel_id: ChannelId(13),
+            sender_id: shared::domain::UserId(7),
+            sender_username: Some("adder".to_string()),
+            ciphertext_b64,
+            attachment: None,
+            sent_at: "2024-01-01T00:00:00Z".parse().expect("timestamp"),
+        }])
     }
 
     async fn spawn_onboarding_server() -> Result<(String, OnboardingServerState)> {
@@ -1225,6 +1262,7 @@ mod tests {
         let state = OnboardingServerState {
             pending_welcome_b64: Arc::new(Mutex::new(None)),
             add_member_posts: Arc::new(Mutex::new(Vec::new())),
+            stored_ciphertexts: Arc::new(Mutex::new(Vec::new())),
         };
         let app = Router::new()
             .route(
@@ -1242,8 +1280,9 @@ mod tests {
             .route("/mls/welcome", axum::routing::get(onboarding_fetch_welcome))
             .route(
                 "/channels/13/messages",
-                axum::routing::get(onboarding_messages),
+                axum::routing::get(onboarding_messages_for_channel),
             )
+            .route("/messages", axum::routing::post(onboarding_send_message))
             .with_state(state.clone());
         tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
@@ -1295,5 +1334,82 @@ mod tests {
 
         let welcomes = joined_welcomes.lock().await.clone();
         assert_eq!(welcomes, vec![b"welcome-generated".to_vec()]);
+    }
+
+    #[tokio::test]
+    async fn onboarding_flow_encrypts_fetches_once_and_renders_plaintext() {
+        let (server_url, server_state) = spawn_onboarding_server().await.expect("spawn server");
+
+        let adder = RealtimeClient::new_with_mls_session_manager(
+            PassthroughCrypto,
+            Arc::new(TestMlsSessionManager::ok(
+                b"ciphertext-from-a".to_vec(),
+                Vec::new(),
+            )),
+        );
+        {
+            let mut inner = adder.inner.lock().await;
+            inner.server_url = Some(server_url.clone());
+            inner.user_id = Some(7);
+            inner.selected_guild = Some(GuildId(11));
+            inner.selected_channel = Some(ChannelId(13));
+            inner.channel_guilds.insert(ChannelId(13), GuildId(11));
+        }
+
+        adder
+            .select_channel(ChannelId(13))
+            .await
+            .expect("adder select");
+        adder.send_message("hello from A").await.expect("send text");
+
+        let stored_ciphertexts = server_state.stored_ciphertexts.lock().await.clone();
+        assert_eq!(stored_ciphertexts.len(), 1);
+        assert_ne!(
+            stored_ciphertexts[0],
+            STANDARD.encode("hello from A".as_bytes())
+        );
+
+        let target_mls = TestMlsSessionManager::ok(Vec::new(), b"hello from A".to_vec());
+        let joined_welcomes = target_mls.joined_welcomes.clone();
+        let decrypted_ciphertexts = target_mls.decrypted_ciphertexts.clone();
+        let target =
+            RealtimeClient::new_with_mls_session_manager(PassthroughCrypto, Arc::new(target_mls));
+        {
+            let mut inner = target.inner.lock().await;
+            inner.server_url = Some(server_url.clone());
+            inner.user_id = Some(42);
+            inner.selected_guild = Some(GuildId(11));
+            inner.selected_channel = Some(ChannelId(13));
+            inner.channel_guilds.insert(ChannelId(13), GuildId(11));
+        }
+
+        let mut rx = target.subscribe_events();
+        target
+            .select_channel(ChannelId(13))
+            .await
+            .expect("target select auto joins");
+
+        loop {
+            let event = rx.recv().await.expect("decrypted event");
+            if let ClientEvent::MessageDecrypted { plaintext, .. } = event {
+                assert_eq!(plaintext, "hello from A");
+                break;
+            }
+        }
+
+        let welcomes = joined_welcomes.lock().await.clone();
+        assert_eq!(welcomes, vec![b"welcome-generated".to_vec()]);
+
+        let decrypt_inputs = decrypted_ciphertexts.lock().await.clone();
+        assert_eq!(decrypt_inputs, vec![b"ciphertext-from-a".to_vec()]);
+
+        let second_welcome_fetch = reqwest::Client::new()
+            .get(format!(
+                "{server_url}/mls/welcome?user_id=42&guild_id=11&channel_id=13"
+            ))
+            .send()
+            .await
+            .expect("second fetch request");
+        assert_eq!(second_welcome_fetch.status(), StatusCode::NOT_FOUND);
     }
 }
