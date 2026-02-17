@@ -2,8 +2,8 @@
 set -euo pipefail
 
 if [[ $# -lt 1 ]]; then
-  echo "Usage: $0 <LAN_IP_OR_HOSTNAME> [PORT] [extra server args...]" >&2
-  echo "Example: $0 192.168.1.42 8443" >&2
+  echo "Usage: $0 <LAN_IP_OR_HOSTNAME> [PORT] [BIND_IP] [extra server args...]" >&2
+  echo "Example: $0 192.168.1.42 8443 0.0.0.0" >&2
   exit 1
 fi
 
@@ -14,7 +14,12 @@ if [[ $# -gt 0 ]]; then
   shift || true
 fi
 
-export SERVER_BIND="0.0.0.0:${PORT}"
+BIND_IP="${1:-0.0.0.0}"
+if [[ $# -gt 0 ]]; then
+  shift || true
+fi
+
+export SERVER_BIND="${BIND_IP}:${PORT}"
 export APP__BIND_ADDR="$SERVER_BIND"
 export SERVER_PUBLIC_URL="http://${LAN_HOST}:${PORT}"
 
