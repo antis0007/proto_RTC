@@ -134,17 +134,16 @@ impl DesktopGuiApp {
                 }
                 UiEvent::Server(server_event) => match server_event {
                     ServerEvent::GuildUpdated { guild } => {
-                        if !self.guilds.iter().any(|g| g.guild_id == guild.guild_id) {
+                        let guild_id = guild.guild_id;
+                        if !self.guilds.iter().any(|g| g.guild_id == guild_id) {
                             self.guilds.push(guild);
                         }
                         if self.selected_guild.is_none() {
-                            self.selected_guild = Some(guild.guild_id);
+                            self.selected_guild = Some(guild_id);
                             self.channels.clear();
                             queue_command(
                                 &self.cmd_tx,
-                                BackendCommand::ListChannels {
-                                    guild_id: guild.guild_id,
-                                },
+                                BackendCommand::ListChannels { guild_id },
                                 &mut self.status,
                             );
                         }
