@@ -806,8 +806,7 @@ mod tests {
             if let Some(err) = &self.fail_with {
                 return Err(anyhow!(err.clone()));
             }
-            Ok(self.decrypt_plaintext.clone())
-            Ok(self.ciphertext.clone())
+            Ok(self.decrypt_plaintext.clone());
         }
     }
 
