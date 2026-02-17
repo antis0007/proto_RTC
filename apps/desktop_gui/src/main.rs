@@ -648,6 +648,45 @@ impl DesktopGuiApp {
                 ui.label("No participants");
             });
 
+        egui::TopBottomPanel::bottom("composer_panel")
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.add_space(6.0);
+                let can_send = self.selected_channel.is_some();
+                ui.add_enabled_ui(can_send, |ui| {
+                    ui.horizontal(|ui| {
+                        let response = ui.add_sized(
+                            [ui.available_width() - 90.0, 72.0],
+                            egui::TextEdit::multiline(&mut self.composer).hint_text(
+                                "Message #channel (Enter to send, Shift+Enter for newline)",
+                            ),
+                        );
+                        let send_shortcut = response.has_focus()
+                            && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
+                        let clicked_send = ui
+                            .add_sized([80.0, 72.0], egui::Button::new("⬆ Send"))
+                            .clicked();
+                        let has_text = !self.composer.trim().is_empty();
+                        if (send_shortcut || clicked_send) && has_text {
+                            let text = self.composer.trim_end_matches('\n').to_string();
+                            self.composer.clear();
+                            queue_command(
+                                &self.cmd_tx,
+                                BackendCommand::SendMessage { text },
+                                &mut self.status,
+                            );
+                            response.request_focus();
+                        }
+                    });
+                });
+                if !can_send {
+                    ui.centered_and_justified(|ui| {
+                        ui.weak("Pick a channel to start chatting.");
+                    });
+                }
+                ui.add_space(4.0);
+            });
+
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("Messages");
@@ -689,32 +728,24 @@ impl DesktopGuiApp {
                             ui.add_space(6.0);
                         }
                     } else {
-                        ui.label("No messages yet");
+                        ui.allocate_ui_with_layout(
+                            ui.available_size(),
+                            egui::Layout::centered_and_justified(egui::Direction::TopDown),
+                            |ui| {
+                                ui.heading("No messages");
+                                ui.weak("This conversation is quiet for now.");
+                            },
+                        );
                     }
                 } else {
-                    ui.label("Select a channel");
-                }
-            });
-
-            ui.separator();
-            ui.horizontal(|ui| {
-                let response = ui.add(
-                    egui::TextEdit::singleline(&mut self.composer)
-                        .hint_text("Type a message and press Enter"),
-                );
-                let pressed_enter =
-                    response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                let clicked_send = ui.button("Send").clicked();
-                let should_send =
-                    (pressed_enter || clicked_send) && !self.composer.trim().is_empty();
-                if should_send {
-                    let text = std::mem::take(&mut self.composer);
-                    queue_command(
-                        &self.cmd_tx,
-                        BackendCommand::SendMessage { text },
-                        &mut self.status,
+                    ui.allocate_ui_with_layout(
+                        ui.available_size(),
+                        egui::Layout::centered_and_justified(egui::Direction::TopDown),
+                        |ui| {
+                            ui.heading("Select a channel");
+                            ui.weak("Choose a channel from the left to view and send messages.");
+                        },
                     );
-                    response.request_focus();
                 }
             });
         });
