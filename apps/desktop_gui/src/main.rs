@@ -28,11 +28,6 @@ enum BackendCommand {
     Login {
         server_url: String,
         username: String,
-        password_or_invite: String,
-        password: Option<String>,
-        token: Option<String>,
-        remember_me: Option<bool>,
-        auth_action: AuthAction,
     },
     ListGuilds,
     ListChannels {
@@ -281,21 +276,6 @@ enum AttachmentPreviewState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AuthAction {
-    SignIn,
-    CreateAccount,
-}
-
-impl AuthAction {
-    fn label(self) -> &'static str {
-        match self {
-            AuthAction::SignIn => "Sign in",
-            AuthAction::CreateAccount => "Create account",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ThemePreset {
     DiscordDark,
     DiscordLegacy,
@@ -464,10 +444,6 @@ struct DesktopGuiApp {
     server_url: String,
     username: String,
     password_or_invite: String,
-    password: String,
-    auth_token: String,
-    remember_me: bool,
-    auth_action: AuthAction,
     auth_session_established: bool,
     composer: String,
     pending_attachment: Option<PathBuf>,
@@ -541,10 +517,6 @@ impl DesktopGuiApp {
             server_url: "http://127.0.0.1:8443".to_string(),
             username: "alice".to_string(),
             password_or_invite: String::new(),
-            password: String::new(),
-            auth_token: String::new(),
-            remember_me: false,
-            auth_action: AuthAction::SignIn,
             auth_session_established: false,
             composer: String::new(),
             pending_attachment: None,
@@ -910,52 +882,24 @@ impl DesktopGuiApp {
                         ui.label("Username:");
                         ui.text_edit_singleline(&mut self.username);
                         ui.end_row();
-
-                        ui.label("Invite/legacy password:");
-                        ui.text_edit_singleline(&mut self.password_or_invite);
-                        ui.end_row();
-
-                        ui.label("Password:");
-                        ui.add(egui::TextEdit::singleline(&mut self.password).password(true));
-                        ui.end_row();
-
-                        ui.label("Token:");
-                        ui.text_edit_singleline(&mut self.auth_token);
-                        ui.end_row();
                     });
 
-                ui.horizontal(|ui| {
-                    ui.selectable_value(
-                        &mut self.auth_action,
-                        AuthAction::SignIn,
-                        AuthAction::SignIn.label(),
-                    );
-                    ui.selectable_value(
-                        &mut self.auth_action,
-                        AuthAction::CreateAccount,
-                        AuthAction::CreateAccount.label(),
-                    );
-                    ui.checkbox(&mut self.remember_me, "Remember me");
-                });
-
                 ui.add_space(12.0);
-                if ui.button(self.auth_action.label()).clicked() {
-                    self.auth_session_established = false;
-                    queue_command(
-                        &self.cmd_tx,
-                        BackendCommand::Login {
-                            server_url: self.server_url.clone(),
-                            username: self.username.clone(),
-                            password_or_invite: self.password_or_invite.clone(),
-                            password: (!self.password.trim().is_empty())
-                                .then(|| self.password.clone()),
-                            token: (!self.auth_token.trim().is_empty())
-                                .then(|| self.auth_token.clone()),
-                            remember_me: self.remember_me.then_some(true),
-                            auth_action: self.auth_action,
-                        },
-                        &mut self.status,
-                    );
+                if ui.button("Sign in").clicked() {
+                    let username = self.username.trim().to_string();
+                    if username.is_empty() {
+                        self.status = "Username is required for username-only sign in".to_string();
+                    } else {
+                        self.auth_session_established = false;
+                        queue_command(
+                            &self.cmd_tx,
+                            BackendCommand::Login {
+                                server_url: self.server_url.clone(),
+                                username,
+                            },
+                            &mut self.status,
+                        );
+                    }
                 }
 
                 ui.add_space(8.0);
@@ -1247,45 +1191,29 @@ impl DesktopGuiApp {
                     ui.text_edit_singleline(&mut self.server_url);
                     ui.label("Username:");
                     ui.text_edit_singleline(&mut self.username);
-                    ui.label("Invite (legacy):");
+                    ui.label("Invite:");
                     ui.text_edit_singleline(&mut self.password_or_invite);
                 });
 
                 ui.horizontal_wrapped(|ui| {
-                    ui.selectable_value(
-                        &mut self.auth_action,
-                        AuthAction::SignIn,
-                        AuthAction::SignIn.label(),
-                    );
-                    ui.selectable_value(
-                        &mut self.auth_action,
-                        AuthAction::CreateAccount,
-                        AuthAction::CreateAccount.label(),
-                    );
                     ui.separator();
-                    ui.label("Password:");
-                    ui.add(egui::TextEdit::singleline(&mut self.password).password(true));
-                    ui.label("Token:");
-                    ui.add(egui::TextEdit::singleline(&mut self.auth_token));
-                    ui.checkbox(&mut self.remember_me, "Remember me");
 
-                    if ui.button(self.auth_action.label()).clicked() {
-                        self.auth_session_established = false;
-                        queue_command(
-                            &self.cmd_tx,
-                            BackendCommand::Login {
-                                server_url: self.server_url.clone(),
-                                username: self.username.clone(),
-                                password_or_invite: self.password_or_invite.clone(),
-                                password: (!self.password.trim().is_empty())
-                                    .then(|| self.password.clone()),
-                                token: (!self.auth_token.trim().is_empty())
-                                    .then(|| self.auth_token.clone()),
-                                remember_me: self.remember_me.then_some(true),
-                                auth_action: self.auth_action,
-                            },
-                            &mut self.status,
-                        );
+                    if ui.button("Sign in").clicked() {
+                        let username = self.username.trim().to_string();
+                        if username.is_empty() {
+                            self.status =
+                                "Username is required for username-only sign in".to_string();
+                        } else {
+                            self.auth_session_established = false;
+                            queue_command(
+                                &self.cmd_tx,
+                                BackendCommand::Login {
+                                    server_url: self.server_url.clone(),
+                                    username,
+                                },
+                                &mut self.status,
+                            );
+                        }
                     }
 
                     let constrained = ui.available_width() < 220.0;
@@ -1338,12 +1266,10 @@ impl DesktopGuiApp {
                     }
                 });
 
-                if self.password.trim().is_empty() && self.auth_token.trim().is_empty() {
-                    ui.colored_label(
-                        egui::Color32::YELLOW,
-                        "Legacy username-only mode active. Password/token auth is reserved for upcoming secure auth backend work.",
-                    );
-                }
+                ui.colored_label(
+                    egui::Color32::YELLOW,
+                    "Username-only sign-in mode is active.",
+                );
                 ui.label(&self.status);
             });
 
@@ -2372,73 +2298,59 @@ fn spawn_backend_thread(cmd_rx: Receiver<BackendCommand>, ui_tx: Sender<UiEvent>
                     BackendCommand::Login {
                         server_url,
                         username,
-                        password_or_invite,
-                        password,
-                        token,
-                        remember_me: _remember_me,
-                        auth_action: _auth_action,
-                    } => {
-                        let credential = password
-                            .as_deref()
-                            .filter(|value| !value.trim().is_empty())
-                            .or_else(|| token.as_deref().filter(|value| !value.trim().is_empty()))
-                            .unwrap_or(password_or_invite.as_str());
-                        match client.login(&server_url, &username, credential).await {
-                            Ok(()) => {
-                                if !subscribed {
-                                    subscribed = true;
-                                    let mut events = client.subscribe_events();
-                                    let ui_tx_clone = ui_tx.clone();
-                                    tokio::spawn(async move {
-                                        while let Ok(event) = events.recv().await {
-                                            let evt = match event {
-                                                ClientEvent::Server(evt) => UiEvent::Server(evt),
-                                                ClientEvent::UserDirectoryUpdated {
-                                                    user_id,
-                                                    username,
-                                                } => UiEvent::SenderDirectoryUpdated {
-                                                    user_id,
-                                                    username,
-                                                },
-                                                ClientEvent::MessageDecrypted {
-                                                    message,
-                                                    plaintext,
-                                                } => {
-                                                    UiEvent::MessageDecrypted { message, plaintext }
-                                                }
-                                                ClientEvent::VoiceSessionStateChanged(snapshot) => {
-                                                    UiEvent::VoiceSessionStateChanged(snapshot)
-                                                }
-                                                ClientEvent::VoiceParticipantsUpdated {
-                                                    guild_id,
-                                                    channel_id,
-                                                    participants,
-                                                } => UiEvent::VoiceParticipantsUpdated {
-                                                    guild_id,
-                                                    channel_id,
-                                                    participants,
-                                                },
-                                                ClientEvent::Error(err) => {
-                                                    UiEvent::Error(UiError::from_message(
-                                                        UiErrorContext::DecryptMessage,
-                                                        err,
-                                                    ))
-                                                }
-                                            };
-                                            let _ = ui_tx_clone.try_send(evt);
-                                        }
-                                    });
-                                }
-                                let _ = ui_tx.try_send(UiEvent::LoginOk);
+                    } => match client.login(&server_url, &username, "").await {
+                        Ok(()) => {
+                            if !subscribed {
+                                subscribed = true;
+                                let mut events = client.subscribe_events();
+                                let ui_tx_clone = ui_tx.clone();
+                                tokio::spawn(async move {
+                                    while let Ok(event) = events.recv().await {
+                                        let evt = match event {
+                                            ClientEvent::Server(evt) => UiEvent::Server(evt),
+                                            ClientEvent::UserDirectoryUpdated {
+                                                user_id,
+                                                username,
+                                            } => UiEvent::SenderDirectoryUpdated {
+                                                user_id,
+                                                username,
+                                            },
+                                            ClientEvent::MessageDecrypted {
+                                                message,
+                                                plaintext,
+                                            } => UiEvent::MessageDecrypted { message, plaintext },
+                                            ClientEvent::VoiceSessionStateChanged(snapshot) => {
+                                                UiEvent::VoiceSessionStateChanged(snapshot)
+                                            }
+                                            ClientEvent::VoiceParticipantsUpdated {
+                                                guild_id,
+                                                channel_id,
+                                                participants,
+                                            } => UiEvent::VoiceParticipantsUpdated {
+                                                guild_id,
+                                                channel_id,
+                                                participants,
+                                            },
+                                            ClientEvent::Error(err) => {
+                                                UiEvent::Error(UiError::from_message(
+                                                    UiErrorContext::DecryptMessage,
+                                                    err,
+                                                ))
+                                            }
+                                        };
+                                        let _ = ui_tx_clone.try_send(evt);
+                                    }
+                                });
                             }
-                            Err(err) => {
-                                let _ = ui_tx.try_send(UiEvent::Error(UiError::from_message(
-                                    UiErrorContext::Login,
-                                    err.to_string(),
-                                )));
-                            }
+                            let _ = ui_tx.try_send(UiEvent::LoginOk);
                         }
-                    }
+                        Err(err) => {
+                            let _ = ui_tx.try_send(UiEvent::Error(UiError::from_message(
+                                UiErrorContext::Login,
+                                err.to_string(),
+                            )));
+                        }
+                    },
                     BackendCommand::ListGuilds => {
                         if let Err(err) = client.list_guilds().await {
                             let _ = ui_tx.try_send(UiEvent::Error(UiError::from_message(
