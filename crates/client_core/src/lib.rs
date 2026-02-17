@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 use anyhow::{anyhow, Context, Result};
@@ -21,8 +22,51 @@ use shared::{
         MemberSummary, MessagePayload, ServerEvent, UploadKeyPackageResponse, WelcomeResponse,
     },
 };
+use thiserror::Error;
 use tokio::sync::{broadcast, Mutex};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
+use zeroize::Zeroize;
+
+const LIVEKIT_E2EE_EXPORT_LABEL: &str = "livekit-e2ee";
+const LIVEKIT_E2EE_KEY_LEN: usize = 32;
+const LIVEKIT_E2EE_CACHE_TTL: Duration = Duration::from_secs(90);
+const LIVEKIT_E2EE_INFO_PREFIX: &[u8] = b"proto-rtc/livekit-e2ee/v1";
+/// Deterministic application salt for LiveKit E2EE key derivation.
+const LIVEKIT_E2EE_APP_SALT: &[u8] = b"proto-rtc/livekit-e2ee-app-salt";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct VoiceConnectionKey {
+    guild_id: GuildId,
+    channel_id: ChannelId,
+}
+
+impl VoiceConnectionKey {
+    fn new(guild_id: GuildId, channel_id: ChannelId) -> Self {
+        Self {
+            guild_id,
+            channel_id,
+        }
+    }
+}
+
+struct CachedVoiceSessionKey {
+    key: Vec<u8>,
+    expires_at: Instant,
+}
+
+#[derive(Debug, Error)]
+pub enum LiveKitE2eeKeyError {
+    #[error("missing MLS group for guild {guild_id} channel {channel_id}")]
+    MissingMlsGroup { guild_id: i64, channel_id: i64 },
+    #[error("MLS secret export failed for guild {guild_id} channel {channel_id}: {source}")]
+    ExportFailure {
+        guild_id: i64,
+        channel_id: i64,
+        source: anyhow::Error,
+    },
+    #[error("invalid derived LiveKit E2EE key length: expected {expected}, got {actual}")]
+    InvalidDerivedKeyLength { expected: usize, actual: usize },
+}
 
 #[async_trait]
 pub trait MlsSessionManager: Send + Sync {
@@ -35,6 +79,12 @@ pub trait MlsSessionManager: Send + Sync {
     ) -> Result<Vec<u8>>;
     async fn add_member(&self, channel_id: ChannelId, key_package_bytes: &[u8]) -> Result<Vec<u8>>;
     async fn join_from_welcome(&self, channel_id: ChannelId, welcome_bytes: &[u8]) -> Result<()>;
+    async fn export_secret(
+        &self,
+        channel_id: ChannelId,
+        label: &str,
+        len: usize,
+    ) -> Result<Vec<u8>>;
 }
 
 pub struct MissingMlsSessionManager;
@@ -75,6 +125,18 @@ impl MlsSessionManager for MissingMlsSessionManager {
     }
 
     async fn join_from_welcome(&self, channel_id: ChannelId, _welcome_bytes: &[u8]) -> Result<()> {
+        Err(anyhow!(
+            "no active MLS group available for channel {}",
+            channel_id.0
+        ))
+    }
+
+    async fn export_secret(
+        &self,
+        channel_id: ChannelId,
+        _label: &str,
+        _len: usize,
+    ) -> Result<Vec<u8>> {
         Err(anyhow!(
             "no active MLS group available for channel {}",
             channel_id.0
@@ -255,6 +317,7 @@ struct RealtimeClientState {
     channel_guilds: HashMap<ChannelId, GuildId>,
     sender_directory: HashMap<i64, String>,
     attempted_channel_member_additions: HashSet<(GuildId, ChannelId, i64)>,
+    voice_session_keys: HashMap<VoiceConnectionKey, CachedVoiceSessionKey>,
 }
 
 #[derive(Serialize)]
@@ -298,9 +361,92 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
                 channel_guilds: HashMap::new(),
                 sender_directory: HashMap::new(),
                 attempted_channel_member_additions: HashSet::new(),
+                voice_session_keys: HashMap::new(),
             }),
             events,
         })
+    }
+
+    pub async fn derive_livekit_e2ee_key(
+        &self,
+        guild_id: GuildId,
+        channel_id: ChannelId,
+    ) -> std::result::Result<[u8; LIVEKIT_E2EE_KEY_LEN], LiveKitE2eeKeyError> {
+        let cache_key = VoiceConnectionKey::new(guild_id, channel_id);
+        {
+            let mut guard = self.inner.lock().await;
+            if let Some(cached) = guard.voice_session_keys.get_mut(&cache_key) {
+                if cached.expires_at > Instant::now() {
+                    if cached.key.len() != LIVEKIT_E2EE_KEY_LEN {
+                        let actual = cached.key.len();
+                        cached.key.zeroize();
+                        guard.voice_session_keys.remove(&cache_key);
+                        return Err(LiveKitE2eeKeyError::InvalidDerivedKeyLength {
+                            expected: LIVEKIT_E2EE_KEY_LEN,
+                            actual,
+                        });
+                    }
+                    let mut key = [0u8; LIVEKIT_E2EE_KEY_LEN];
+                    key.copy_from_slice(&cached.key);
+                    return Ok(key);
+                }
+                cached.key.zeroize();
+                guard.voice_session_keys.remove(&cache_key);
+            }
+        }
+
+        let mut exported = self
+            .mls_session_manager
+            .export_secret(channel_id, LIVEKIT_E2EE_EXPORT_LABEL, LIVEKIT_E2EE_KEY_LEN)
+            .await
+            .map_err(|source| map_export_error(guild_id, channel_id, source))?;
+
+        let mut info = build_livekit_hkdf_info(guild_id, channel_id);
+        let hk = hkdf::Hkdf::<sha2::Sha256>::new(Some(LIVEKIT_E2EE_APP_SALT), &exported);
+        let mut okm = vec![0u8; LIVEKIT_E2EE_KEY_LEN];
+        hk.expand(&info, &mut okm)
+            .map_err(|_| LiveKitE2eeKeyError::ExportFailure {
+                guild_id: guild_id.0,
+                channel_id: channel_id.0,
+                source: anyhow!("hkdf expansion failed"),
+            })?;
+
+        exported.zeroize();
+        info.zeroize();
+
+        if okm.len() != LIVEKIT_E2EE_KEY_LEN {
+            let actual = okm.len();
+            okm.zeroize();
+            return Err(LiveKitE2eeKeyError::InvalidDerivedKeyLength {
+                expected: LIVEKIT_E2EE_KEY_LEN,
+                actual,
+            });
+        }
+
+        let mut key = [0u8; LIVEKIT_E2EE_KEY_LEN];
+        key.copy_from_slice(&okm);
+        okm.zeroize();
+
+        let mut guard = self.inner.lock().await;
+        guard.voice_session_keys.insert(
+            cache_key,
+            CachedVoiceSessionKey {
+                key: key.to_vec(),
+                expires_at: Instant::now() + LIVEKIT_E2EE_CACHE_TTL,
+            },
+        );
+
+        Ok(key)
+    }
+
+    pub async fn clear_voice_session_key(&self, guild_id: GuildId, channel_id: ChannelId) {
+        let mut guard = self.inner.lock().await;
+        if let Some(mut cached) = guard
+            .voice_session_keys
+            .remove(&VoiceConnectionKey::new(guild_id, channel_id))
+        {
+            cached.key.zeroize();
+        }
     }
 
     async fn record_sender_username(&self, message: &MessagePayload) {
@@ -374,6 +520,7 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
             }
             let mut guard = client.inner.lock().await;
             guard.ws_started = false;
+            zeroize_voice_session_cache(&mut guard);
         });
 
         Ok(())
@@ -659,6 +806,42 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
     }
 }
 
+fn build_livekit_hkdf_info(guild_id: GuildId, channel_id: ChannelId) -> Vec<u8> {
+    let mut info = Vec::with_capacity(LIVEKIT_E2EE_INFO_PREFIX.len() + 1 + 16);
+    info.extend_from_slice(LIVEKIT_E2EE_INFO_PREFIX);
+    info.push(0);
+    info.extend_from_slice(&guild_id.0.to_be_bytes());
+    info.extend_from_slice(&channel_id.0.to_be_bytes());
+    info
+}
+
+fn zeroize_voice_session_cache(state: &mut RealtimeClientState) {
+    for cached in state.voice_session_keys.values_mut() {
+        cached.key.zeroize();
+    }
+    state.voice_session_keys.clear();
+}
+
+fn map_export_error(
+    guild_id: GuildId,
+    channel_id: ChannelId,
+    source: anyhow::Error,
+) -> LiveKitE2eeKeyError {
+    let msg = source.to_string();
+    if msg.contains("no active MLS group") || msg.contains("group not initialized") {
+        LiveKitE2eeKeyError::MissingMlsGroup {
+            guild_id: guild_id.0,
+            channel_id: channel_id.0,
+        }
+    } else {
+        LiveKitE2eeKeyError::ExportFailure {
+            guild_id: guild_id.0,
+            channel_id: channel_id.0,
+            source,
+        }
+    }
+}
+
 #[async_trait]
 impl<C: CryptoProvider + 'static> ClientHandle for Arc<RealtimeClient<C>> {
     async fn login(
@@ -687,6 +870,7 @@ impl<C: CryptoProvider + 'static> ClientHandle for Arc<RealtimeClient<C>> {
             guard.ws_started = true;
             guard.channel_guilds.clear();
             guard.sender_directory.clear();
+            zeroize_voice_session_cache(&mut guard);
         }
 
         self.spawn_ws_events(server_url, body.user_id).await?;
@@ -922,6 +1106,7 @@ mod tests {
         decrypt_plaintext: Vec<u8>,
         add_member_welcome: Vec<u8>,
         fail_with: Option<String>,
+        exported_secret: Vec<u8>,
         joined_welcomes: Arc<Mutex<Vec<Vec<u8>>>>,
         decrypted_ciphertexts: Arc<Mutex<Vec<Vec<u8>>>>,
     }
@@ -933,6 +1118,7 @@ mod tests {
                 decrypt_plaintext,
                 add_member_welcome: b"welcome-generated".to_vec(),
                 fail_with: None,
+                exported_secret: b"mls-export-secret".to_vec(),
                 joined_welcomes: Arc::new(Mutex::new(Vec::new())),
                 decrypted_ciphertexts: Arc::new(Mutex::new(Vec::new())),
             }
@@ -944,9 +1130,16 @@ mod tests {
                 decrypt_plaintext: Vec::new(),
                 add_member_welcome: Vec::new(),
                 fail_with: Some(err.into()),
+                exported_secret: Vec::new(),
                 joined_welcomes: Arc::new(Mutex::new(Vec::new())),
                 decrypted_ciphertexts: Arc::new(Mutex::new(Vec::new())),
             }
+        }
+
+        fn with_exported_secret(secret: Vec<u8>) -> Self {
+            let mut manager = Self::ok(Vec::new(), Vec::new());
+            manager.exported_secret = secret;
+            manager
         }
     }
 
@@ -1005,6 +1198,18 @@ mod tests {
                 .await
                 .push(welcome_bytes.to_vec());
             Ok(())
+        }
+
+        async fn export_secret(
+            &self,
+            _channel_id: ChannelId,
+            _label: &str,
+            _len: usize,
+        ) -> Result<Vec<u8>> {
+            if let Some(err) = &self.fail_with {
+                return Err(anyhow!(err.clone()));
+            }
+            Ok(self.exported_secret.clone())
         }
     }
 
@@ -1334,6 +1539,132 @@ mod tests {
 
         let welcomes = joined_welcomes.lock().await.clone();
         assert_eq!(welcomes, vec![b"welcome-generated".to_vec()]);
+    }
+
+    #[tokio::test]
+    async fn derive_livekit_e2ee_key_is_deterministic_for_same_connection() {
+        let client = RealtimeClient::new_with_mls_session_manager(
+            PassthroughCrypto,
+            Arc::new(TestMlsSessionManager::with_exported_secret(
+                b"same-mls-secret-material".to_vec(),
+            )),
+        );
+
+        let first = client
+            .derive_livekit_e2ee_key(GuildId(1), ChannelId(10))
+            .await
+            .expect("first key");
+        let second = client
+            .derive_livekit_e2ee_key(GuildId(1), ChannelId(10))
+            .await
+            .expect("second key");
+
+        assert_eq!(first, second);
+    }
+
+    #[tokio::test]
+    async fn derive_livekit_e2ee_key_is_domain_separated_by_channel() {
+        let client = RealtimeClient::new_with_mls_session_manager(
+            PassthroughCrypto,
+            Arc::new(TestMlsSessionManager::with_exported_secret(
+                b"same-mls-secret-material".to_vec(),
+            )),
+        );
+
+        let key_a = client
+            .derive_livekit_e2ee_key(GuildId(1), ChannelId(10))
+            .await
+            .expect("key a");
+        let key_b = client
+            .derive_livekit_e2ee_key(GuildId(1), ChannelId(11))
+            .await
+            .expect("key b");
+
+        assert_ne!(key_a, key_b);
+    }
+
+    #[tokio::test]
+    async fn derive_livekit_e2ee_key_surfaces_missing_group_failure() {
+        let client = RealtimeClient::new_with_mls_session_manager(
+            PassthroughCrypto,
+            Arc::new(TestMlsSessionManager::failing("group not initialized")),
+        );
+
+        let err = client
+            .derive_livekit_e2ee_key(GuildId(9), ChannelId(99))
+            .await
+            .expect_err("must fail");
+
+        match err {
+            LiveKitE2eeKeyError::MissingMlsGroup {
+                guild_id,
+                channel_id,
+            } => {
+                assert_eq!(guild_id, 9);
+                assert_eq!(channel_id, 99);
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn derive_livekit_e2ee_key_surfaces_export_failure() {
+        let client = RealtimeClient::new_with_mls_session_manager(
+            PassthroughCrypto,
+            Arc::new(TestMlsSessionManager::failing("backend export failed")),
+        );
+
+        let err = client
+            .derive_livekit_e2ee_key(GuildId(9), ChannelId(100))
+            .await
+            .expect_err("must fail");
+
+        match err {
+            LiveKitE2eeKeyError::ExportFailure {
+                guild_id,
+                channel_id,
+                source,
+            } => {
+                assert_eq!(guild_id, 9);
+                assert_eq!(channel_id, 100);
+                assert!(source.to_string().contains("backend export failed"));
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn derive_livekit_e2ee_key_rejects_invalid_cached_key_length() {
+        let client = RealtimeClient::new_with_mls_session_manager(
+            PassthroughCrypto,
+            Arc::new(TestMlsSessionManager::with_exported_secret(
+                b"same-mls-secret-material".to_vec(),
+            )),
+        );
+
+        {
+            let mut inner = client.inner.lock().await;
+            inner.voice_session_keys.insert(
+                VoiceConnectionKey::new(GuildId(5), ChannelId(6)),
+                CachedVoiceSessionKey {
+                    key: vec![7u8; 8],
+                    expires_at: Instant::now() + Duration::from_secs(30),
+                },
+            );
+        }
+
+        let err = client
+            .derive_livekit_e2ee_key(GuildId(5), ChannelId(6))
+            .await
+            .expect_err("must fail");
+
+        match err {
+            LiveKitE2eeKeyError::InvalidDerivedKeyLength { expected, actual } => {
+                assert_eq!(expected, LIVEKIT_E2EE_KEY_LEN);
+                assert_eq!(actual, 8);
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
     }
 
     #[tokio::test]
