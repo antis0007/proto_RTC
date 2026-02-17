@@ -1,13 +1,18 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
+    fs,
+    hash::{Hash, Hasher},
     path::PathBuf,
     thread,
+    time::SystemTime,
 };
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use client_core::{AttachmentUpload, ClientEvent, ClientHandle, PassthroughCrypto, RealtimeClient};
 use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 use eframe::egui;
+use egui::TextureHandle;
+use image::GenericImageView;
 use serde::{Deserialize, Serialize};
 use shared::{
     domain::{ChannelId, ChannelKind, GuildId, MessageId, Role},
@@ -249,6 +254,7 @@ struct DesktopGuiApp {
     auth_session_established: bool,
     composer: String,
     pending_attachment: Option<PathBuf>,
+    attachment_preview_cache: HashMap<AttachmentPreviewCacheKey, AttachmentPreview>,
     guilds: Vec<GuildSummary>,
     channels: Vec<ChannelSummary>,
     selected_guild: Option<GuildId>,
@@ -264,6 +270,34 @@ struct DesktopGuiApp {
     applied_theme: Option<ThemeSettings>,
     readability: UiReadabilitySettings,
     applied_readability: Option<UiReadabilitySettings>,
+}
+
+#[derive(Clone)]
+enum AttachmentPreview {
+    Image {
+        texture: TextureHandle,
+        size: egui::Vec2,
+    },
+    DecodeFailed,
+}
+
+#[derive(Clone, Eq)]
+struct AttachmentPreviewCacheKey {
+    path: PathBuf,
+    modified: Option<SystemTime>,
+}
+
+impl PartialEq for AttachmentPreviewCacheKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.path == other.path && self.modified == other.modified
+    }
+}
+
+impl Hash for AttachmentPreviewCacheKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.path.hash(state);
+        self.modified.hash(state);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -292,6 +326,7 @@ impl DesktopGuiApp {
             auth_session_established: false,
             composer: String::new(),
             pending_attachment: None,
+            attachment_preview_cache: HashMap::new(),
             guilds: Vec::new(),
             channels: Vec::new(),
             selected_guild: None,
@@ -595,6 +630,100 @@ impl DesktopGuiApp {
                 ui.label(&self.status);
             });
         });
+    }
+
+    fn attachment_preview_cache_key(path: &std::path::Path) -> AttachmentPreviewCacheKey {
+        let modified = fs::metadata(path).and_then(|m| m.modified()).ok();
+        AttachmentPreviewCacheKey {
+            path: path.to_path_buf(),
+            modified,
+        }
+    }
+
+    fn is_previewable_image(path: &std::path::Path) -> bool {
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| {
+                matches!(
+                    ext.to_ascii_lowercase().as_str(),
+                    "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp"
+                )
+            })
+            .unwrap_or(false)
+    }
+
+    fn load_attachment_preview(
+        &mut self,
+        ctx: &egui::Context,
+        path: &std::path::Path,
+    ) -> Option<AttachmentPreview> {
+        if !Self::is_previewable_image(path) {
+            return None;
+        }
+
+        let cache_key = Self::attachment_preview_cache_key(path);
+        if let Some(cached) = self.attachment_preview_cache.get(&cache_key).cloned() {
+            return Some(cached);
+        }
+
+        let bytes = match fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                self.attachment_preview_cache
+                    .insert(cache_key, AttachmentPreview::DecodeFailed);
+                return Some(AttachmentPreview::DecodeFailed);
+            }
+        };
+
+        let decoded = match image::load_from_memory(&bytes) {
+            Ok(image) => image,
+            Err(_) => {
+                self.attachment_preview_cache
+                    .insert(cache_key, AttachmentPreview::DecodeFailed);
+                return Some(AttachmentPreview::DecodeFailed);
+            }
+        };
+
+        let (orig_w, orig_h) = decoded.dimensions();
+        let max_dimension = 240.0_f32;
+        let scale = (max_dimension / (orig_w.max(orig_h) as f32)).min(1.0);
+        let resized = if scale < 1.0 {
+            decoded.resize(
+                (orig_w as f32 * scale).max(1.0) as u32,
+                (orig_h as f32 * scale).max(1.0) as u32,
+                image::imageops::FilterType::Triangle,
+            )
+        } else {
+            decoded
+        };
+        let rgba = resized.to_rgba8();
+        let [w, h] = [rgba.width() as usize, rgba.height() as usize];
+        let color_image = egui::ColorImage::from_rgba_unmultiplied([w, h], rgba.as_raw());
+        let texture = ctx.load_texture(
+            format!("attachment-preview:{}", path.display()),
+            color_image,
+            egui::TextureOptions::LINEAR,
+        );
+        let preview = AttachmentPreview::Image {
+            texture,
+            size: egui::vec2(w as f32, h as f32),
+        };
+        self.attachment_preview_cache
+            .insert(cache_key, preview.clone());
+        Some(preview)
+    }
+
+    fn attachment_size_text(path: &std::path::Path) -> String {
+        let bytes = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        const KB: u64 = 1024;
+        const MB: u64 = KB * 1024;
+        if bytes >= MB {
+            format!("{:.1} MB", bytes as f64 / MB as f64)
+        } else if bytes >= KB {
+            format!("{:.1} KB", bytes as f64 / KB as f64)
+        } else {
+            format!("{bytes} B")
+        }
     }
 
     fn show_main_workspace(&mut self, ctx: &egui::Context) {
@@ -966,8 +1095,46 @@ impl DesktopGuiApp {
                             response.request_focus();
                         }
                     });
-                    if let Some(path) = &self.pending_attachment {
-                        ui.small(format!("Attached: {}", path.display()));
+                    if let Some(path) = self.pending_attachment.clone() {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.small(format!("Attached: {}", path.display()));
+                            if ui.button("✕ Remove").clicked() {
+                                self.pending_attachment = None;
+                            }
+                        });
+
+                        let file_name = path
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .unwrap_or("attachment");
+                        let size_text = Self::attachment_size_text(&path);
+                        match self.load_attachment_preview(ctx, &path) {
+                            Some(AttachmentPreview::Image { texture, size }) => {
+                                egui::Frame::group(ui.style()).show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.label(format!("🖼 {file_name}"));
+                                        ui.small(size_text.clone());
+                                    });
+                                    ui.add(
+                                        egui::Image::new((texture.id(), size))
+                                            .max_size(egui::vec2(240.0, 240.0)),
+                                    );
+                                });
+                            }
+                            Some(AttachmentPreview::DecodeFailed) => {
+                                egui::Frame::group(ui.style()).show(ui, |ui| {
+                                    ui.label(format!("⚠ {file_name}"));
+                                    ui.small(size_text.clone());
+                                    ui.small("Image preview unavailable (decode failed)");
+                                });
+                            }
+                            None => {
+                                egui::Frame::group(ui.style()).show(ui, |ui| {
+                                    ui.label(format!("📎 {file_name}"));
+                                    ui.small(size_text);
+                                });
+                            }
+                        }
                     }
                 });
                 if !can_send {
