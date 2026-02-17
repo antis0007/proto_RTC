@@ -14,7 +14,9 @@ use base64::{
 };
 use livekit_integration::LiveKitConfig;
 use serde::{Deserialize, Serialize};
-use server_api::{list_channels, list_guilds, list_messages, send_message, ApiContext};
+use server_api::{
+    list_channels, list_guilds, list_members, list_messages, send_message, ApiContext,
+};
 use shared::{
     domain::{ChannelId, ChannelKind, FileId, GuildId, UserId},
     error::{ApiError, ErrorCode},
@@ -142,6 +144,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/login", post(login))
         .route("/guilds", get(http_list_guilds))
         .route("/guilds/:guild_id/channels", get(http_list_channels))
+        .route("/guilds/:guild_id/members", get(http_list_members))
         .route("/channels/:channel_id/messages", get(http_list_messages))
         .route("/guilds/:guild_id/invites", post(http_create_invite))
         .route("/guilds/join", post(http_join_guild))
@@ -405,6 +408,17 @@ async fn http_list_channels(
     Ok(Json(channels))
 }
 
+async fn http_list_members(
+    State(state): State<Arc<AppState>>,
+    Path(guild_id): Path<i64>,
+    Query(q): Query<UserQuery>,
+) -> Result<Json<Vec<shared::protocol::MemberSummary>>, (StatusCode, Json<ApiError>)> {
+    let members = list_members(&state.api, UserId(q.user_id), GuildId(guild_id))
+        .await
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(e)))?;
+    Ok(Json(members))
+}
+
 async fn http_list_messages(
     State(state): State<Arc<AppState>>,
     Path(channel_id): Path<i64>,
@@ -483,12 +497,13 @@ async fn http_join_guild(
             )
         })?;
 
+    let joining_user_id = UserId(req.user_id);
     state
         .api
         .storage
         .add_membership(
             guild_id,
-            UserId(req.user_id),
+            joining_user_id,
             shared::domain::Role::Member,
             false,
             false,
@@ -500,6 +515,12 @@ async fn http_join_guild(
                 Json(ApiError::new(ErrorCode::Internal, e.to_string())),
             )
         })?;
+
+    if let Ok(members) = list_members(&state.api, joining_user_id, guild_id).await {
+        let _ = state
+            .events
+            .send(ServerEvent::GuildMembersUpdated { guild_id, members });
+    }
 
     Ok(StatusCode::NO_CONTENT)
 }
