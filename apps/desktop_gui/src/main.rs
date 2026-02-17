@@ -2358,7 +2358,7 @@ fn spawn_backend_thread(cmd_rx: Receiver<BackendCommand>, ui_tx: Sender<UiEvent>
             #[cfg(target_os = "windows")]
             let mut attempted_dir_strategy = vec!["HOME/.proto_rtc".to_string()];
             #[cfg(not(target_os = "windows"))]
-            let attempted_dir_strategy = vec!["HOME/.proto_rtc".to_string()];
+            let attempted_dir_strategy = ["HOME/.proto_rtc".to_string()];
             let mls_state_dir = if let Ok(home) = std::env::var("HOME") {
                 PathBuf::from(home).join(".proto_rtc")
             } else {
