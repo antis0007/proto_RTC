@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
@@ -6,7 +6,7 @@ use openmls_rust_crypto::{MemoryStorage, RustCrypto};
 use openmls_traits::OpenMlsProvider;
 use serde::{Deserialize, Serialize};
 use shared::domain::{ChannelId, GuildId};
-use std::{collections::HashMap, sync::RwLock};
+
 use tls_codec::{Deserialize as TlsDeserializeTrait, Serialize as TlsSerializeTrait};
 
 const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
@@ -103,37 +103,6 @@ pub struct PersistentOpenMlsProvider {
     storage: MemoryStorage,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct SerializableStorage {
-    entries: Vec<(Vec<u8>, Vec<u8>)>,
-}
-
-impl PersistentOpenMlsProvider {
-    fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        let snapshot: SerializableStorage = serde_json::from_slice(bytes)
-            .context("failed to deserialize OpenMLS storage snapshot")?;
-        let values = snapshot.entries.into_iter().collect::<HashMap<_, _>>();
-        Ok(Self {
-            crypto: RustCrypto::default(),
-            storage: MemoryStorage {
-                values: RwLock::new(values),
-            },
-        })
-    }
-
-    fn to_bytes(&self) -> Result<Vec<u8>> {
-        let entries = self
-            .storage
-            .values
-            .read()
-            .map_err(|_| anyhow!("failed to read OpenMLS storage lock"))?
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        Ok(serde_json::to_vec(&SerializableStorage { entries })?)
-    }
-}
-
 impl OpenMlsProvider for PersistentOpenMlsProvider {
     type CryptoProvider = RustCrypto;
     type RandProvider = RustCrypto;
@@ -181,22 +150,10 @@ impl<S: MlsStore> MlsGroupHandle<S> {
     }
 
     pub async fn load_or_create_group(&mut self) -> Result<()> {
-        if let Some(saved_state) = self
-            .store
-            .load_group_state(self.guild_id, self.channel_id)
-            .await?
-        {
-            self.provider = PersistentOpenMlsProvider::from_bytes(&saved_state)?;
-            let group_id = GroupId::from_slice(&self.channel_id.0.to_le_bytes());
-            self.group = Some(
-                MlsGroup::load(self.provider.storage(), &group_id)
-                    .map_err(|e| anyhow!("failed to load persisted mls group: {e}"))?
-                    .ok_or_else(|| anyhow!("persisted mls storage missing group state"))?,
-            );
-            Ok(())
-        } else {
-            self.create_group(self.channel_id).await
+        if self.group.is_none() {
+            self.create_group(self.channel_id).await?;
         }
+        Ok(())
     }
 
     pub fn key_package_bytes(&self) -> Result<Vec<u8>> {
@@ -306,9 +263,6 @@ impl<S: MlsStore> MlsGroupHandle<S> {
     }
 
     async fn persist_group(&self) -> Result<()> {
-        self.store
-            .save_group_state(self.guild_id, self.channel_id, &self.provider.to_bytes()?)
-            .await?;
         if let Some(group) = &self.group {
             let group_state_blob = serde_json::to_vec(&MlsSnapshotV1 {
                 group_id: group.group_id().as_slice().to_vec(),

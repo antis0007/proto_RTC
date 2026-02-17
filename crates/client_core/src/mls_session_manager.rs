@@ -75,7 +75,8 @@ impl MlsSessionManager for DurableMlsSessionManager {
         }
 
         let identity = self.load_or_create_identity().await?;
-        let mut handle = MlsGroupHandle::new(self.store.clone(), guild_id, channel_id, identity);
+        let mut handle =
+            MlsGroupHandle::new(self.store.clone(), guild_id, channel_id, identity).await?;
         handle.load_or_create_group().await?;
         self.sessions.lock().await.insert(key, handle);
         Ok(())

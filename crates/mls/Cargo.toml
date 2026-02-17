@@ -16,7 +16,6 @@ openmls_rust_crypto = "0.3"
 openmls_traits = "0.3"
 openmls_basic_credential = "0.3"
 tls_codec = "0.4"
-serde_json.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true

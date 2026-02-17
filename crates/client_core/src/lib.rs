@@ -251,7 +251,6 @@ pub trait CryptoProvider: Send + Sync {
     fn decrypt_message(&self, ciphertext: &[u8]) -> Vec<u8>;
 }
 
-/// TODO: replace with real E2EE provider implementation.
 pub struct PassthroughCrypto;
 
 impl CryptoProvider for PassthroughCrypto {
