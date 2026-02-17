@@ -14,8 +14,8 @@ use serde::{Deserialize, Serialize};
 use shared::{
     domain::{ChannelId, FileId, GuildId, MessageId},
     protocol::{
-        AttachmentPayload, ChannelSummary, ClientRequest, GuildSummary, MemberSummary,
-        MessagePayload, ServerEvent,
+        AttachmentPayload, ChannelSummary, ClientRequest, GuildSummary, KeyPackageResponse,
+        MemberSummary, MessagePayload, ServerEvent, UploadKeyPackageResponse,
     },
 };
 use tokio::sync::{broadcast, Mutex};
@@ -65,18 +65,6 @@ struct JoinGuildRequest {
 #[derive(Debug, Deserialize)]
 struct InviteResponse {
     invite_code: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct KeyPackageUploadResponse {
-    key_package_id: i64,
-}
-
-#[derive(Debug, Deserialize)]
-struct KeyPackageFetchResponse {
-    guild_id: i64,
-    user_id: i64,
-    key_package_b64: String,
 }
 
 pub struct CommunityClient<C: CryptoProvider> {
@@ -325,7 +313,7 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
         let identity = MlsIdentity::new_with_name(format!("user-{user_id}"))?;
         let key_package_bytes = identity.key_package_bytes(&OpenMlsRustCrypto::default())?;
 
-        let response: KeyPackageUploadResponse = self
+        let response: UploadKeyPackageResponse = self
             .http
             .post(format!("{server_url}/mls/key_packages"))
             .query(&[("user_id", user_id), ("guild_id", guild_id.0)])
@@ -341,7 +329,7 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
 
     pub async fn fetch_key_package(&self, user_id: i64, guild_id: GuildId) -> Result<Vec<u8>> {
         let (server_url, _current_user_id) = self.session().await?;
-        let response: KeyPackageFetchResponse = self
+        let response: KeyPackageResponse = self
             .http
             .get(format!("{server_url}/mls/key_packages"))
             .query(&[("user_id", user_id), ("guild_id", guild_id.0)])
