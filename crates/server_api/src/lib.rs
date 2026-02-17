@@ -4,7 +4,7 @@ use livekit_integration::{mint_token, room_name_for_voice_channel, LiveKitConfig
 use shared::{
     domain::{ChannelId, ChannelKind, GuildId, Role, UserId},
     error::{ApiError, ErrorCode},
-    protocol::{ChannelSummary, GuildSummary, MessagePayload, ServerEvent},
+    protocol::{ChannelSummary, GuildSummary, MemberSummary, MessagePayload, ServerEvent},
 };
 use storage::Storage;
 
@@ -60,6 +60,30 @@ pub async fn list_channels(
             guild_id,
             kind,
             name,
+        })
+        .collect())
+}
+
+pub async fn list_members(
+    ctx: &ApiContext,
+    user_id: UserId,
+    guild_id: GuildId,
+) -> Result<Vec<MemberSummary>, ApiError> {
+    ensure_active_membership(ctx, guild_id, user_id).await?;
+    let members = ctx
+        .storage
+        .list_members_for_guild(guild_id)
+        .await
+        .map_err(internal)?;
+
+    Ok(members
+        .into_iter()
+        .map(|member| MemberSummary {
+            guild_id,
+            user_id: member.user_id,
+            username: member.username,
+            role: member.role,
+            muted: member.muted,
         })
         .collect())
 }
@@ -246,5 +270,18 @@ mod tests {
             .await
             .expect_err("should fail");
         assert!(matches!(err.code, ErrorCode::Forbidden));
+    }
+
+    #[tokio::test]
+    async fn list_members_includes_muted_flag() {
+        let (ctx, user, guild, _) = setup().await;
+        let bob = ctx.storage.create_user("bob").await.expect("user");
+        ctx.storage
+            .add_membership(guild, bob, Role::Member, false, true)
+            .await
+            .expect("membership");
+
+        let members = list_members(&ctx, user, guild).await.expect("members");
+        assert!(members.iter().any(|m| m.user_id == bob && m.muted));
     }
 }

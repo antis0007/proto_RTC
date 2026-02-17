@@ -8,8 +8,8 @@ use client_core::{ClientEvent, ClientHandle, PassthroughCrypto, RealtimeClient};
 use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 use eframe::egui;
 use shared::{
-    domain::{ChannelId, ChannelKind, GuildId, MessageId},
-    protocol::{ChannelSummary, GuildSummary, MessagePayload, ServerEvent},
+    domain::{ChannelId, ChannelKind, GuildId, MessageId, Role},
+    protocol::{ChannelSummary, GuildSummary, MemberSummary, MessagePayload, ServerEvent},
 };
 
 enum BackendCommand {
@@ -20,6 +20,9 @@ enum BackendCommand {
     },
     ListGuilds,
     ListChannels {
+        guild_id: GuildId,
+    },
+    ListMembers {
         guild_id: GuildId,
     },
     SelectChannel {
@@ -94,6 +97,7 @@ struct DesktopGuiApp {
     selected_guild: Option<GuildId>,
     selected_channel: Option<ChannelId>,
     messages: HashMap<ChannelId, Vec<MessagePayload>>,
+    members: HashMap<GuildId, Vec<MemberSummary>>,
     message_ids: HashMap<ChannelId, HashSet<MessageId>>,
     status: String,
     settings_open: bool,
@@ -115,6 +119,7 @@ impl DesktopGuiApp {
             selected_guild: None,
             selected_channel: None,
             messages: HashMap::new(),
+            members: HashMap::new(),
             message_ids: HashMap::new(),
             status: "Not logged in".to_string(),
             settings_open: false,
@@ -131,6 +136,7 @@ impl DesktopGuiApp {
                     self.guilds.clear();
                     self.channels.clear();
                     self.messages.clear();
+                    self.members.clear();
                     self.message_ids.clear();
                     self.selected_guild = None;
                     self.selected_channel = None;
@@ -161,6 +167,11 @@ impl DesktopGuiApp {
                                 BackendCommand::ListChannels { guild_id },
                                 &mut self.status,
                             );
+                            queue_command(
+                                &self.cmd_tx,
+                                BackendCommand::ListMembers { guild_id },
+                                &mut self.status,
+                            );
                         }
                     }
                     ServerEvent::ChannelUpdated { channel } => {
@@ -179,6 +190,11 @@ impl DesktopGuiApp {
                                     &mut self.status,
                                 );
                             }
+                        }
+                    }
+                    ServerEvent::GuildMembersUpdated { guild_id, members } => {
+                        if self.selected_guild == Some(guild_id) {
+                            self.members.insert(guild_id, members);
                         }
                     }
                     ServerEvent::MessageReceived { message } => {
@@ -381,9 +397,17 @@ impl eframe::App for DesktopGuiApp {
                         self.selected_guild = Some(guild.guild_id);
                         self.selected_channel = None;
                         self.channels.clear();
+                        self.members.remove(&guild.guild_id);
                         queue_command(
                             &self.cmd_tx,
                             BackendCommand::ListChannels {
+                                guild_id: guild.guild_id,
+                            },
+                            &mut self.status,
+                        );
+                        queue_command(
+                            &self.cmd_tx,
+                            BackendCommand::ListMembers {
                                 guild_id: guild.guild_id,
                             },
                             &mut self.status,
@@ -402,6 +426,11 @@ impl eframe::App for DesktopGuiApp {
                             queue_command(
                                 &self.cmd_tx,
                                 BackendCommand::ListChannels { guild_id },
+                                &mut self.status,
+                            );
+                            queue_command(
+                                &self.cmd_tx,
+                                BackendCommand::ListMembers { guild_id },
                                 &mut self.status,
                             );
                         } else {
@@ -430,10 +459,46 @@ impl eframe::App for DesktopGuiApp {
             });
 
         egui::SidePanel::right("members_panel")
-            .default_width(160.0)
+            .default_width(220.0)
             .show(ctx, |ui| {
-                ui.heading("Members");
-                ui.label("(placeholder)");
+                ui.horizontal(|ui| {
+                    ui.heading("Members");
+                    if ui.button("Refresh").clicked() {
+                        if let Some(guild_id) = self.selected_guild {
+                            queue_command(
+                                &self.cmd_tx,
+                                BackendCommand::ListMembers { guild_id },
+                                &mut self.status,
+                            );
+                        }
+                    }
+                });
+
+                if let Some(guild_id) = self.selected_guild {
+                    if let Some(members) = self.members.get(&guild_id) {
+                        if members.is_empty() {
+                            ui.label("No visible members in this guild yet.");
+                        } else {
+                            for member in members {
+                                let role_label = match member.role {
+                                    Role::Owner => "owner",
+                                    Role::Mod => "mod",
+                                    Role::Member => "member",
+                                };
+                                let mute_label = if member.muted { " · 🔇 muted" } else { "" };
+                                ui.label(format!(
+                                    "{} ({}){}",
+                                    member.username, role_label, mute_label
+                                ));
+                            }
+                        }
+                    } else {
+                        ui.label("Loading members for selected guild…");
+                    }
+                } else {
+                    ui.label("Select a guild to view members.");
+                }
+
                 ui.separator();
                 ui.heading("Voice");
                 ui.label("No participants");
@@ -559,6 +624,11 @@ fn spawn_backend_thread(cmd_rx: Receiver<BackendCommand>, ui_tx: Sender<UiEvent>
                     }
                     BackendCommand::ListChannels { guild_id } => {
                         if let Err(err) = client.list_channels(guild_id).await {
+                            let _ = ui_tx.try_send(UiEvent::Error(err.to_string()));
+                        }
+                    }
+                    BackendCommand::ListMembers { guild_id } => {
+                        if let Err(err) = client.list_members(guild_id).await {
                             let _ = ui_tx.try_send(UiEvent::Error(err.to_string()));
                         }
                     }
