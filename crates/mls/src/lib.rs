@@ -124,10 +124,10 @@ impl<S: MlsStore> MlsGroupHandle<S> {
         if !bytes.is_empty() {
             return Err(anyhow!("key package bytes had trailing data"));
         }
-        let key_package: KeyPackage = key_package_in
-            .try_into()
-            .map_err(|e| anyhow!("invalid key package bytes: {e}"))?;
         let provider = &self.provider;
+        let key_package = key_package_in
+            .validate(provider.crypto(), ProtocolVersion::default(), CIPHERSUITE)
+            .map_err(|e| anyhow!("invalid key package bytes: {e}"))?;
         let signer = &self.identity.signer;
         let group = self
             .group
