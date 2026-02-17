@@ -11,6 +11,9 @@ use base64::{
     Engine as _,
 };
 use futures::StreamExt;
+use livekit_integration::{
+    LiveKitRoomConnector, LiveKitRoomEvent, LiveKitRoomOptions, LiveKitRoomSession, LocalTrack,
+};
 use mls::MlsIdentity;
 use openmls_rust_crypto::OpenMlsRustCrypto;
 use reqwest::Client;
@@ -23,8 +26,12 @@ use shared::{
     },
 };
 use thiserror::Error;
-use tokio::sync::{broadcast, Mutex};
+use tokio::{
+    sync::{broadcast, Mutex, RwLock},
+    task::JoinHandle,
+};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tracing::{error, info, warn};
 use zeroize::Zeroize;
 
 const LIVEKIT_E2EE_EXPORT_LABEL: &str = "livekit-e2ee";
@@ -144,6 +151,89 @@ impl MlsSessionManager for MissingMlsSessionManager {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VoiceParticipantState {
+    pub participant_id: String,
+    pub identity: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VoiceSessionSnapshot {
+    pub guild_id: GuildId,
+    pub channel_id: ChannelId,
+    pub room_name: String,
+    pub e2ee_enabled: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct VoiceConnectOptions {
+    pub guild_id: GuildId,
+    pub channel_id: ChannelId,
+    pub can_publish_mic: bool,
+    pub can_publish_screen: bool,
+}
+
+#[derive(Debug, Error)]
+pub enum VoiceSessionError {
+    #[error("failed to request voice token: {0}")]
+    TokenRequest(String),
+    #[error("unexpected server response for voice token request")]
+    UnexpectedTokenResponse,
+    #[error("voice token response channel mismatch")]
+    TokenChannelMismatch,
+    #[error("failed to derive e2ee key: {0}")]
+    E2eeKey(#[from] LiveKitE2eeKeyError),
+    #[error("failed to connect livekit room: {0}")]
+    Connect(String),
+}
+
+#[async_trait]
+pub trait LiveKitControlPlane: Send + Sync {
+    async fn request_livekit_token(&self, request: ClientRequest) -> Result<ServerEvent>;
+}
+
+pub struct MissingLiveKitControlPlane;
+
+#[async_trait]
+impl LiveKitControlPlane for MissingLiveKitControlPlane {
+    async fn request_livekit_token(&self, _request: ClientRequest) -> Result<ServerEvent> {
+        Err(anyhow!("livekit control plane is unavailable"))
+    }
+}
+
+#[async_trait]
+pub trait LiveKitConnectorProvider: Send + Sync {
+    async fn connect_room(
+        &self,
+        options: LiveKitRoomOptions,
+    ) -> Result<Arc<dyn LiveKitRoomSession>>;
+}
+
+pub struct MissingLiveKitConnector;
+
+#[async_trait]
+impl LiveKitConnectorProvider for MissingLiveKitConnector {
+    async fn connect_room(
+        &self,
+        _options: LiveKitRoomOptions,
+    ) -> Result<Arc<dyn LiveKitRoomSession>> {
+        Err(anyhow!("livekit connector is unavailable"))
+    }
+}
+
+#[async_trait]
+impl<T> LiveKitConnectorProvider for T
+where
+    T: LiveKitRoomConnector,
+{
+    async fn connect_room(
+        &self,
+        options: LiveKitRoomOptions,
+    ) -> Result<Arc<dyn LiveKitRoomSession>> {
+        self.connect(options).await.map_err(Into::into)
+    }
+}
+
 pub trait CryptoProvider: Send + Sync {
     fn encrypt_message(&self, plaintext: &[u8]) -> Vec<u8>;
     fn decrypt_message(&self, ciphertext: &[u8]) -> Vec<u8>;
@@ -257,6 +347,12 @@ pub enum ClientEvent {
         user_id: i64,
         username: String,
     },
+    VoiceSessionStateChanged(Option<VoiceSessionSnapshot>),
+    VoiceParticipantsUpdated {
+        guild_id: GuildId,
+        channel_id: ChannelId,
+        participants: Vec<VoiceParticipantState>,
+    },
     Error(String),
 }
 
@@ -297,6 +393,8 @@ pub trait ClientHandle: Send + Sync {
     async fn create_invite(&self, guild_id: GuildId) -> Result<String>;
     async fn join_with_invite(&self, invite_code: &str) -> Result<()>;
     async fn sender_directory(&self) -> HashMap<i64, String>;
+    async fn connect_voice_session(&self, options: VoiceConnectOptions) -> Result<()>;
+    async fn disconnect_voice_session(&self) -> Result<()>;
     fn subscribe_events(&self) -> broadcast::Receiver<ClientEvent>;
 }
 
@@ -304,8 +402,18 @@ pub struct RealtimeClient<C: CryptoProvider + 'static> {
     http: Client,
     _crypto: C,
     mls_session_manager: Arc<dyn MlsSessionManager>,
+    livekit_control_plane: Arc<dyn LiveKitControlPlane>,
+    livekit_connector: Arc<dyn LiveKitConnectorProvider>,
     inner: Mutex<RealtimeClientState>,
+    voice_connection: Mutex<Option<ActiveVoiceSession>>,
+    voice_participants: RwLock<HashMap<String, VoiceParticipantState>>,
     events: broadcast::Sender<ClientEvent>,
+}
+
+struct ActiveVoiceSession {
+    snapshot: VoiceSessionSnapshot,
+    room: Arc<dyn LiveKitRoomSession>,
+    event_task: JoinHandle<()>,
 }
 
 struct RealtimeClientState {
@@ -340,18 +448,39 @@ struct SendMessageHttpRequest {
 
 impl<C: CryptoProvider + 'static> RealtimeClient<C> {
     pub fn new(crypto: C) -> Arc<Self> {
-        Self::new_with_mls_session_manager(crypto, Arc::new(MissingMlsSessionManager))
+        Self::new_with_dependencies(
+            crypto,
+            Arc::new(MissingMlsSessionManager),
+            Arc::new(MissingLiveKitControlPlane),
+            Arc::new(MissingLiveKitConnector),
+        )
     }
 
     pub fn new_with_mls_session_manager(
         crypto: C,
         mls_session_manager: Arc<dyn MlsSessionManager>,
     ) -> Arc<Self> {
+        Self::new_with_dependencies(
+            crypto,
+            mls_session_manager,
+            Arc::new(MissingLiveKitControlPlane),
+            Arc::new(MissingLiveKitConnector),
+        )
+    }
+
+    pub fn new_with_dependencies(
+        crypto: C,
+        mls_session_manager: Arc<dyn MlsSessionManager>,
+        livekit_control_plane: Arc<dyn LiveKitControlPlane>,
+        livekit_connector: Arc<dyn LiveKitConnectorProvider>,
+    ) -> Arc<Self> {
         let (events, _) = broadcast::channel(1024);
         Arc::new(Self {
             http: Client::new(),
             _crypto: crypto,
             mls_session_manager,
+            livekit_control_plane,
+            livekit_connector,
             inner: Mutex::new(RealtimeClientState {
                 server_url: None,
                 user_id: None,
@@ -363,6 +492,8 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
                 attempted_channel_member_additions: HashSet::new(),
                 voice_session_keys: HashMap::new(),
             }),
+            voice_connection: Mutex::new(None),
+            voice_participants: RwLock::new(HashMap::new()),
             events,
         })
     }
@@ -447,6 +578,172 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
         {
             cached.key.zeroize();
         }
+    }
+
+    async fn spawn_voice_event_task(
+        self: &Arc<Self>,
+        guild_id: GuildId,
+        channel_id: ChannelId,
+        room: Arc<dyn LiveKitRoomSession>,
+    ) -> JoinHandle<()> {
+        let mut events = room.subscribe_events();
+        let client = Arc::clone(self);
+        tokio::spawn(async move {
+            while let Ok(event) = events.recv().await {
+                let snapshot = {
+                    let mut participants = client.voice_participants.write().await;
+                    match event {
+                        LiveKitRoomEvent::ParticipantJoined(participant) => {
+                            participants.insert(
+                                participant.participant_id.clone(),
+                                VoiceParticipantState {
+                                    participant_id: participant.participant_id,
+                                    identity: participant.identity,
+                                },
+                            );
+                        }
+                        LiveKitRoomEvent::ParticipantLeft { participant_id } => {
+                            participants.remove(&participant_id);
+                        }
+                    }
+                    participants.values().cloned().collect::<Vec<_>>()
+                };
+
+                let _ = client.events.send(ClientEvent::VoiceParticipantsUpdated {
+                    guild_id,
+                    channel_id,
+                    participants: snapshot,
+                });
+            }
+        })
+    }
+
+    pub async fn connect_voice_session(
+        self: &Arc<Self>,
+        options: VoiceConnectOptions,
+    ) -> Result<()> {
+        let request = ClientRequest::RequestLiveKitToken {
+            guild_id: options.guild_id,
+            channel_id: options.channel_id,
+            can_publish_mic: options.can_publish_mic,
+            can_publish_screen: options.can_publish_screen,
+        };
+
+        let event = self
+            .livekit_control_plane
+            .request_livekit_token(request)
+            .await
+            .map_err(|err| VoiceSessionError::TokenRequest(err.to_string()))?;
+
+        let (guild_id, channel_id, room_name, token) = match event {
+            ServerEvent::LiveKitTokenIssued {
+                guild_id,
+                channel_id,
+                room_name,
+                token,
+            } => (guild_id, channel_id, room_name, token),
+            _ => return Err(VoiceSessionError::UnexpectedTokenResponse.into()),
+        };
+
+        if guild_id != options.guild_id || channel_id != options.channel_id {
+            return Err(VoiceSessionError::TokenChannelMismatch.into());
+        }
+
+        let e2ee_key = self
+            .derive_livekit_e2ee_key(guild_id, channel_id)
+            .await
+            .map_err(VoiceSessionError::E2eeKey)?;
+
+        let room = self
+            .livekit_connector
+            .connect_room(LiveKitRoomOptions {
+                room_name: room_name.clone(),
+                token,
+                e2ee_key: e2ee_key.to_vec(),
+                e2ee_enabled: true,
+            })
+            .await
+            .map_err(|err| VoiceSessionError::Connect(err.to_string()))?;
+
+        if options.can_publish_mic {
+            room.publish_local_track(LocalTrack::Microphone).await?;
+        }
+
+        if options.can_publish_screen {
+            if room.supports_screen_share() {
+                room.publish_local_track(LocalTrack::ScreenShare).await?;
+            } else {
+                warn!("voice: screen share not supported by room backend room={room_name}");
+            }
+        }
+
+        if !room.is_e2ee_enabled() {
+            error!(
+                "voice: e2ee enabled=false downgraded=true room={} guild={} channel={}",
+                room_name, guild_id.0, channel_id.0
+            );
+        } else {
+            info!(
+                "voice: e2ee enabled=true room={} guild={} channel={}",
+                room_name, guild_id.0, channel_id.0
+            );
+        }
+
+        let snapshot = VoiceSessionSnapshot {
+            guild_id,
+            channel_id,
+            room_name,
+            e2ee_enabled: room.is_e2ee_enabled(),
+        };
+
+        let task = self
+            .spawn_voice_event_task(guild_id, channel_id, Arc::clone(&room))
+            .await;
+
+        {
+            let mut participants = self.voice_participants.write().await;
+            participants.clear();
+        }
+
+        let previous = {
+            let mut voice = self.voice_connection.lock().await;
+            voice.replace(ActiveVoiceSession {
+                snapshot: snapshot.clone(),
+                room,
+                event_task: task,
+            })
+        };
+        if let Some(active) = previous {
+            active.event_task.abort();
+        }
+
+        let _ = self
+            .events
+            .send(ClientEvent::VoiceSessionStateChanged(Some(snapshot)));
+
+        Ok(())
+    }
+
+    pub async fn disconnect_voice_session(&self) -> Result<()> {
+        let active = {
+            let mut guard = self.voice_connection.lock().await;
+            guard.take()
+        };
+
+        if let Some(active) = active {
+            let _ = active.room.unpublish_local_tracks().await;
+            let _ = active.room.leave().await;
+            active.event_task.abort();
+            self.clear_voice_session_key(active.snapshot.guild_id, active.snapshot.channel_id)
+                .await;
+        }
+
+        self.voice_participants.write().await.clear();
+        let _ = self
+            .events
+            .send(ClientEvent::VoiceSessionStateChanged(None));
+
+        Ok(())
     }
 
     async fn record_sender_username(&self, message: &MessagePayload) {
@@ -1078,6 +1375,14 @@ impl<C: CryptoProvider + 'static> ClientHandle for Arc<RealtimeClient<C>> {
     async fn sender_directory(&self) -> HashMap<i64, String> {
         let guard = self.inner.lock().await;
         guard.sender_directory.clone()
+    }
+
+    async fn connect_voice_session(&self, options: VoiceConnectOptions) -> Result<()> {
+        RealtimeClient::connect_voice_session(self, options).await
+    }
+
+    async fn disconnect_voice_session(&self) -> Result<()> {
+        RealtimeClient::disconnect_voice_session(self).await
     }
 
     fn subscribe_events(&self) -> broadcast::Receiver<ClientEvent> {
@@ -1742,5 +2047,196 @@ mod tests {
             .await
             .expect("second fetch request");
         assert_eq!(second_welcome_fetch.status(), StatusCode::NOT_FOUND);
+    }
+
+    struct MockLiveKitControlPlane {
+        event: ServerEvent,
+    }
+
+    #[async_trait]
+    impl LiveKitControlPlane for MockLiveKitControlPlane {
+        async fn request_livekit_token(&self, request: ClientRequest) -> Result<ServerEvent> {
+            match request {
+                ClientRequest::RequestLiveKitToken { .. } => Ok(self.event.clone()),
+                _ => Err(anyhow!("unexpected request")),
+            }
+        }
+    }
+
+    struct MockRoom {
+        supports_screen: bool,
+        e2ee_enabled: bool,
+        events_tx: broadcast::Sender<LiveKitRoomEvent>,
+        published: Arc<Mutex<Vec<LocalTrack>>>,
+        unpublish_calls: Arc<Mutex<u32>>,
+        leave_calls: Arc<Mutex<u32>>,
+    }
+
+    #[async_trait]
+    impl LiveKitRoomSession for MockRoom {
+        async fn publish_local_track(&self, track: LocalTrack) -> Result<()> {
+            self.published.lock().await.push(track);
+            Ok(())
+        }
+
+        async fn unpublish_local_tracks(&self) -> Result<()> {
+            *self.unpublish_calls.lock().await += 1;
+            Ok(())
+        }
+
+        async fn leave(&self) -> Result<()> {
+            *self.leave_calls.lock().await += 1;
+            Ok(())
+        }
+
+        fn supports_screen_share(&self) -> bool {
+            self.supports_screen
+        }
+
+        fn is_e2ee_enabled(&self) -> bool {
+            self.e2ee_enabled
+        }
+
+        fn subscribe_events(&self) -> broadcast::Receiver<LiveKitRoomEvent> {
+            self.events_tx.subscribe()
+        }
+    }
+
+    struct MockLiveKitConnector {
+        room: Arc<MockRoom>,
+        options_seen: Arc<Mutex<Vec<LiveKitRoomOptions>>>,
+    }
+
+    #[async_trait]
+    impl LiveKitConnectorProvider for MockLiveKitConnector {
+        async fn connect_room(
+            &self,
+            options: LiveKitRoomOptions,
+        ) -> Result<Arc<dyn LiveKitRoomSession>> {
+            self.options_seen.lock().await.push(options);
+            Ok(self.room.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_and_disconnect_voice_session_flow() {
+        let room = Arc::new(MockRoom {
+            supports_screen: true,
+            e2ee_enabled: true,
+            events_tx: broadcast::channel(32).0,
+            published: Arc::new(Mutex::new(Vec::new())),
+            unpublish_calls: Arc::new(Mutex::new(0)),
+            leave_calls: Arc::new(Mutex::new(0)),
+        });
+        let options_seen = Arc::new(Mutex::new(Vec::new()));
+        let client = RealtimeClient::new_with_dependencies(
+            PassthroughCrypto,
+            Arc::new(TestMlsSessionManager::with_exported_secret(
+                b"voice-secret-material".to_vec(),
+            )),
+            Arc::new(MockLiveKitControlPlane {
+                event: ServerEvent::LiveKitTokenIssued {
+                    guild_id: GuildId(11),
+                    channel_id: ChannelId(13),
+                    room_name: "g:11:c:13".to_string(),
+                    token: "token-abc".to_string(),
+                },
+            }),
+            Arc::new(MockLiveKitConnector {
+                room: room.clone(),
+                options_seen: options_seen.clone(),
+            }),
+        );
+
+        client
+            .connect_voice_session(VoiceConnectOptions {
+                guild_id: GuildId(11),
+                channel_id: ChannelId(13),
+                can_publish_mic: true,
+                can_publish_screen: true,
+            })
+            .await
+            .expect("connect");
+
+        assert_eq!(room.published.lock().await.len(), 2);
+        let seen = options_seen.lock().await;
+        assert_eq!(seen.len(), 1);
+        assert!(seen[0].e2ee_enabled);
+        assert_eq!(seen[0].room_name, "g:11:c:13");
+
+        client.disconnect_voice_session().await.expect("disconnect");
+        assert_eq!(*room.unpublish_calls.lock().await, 1);
+        assert_eq!(*room.leave_calls.lock().await, 1);
+    }
+
+    #[tokio::test]
+    async fn voice_participant_events_are_emitted() {
+        let room = Arc::new(MockRoom {
+            supports_screen: false,
+            e2ee_enabled: true,
+            events_tx: broadcast::channel(32).0,
+            published: Arc::new(Mutex::new(Vec::new())),
+            unpublish_calls: Arc::new(Mutex::new(0)),
+            leave_calls: Arc::new(Mutex::new(0)),
+        });
+
+        let client = RealtimeClient::new_with_dependencies(
+            PassthroughCrypto,
+            Arc::new(TestMlsSessionManager::with_exported_secret(
+                b"voice-secret-material".to_vec(),
+            )),
+            Arc::new(MockLiveKitControlPlane {
+                event: ServerEvent::LiveKitTokenIssued {
+                    guild_id: GuildId(1),
+                    channel_id: ChannelId(2),
+                    room_name: "g:1:c:2".to_string(),
+                    token: "token".to_string(),
+                },
+            }),
+            Arc::new(MockLiveKitConnector {
+                room: room.clone(),
+                options_seen: Arc::new(Mutex::new(Vec::new())),
+            }),
+        );
+
+        let mut rx = client.subscribe_events();
+        client
+            .connect_voice_session(VoiceConnectOptions {
+                guild_id: GuildId(1),
+                channel_id: ChannelId(2),
+                can_publish_mic: false,
+                can_publish_screen: false,
+            })
+            .await
+            .expect("connect");
+
+        let _ = room.events_tx.send(LiveKitRoomEvent::ParticipantJoined(
+            livekit_integration::RemoteParticipant {
+                participant_id: "p1".to_string(),
+                identity: "alice".to_string(),
+            },
+        ));
+        let _ = room.events_tx.send(LiveKitRoomEvent::ParticipantLeft {
+            participant_id: "p1".to_string(),
+        });
+
+        let mut got_join = false;
+        let mut got_leave = false;
+        for _ in 0..6 {
+            if let Ok(ClientEvent::VoiceParticipantsUpdated { participants, .. }) = rx.recv().await
+            {
+                if participants.iter().any(|p| p.participant_id == "p1") {
+                    got_join = true;
+                }
+                if participants.is_empty() {
+                    got_leave = true;
+                }
+                if got_join && got_leave {
+                    break;
+                }
+            }
+        }
+
+        assert!(got_join && got_leave);
     }
 }
