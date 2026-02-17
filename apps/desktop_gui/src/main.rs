@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
+    fs,
     path::PathBuf,
     thread,
 };
@@ -248,7 +249,7 @@ struct DesktopGuiApp {
     auth_action: AuthAction,
     auth_session_established: bool,
     composer: String,
-    pending_attachment: Option<PathBuf>,
+    pending_attachment: Option<PendingAttachment>,
     guilds: Vec<GuildSummary>,
     channels: Vec<ChannelSummary>,
     selected_guild: Option<GuildId>,
@@ -264,6 +265,64 @@ struct DesktopGuiApp {
     applied_theme: Option<ThemeSettings>,
     readability: UiReadabilitySettings,
     applied_readability: Option<UiReadabilitySettings>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttachmentCategory {
+    Image,
+    NonImage,
+}
+
+impl AttachmentCategory {
+    fn label(self) -> &'static str {
+        match self {
+            AttachmentCategory::Image => "image",
+            AttachmentCategory::NonImage => "file",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PendingAttachment {
+    path: PathBuf,
+    filename: String,
+    category: AttachmentCategory,
+    size_bytes: u64,
+}
+
+impl PendingAttachment {
+    fn from_path(path: PathBuf) -> Self {
+        let filename = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("attachment.bin")
+            .to_string();
+        let category = mime_guess::from_path(&path)
+            .first_raw()
+            .map(|mime| mime.starts_with("image/"))
+            .unwrap_or(false)
+            .then_some(AttachmentCategory::Image)
+            .unwrap_or(AttachmentCategory::NonImage);
+        let size_bytes = fs::metadata(&path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+
+        Self {
+            path,
+            filename,
+            category,
+            size_bytes,
+        }
+    }
+
+    fn summary(&self) -> String {
+        format!(
+            "{} · {} · {}",
+            self.filename,
+            format_byte_size(self.size_bytes),
+            self.category.label()
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -437,6 +496,96 @@ impl DesktopGuiApp {
         ctx.set_style(style);
         self.applied_theme = Some(self.theme);
         self.applied_readability = Some(self.readability);
+    }
+
+    fn select_pending_attachment(&mut self) {
+        if let Some(path) = rfd::FileDialog::new().pick_file() {
+            self.pending_attachment = Some(PendingAttachment::from_path(path));
+        }
+    }
+
+    fn show_attachment_menu(&mut self, ui: &mut egui::Ui) {
+        ui.menu_button("📎", |ui| {
+            if ui.button("Attach file").clicked() {
+                self.select_pending_attachment();
+                ui.close_menu();
+            }
+
+            if self.pending_attachment.is_some() {
+                if ui.button("Replace attachment").clicked() {
+                    self.select_pending_attachment();
+                    ui.close_menu();
+                }
+
+                if ui.button("Remove current attachment").clicked() {
+                    self.pending_attachment = None;
+                    ui.close_menu();
+                }
+
+                ui.separator();
+                if let Some(attachment) = &self.pending_attachment {
+                    ui.label(egui::RichText::new("Attachment details").strong());
+                    ui.small(attachment.summary());
+                }
+            } else {
+                ui.separator();
+                ui.small("No attachment selected.");
+            }
+        })
+        .response
+        .on_hover_text("Attachments");
+    }
+
+    fn send_composer_message(&mut self, response: &egui::Response) {
+        let text = self.composer.trim_end_matches('\n').to_string();
+        self.composer.clear();
+        let attachment_path = self.pending_attachment.take().map(|pending| pending.path);
+        queue_command(
+            &self.cmd_tx,
+            BackendCommand::SendMessage {
+                text,
+                attachment_path,
+            },
+            &mut self.status,
+        );
+        response.request_focus();
+    }
+
+    fn show_attachment_summary(&self, ui: &mut egui::Ui) {
+        if let Some(attachment) = &self.pending_attachment {
+            egui::Frame::none()
+                .fill(ui.visuals().faint_bg_color.gamma_multiply(0.35))
+                .rounding(egui::Rounding::same(f32::from(self.theme.panel_rounding)))
+                .inner_margin(egui::Margin::symmetric(8.0, 4.0))
+                .show(ui, |ui| {
+                    ui.small(format!("📎 {}", attachment.summary()));
+                });
+        }
+    }
+
+    fn show_composer_row(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            self.show_attachment_menu(ui);
+
+            let response = ui.add_sized(
+                [ui.available_width() - 130.0, 72.0],
+                egui::TextEdit::multiline(&mut self.composer)
+                    .hint_text("Message #channel (Enter to send, Shift+Enter for newline)"),
+            );
+            let send_shortcut = response.has_focus()
+                && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
+            let clicked_send = ui
+                .add_sized([80.0, 72.0], egui::Button::new("⬆ Send"))
+                .clicked();
+            let has_text = !self.composer.trim().is_empty();
+            let has_attachment = self.pending_attachment.is_some();
+
+            if (send_shortcut || clicked_send) && (has_text || has_attachment) {
+                self.send_composer_message(&response);
+            }
+        });
+
+        self.show_attachment_summary(ui);
     }
 
     fn show_settings_window(&mut self, ctx: &egui::Context) {
@@ -934,41 +1083,7 @@ impl DesktopGuiApp {
                 ui.add_space(6.0);
                 let can_send = self.selected_channel.is_some();
                 ui.add_enabled_ui(can_send && self.auth_session_established, |ui| {
-                    ui.horizontal(|ui| {
-                        if ui.button("📎").on_hover_text("Attach file").clicked() {
-                            self.pending_attachment = rfd::FileDialog::new().pick_file();
-                        }
-                        let response = ui.add_sized(
-                            [ui.available_width() - 130.0, 72.0],
-                            egui::TextEdit::multiline(&mut self.composer).hint_text(
-                                "Message #channel (Enter to send, Shift+Enter for newline)",
-                            ),
-                        );
-                        let send_shortcut = response.has_focus()
-                            && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
-                        let clicked_send = ui
-                            .add_sized([80.0, 72.0], egui::Button::new("⬆ Send"))
-                            .clicked();
-                        let has_text = !self.composer.trim().is_empty();
-                        let has_attachment = self.pending_attachment.is_some();
-                        if (send_shortcut || clicked_send) && (has_text || has_attachment) {
-                            let text = self.composer.trim_end_matches('\n').to_string();
-                            self.composer.clear();
-                            let attachment_path = self.pending_attachment.take();
-                            queue_command(
-                                &self.cmd_tx,
-                                BackendCommand::SendMessage {
-                                    text,
-                                    attachment_path,
-                                },
-                                &mut self.status,
-                            );
-                            response.request_focus();
-                        }
-                    });
-                    if let Some(path) = &self.pending_attachment {
-                        ui.small(format!("Attached: {}", path.display()));
-                    }
+                    self.show_composer_row(ui);
                 });
                 if !can_send {
                     ui.centered_and_justified(|ui| {
@@ -1149,6 +1264,22 @@ fn scaled_text_styles(text_scale: f32) -> BTreeMap<egui::TextStyle, egui::FontId
         font.size *= text_scale;
     }
     styles
+}
+
+fn format_byte_size(size_bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut size = size_bytes as f64;
+    let mut unit = 0;
+    while size >= 1024.0 && unit < UNITS.len() - 1 {
+        size /= 1024.0;
+        unit += 1;
+    }
+
+    if unit == 0 {
+        format!("{} {}", size_bytes, UNITS[unit])
+    } else {
+        format!("{size:.1} {}", UNITS[unit])
+    }
 }
 
 const SETTINGS_STORAGE_KEY: &str = "desktop_gui.settings";
