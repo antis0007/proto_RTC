@@ -250,7 +250,9 @@ impl<S: MlsStore> MlsGroupHandle<S> {
                 self.persist_group().await?;
                 Ok(Vec::new())
             }
-            _ => Err(anyhow!("message was not an application message")),
+            // Proposal and external/public messages can legitimately appear on the same MLS wire.
+            // They do not produce chat plaintext and should be treated as a no-op in the app path.
+            _ => Ok(Vec::new()),
         }
     }
 

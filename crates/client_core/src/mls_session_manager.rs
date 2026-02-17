@@ -56,7 +56,12 @@ impl DurableMlsSessionManager {
             .await
             .get(&channel_id)
             .copied()
-            .ok_or_else(|| anyhow!("MLS group not opened for channel {}", channel_id.0))?;
+            .ok_or_else(|| {
+                anyhow!(
+                    "MLS group not opened for channel {}; channel state is uninitialized for this session",
+                    channel_id.0
+                )
+            })?;
         Ok((guild_id, channel_id))
     }
 
@@ -68,7 +73,19 @@ impl DurableMlsSessionManager {
 #[async_trait]
 impl MlsSessionManager for DurableMlsSessionManager {
     async fn open_or_create_group(&self, guild_id: GuildId, channel_id: ChannelId) -> Result<()> {
-        self.channel_index.lock().await.insert(channel_id, guild_id);
+        {
+            let mut index = self.channel_index.lock().await;
+            if let Some(existing_guild) = index.get(&channel_id) {
+                if *existing_guild != guild_id {
+                    return Err(anyhow!(
+                        "channel {} is already bound to guild {} in this MLS session",
+                        channel_id.0,
+                        existing_guild.0
+                    ));
+                }
+            }
+            index.insert(channel_id, guild_id);
+        }
         let key = (guild_id, channel_id);
         if self.sessions.lock().await.contains_key(&key) {
             return Ok(());
