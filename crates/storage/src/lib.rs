@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use mls::MlsStore;
+use mls::{MlsStore, PersistedGroupSnapshot};
 use sqlx::{
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
     Pool, Sqlite,
@@ -528,15 +528,31 @@ impl MlsStore for Storage {
         &self,
         guild_id: GuildId,
         channel_id: ChannelId,
-        group_state_bytes: &[u8],
+        snapshot: PersistedGroupSnapshot,
     ) -> Result<()> {
         sqlx::query(
-            "INSERT INTO mls_group_states (guild_id, channel_id, group_state_bytes, updated_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-             ON CONFLICT(guild_id, channel_id) DO UPDATE SET group_state_bytes = excluded.group_state_bytes, updated_at = CURRENT_TIMESTAMP",
+            "INSERT INTO mls_group_states (
+                guild_id,
+                channel_id,
+                schema_version,
+                group_state_blob,
+                key_material_blob,
+                group_state_bytes,
+                updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+             ON CONFLICT(guild_id, channel_id) DO UPDATE SET
+                schema_version = excluded.schema_version,
+                group_state_blob = excluded.group_state_blob,
+                key_material_blob = excluded.key_material_blob,
+                group_state_bytes = excluded.group_state_bytes,
+                updated_at = CURRENT_TIMESTAMP",
         )
         .bind(guild_id.0)
         .bind(channel_id.0)
-        .bind(group_state_bytes)
+        .bind(snapshot.schema_version)
+        .bind(snapshot.group_state_blob)
+        .bind(snapshot.key_material_blob)
+        .bind(Vec::<u8>::new())
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -546,15 +562,35 @@ impl MlsStore for Storage {
         &self,
         guild_id: GuildId,
         channel_id: ChannelId,
-    ) -> Result<Option<Vec<u8>>> {
+    ) -> Result<Option<PersistedGroupSnapshot>> {
         let row = sqlx::query(
-            "SELECT group_state_bytes FROM mls_group_states WHERE guild_id = ? AND channel_id = ?",
+            "SELECT schema_version, group_state_blob, key_material_blob, group_state_bytes
+             FROM mls_group_states
+             WHERE guild_id = ? AND channel_id = ?",
         )
         .bind(guild_id.0)
         .bind(channel_id.0)
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.map(|r| r.get::<Vec<u8>, _>(0)))
+        Ok(row.map(|r| {
+            let schema_version = r.get::<i64, _>(0) as i32;
+            let group_state_blob = r.get::<Option<Vec<u8>>, _>(1);
+            let key_material_blob = r.get::<Option<Vec<u8>>, _>(2);
+            let legacy_group_state = r.get::<Vec<u8>, _>(3);
+
+            match (group_state_blob, key_material_blob) {
+                (Some(group_state_blob), Some(key_material_blob)) => PersistedGroupSnapshot {
+                    schema_version,
+                    group_state_blob,
+                    key_material_blob,
+                },
+                _ => PersistedGroupSnapshot {
+                    schema_version: 0,
+                    group_state_blob: legacy_group_state,
+                    key_material_blob: Vec::new(),
+                },
+            }
+        }))
     }
 }
 

@@ -10,6 +10,30 @@ use std::{collections::HashMap, sync::RwLock};
 use tls_codec::{Deserialize as TlsDeserializeTrait, Serialize as TlsSerializeTrait};
 
 const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
+const MLS_SNAPSHOT_SCHEMA_VERSION: i32 = 1;
+
+#[derive(Debug, Clone)]
+pub struct PersistedGroupSnapshot {
+    pub schema_version: i32,
+    pub group_state_blob: Vec<u8>,
+    pub key_material_blob: Vec<u8>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct MlsSnapshotV1 {
+    group_id: Vec<u8>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SerializedProviderState {
+    values: Vec<SerializedProviderValue>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SerializedProviderValue {
+    key: Vec<u8>,
+    value: Vec<u8>,
+}
 
 #[derive(Debug)]
 pub struct MlsIdentity {
@@ -64,13 +88,13 @@ pub trait MlsStore: Send + Sync {
         &self,
         guild_id: GuildId,
         channel_id: ChannelId,
-        group_state_bytes: &[u8],
+        snapshot: PersistedGroupSnapshot,
     ) -> Result<()>;
     async fn load_group_state(
         &self,
         guild_id: GuildId,
         channel_id: ChannelId,
-    ) -> Result<Option<Vec<u8>>>;
+    ) -> Result<Option<PersistedGroupSnapshot>>;
 }
 
 #[derive(Default, Debug)]
@@ -138,15 +162,22 @@ pub struct MlsGroupHandle<S: MlsStore> {
 }
 
 impl<S: MlsStore> MlsGroupHandle<S> {
-    pub fn new(store: S, guild_id: GuildId, channel_id: ChannelId, identity: MlsIdentity) -> Self {
-        Self {
+    pub async fn new(
+        store: S,
+        guild_id: GuildId,
+        channel_id: ChannelId,
+        identity: MlsIdentity,
+    ) -> Result<Self> {
+        let mut handle = Self {
             store,
             guild_id,
             channel_id,
             provider: PersistentOpenMlsProvider::default(),
             identity,
             group: None,
-        }
+        };
+        handle.load_group_if_exists().await?;
+        Ok(handle)
     }
 
     pub async fn load_or_create_group(&mut self) -> Result<()> {
@@ -278,6 +309,320 @@ impl<S: MlsStore> MlsGroupHandle<S> {
         self.store
             .save_group_state(self.guild_id, self.channel_id, &self.provider.to_bytes()?)
             .await?;
+        if let Some(group) = &self.group {
+            let group_state_blob = serde_json::to_vec(&MlsSnapshotV1 {
+                group_id: group.group_id().as_slice().to_vec(),
+            })?;
+            let key_material_blob = {
+                let values = self
+                    .provider
+                    .storage()
+                    .values
+                    .read()
+                    .unwrap()
+                    .iter()
+                    .map(|(key, value)| SerializedProviderValue {
+                        key: key.clone(),
+                        value: value.clone(),
+                    })
+                    .collect();
+                serde_json::to_vec(&SerializedProviderState { values })?
+            };
+
+            self.store
+                .save_group_state(
+                    self.guild_id,
+                    self.channel_id,
+                    PersistedGroupSnapshot {
+                        schema_version: MLS_SNAPSHOT_SCHEMA_VERSION,
+                        group_state_blob,
+                        key_material_blob,
+                    },
+                )
+                .await?;
+        }
         Ok(())
+    }
+
+    async fn load_group_if_exists(&mut self) -> Result<()> {
+        let Some(snapshot) = self
+            .store
+            .load_group_state(self.guild_id, self.channel_id)
+            .await?
+        else {
+            return Ok(());
+        };
+
+        if snapshot.schema_version != MLS_SNAPSHOT_SCHEMA_VERSION {
+            return Err(anyhow!(
+                "unsupported MLS snapshot schema version: {}",
+                snapshot.schema_version
+            ));
+        }
+
+        let parsed_state: MlsSnapshotV1 = serde_json::from_slice(&snapshot.group_state_blob)?;
+        let parsed_provider_state: SerializedProviderState =
+            serde_json::from_slice(&snapshot.key_material_blob)?;
+
+        {
+            let mut values = self.provider.storage().values.write().unwrap();
+            values.clear();
+            values.extend(
+                parsed_provider_state
+                    .values
+                    .into_iter()
+                    .map(|entry| (entry.key, entry.value)),
+            );
+        }
+
+        let group_id = GroupId::from_slice(&parsed_state.group_id);
+        self.group = MlsGroup::load(self.provider.storage(), &group_id)?;
+
+        if self.group.is_none() {
+            return Err(anyhow!(
+                "persisted MLS snapshot did not contain a loadable group"
+            ));
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{collections::HashMap, sync::Arc};
+    use tokio::sync::Mutex;
+
+    type IdentityKey = (i64, String);
+    type GroupKey = (i64, i64);
+    type BlobMap<K, V> = Arc<Mutex<HashMap<K, V>>>;
+
+    #[derive(Default, Clone)]
+    struct MemoryStore {
+        identities: BlobMap<IdentityKey, Vec<u8>>,
+        groups: BlobMap<GroupKey, PersistedGroupSnapshot>,
+    }
+
+    #[async_trait]
+    impl MlsStore for MemoryStore {
+        async fn save_identity_keys(
+            &self,
+            user_id: i64,
+            device_id: &str,
+            identity_bytes: &[u8],
+        ) -> Result<()> {
+            self.identities
+                .lock()
+                .await
+                .insert((user_id, device_id.to_string()), identity_bytes.to_vec());
+            Ok(())
+        }
+
+        async fn load_identity_keys(
+            &self,
+            user_id: i64,
+            device_id: &str,
+        ) -> Result<Option<Vec<u8>>> {
+            Ok(self
+                .identities
+                .lock()
+                .await
+                .get(&(user_id, device_id.to_string()))
+                .cloned())
+        }
+
+        async fn save_group_state(
+            &self,
+            guild_id: GuildId,
+            channel_id: ChannelId,
+            snapshot: PersistedGroupSnapshot,
+        ) -> Result<()> {
+            self.groups
+                .lock()
+                .await
+                .insert((guild_id.0, channel_id.0), snapshot);
+            Ok(())
+        }
+
+        async fn load_group_state(
+            &self,
+            guild_id: GuildId,
+            channel_id: ChannelId,
+        ) -> Result<Option<PersistedGroupSnapshot>> {
+            Ok(self
+                .groups
+                .lock()
+                .await
+                .get(&(guild_id.0, channel_id.0))
+                .cloned())
+        }
+    }
+
+    #[tokio::test]
+    async fn merge_commit_before_decrypting_next_application() {
+        let guild_id = GuildId(1);
+        let channel_id = ChannelId(20);
+
+        let alice_identity = MlsIdentity::new_with_name(b"alice".to_vec()).expect("alice identity");
+        let bob_identity = MlsIdentity::new_with_name(b"bob".to_vec()).expect("bob identity");
+        let charlie_identity =
+            MlsIdentity::new_with_name(b"charlie".to_vec()).expect("charlie identity");
+
+        let mut alice =
+            MlsGroupHandle::new(MemoryStore::default(), guild_id, channel_id, alice_identity)
+                .await
+                .expect("alice handle");
+        let bob = MlsGroupHandle::new(MemoryStore::default(), guild_id, channel_id, bob_identity)
+            .await
+            .expect("bob handle");
+        let charlie = MlsGroupHandle::new(
+            MemoryStore::default(),
+            guild_id,
+            channel_id,
+            charlie_identity,
+        )
+        .await
+        .expect("charlie handle");
+
+        let bob_kp = bob.key_package_bytes().expect("bob key package bytes");
+        let charlie_kp = charlie
+            .key_package_bytes()
+            .expect("charlie key package bytes");
+        alice.create_group(channel_id).await.expect("create group");
+
+        let (commit_to_bob, welcome_for_bob) = alice.add_member(&bob_kp).await.expect("add bob");
+
+        let mut bob = bob;
+        bob.join_group_from_welcome(&welcome_for_bob.expect("welcome bob"))
+            .await
+            .expect("bob joins");
+
+        let (commit_for_existing, _welcome_for_charlie) =
+            alice.add_member(&charlie_kp).await.expect("add charlie");
+
+        let _ = bob
+            .decrypt_application(&commit_for_existing)
+            .expect("process inbound commit and merge it");
+
+        let ciphertext = alice
+            .encrypt_application(b"post-commit message")
+            .expect("encrypt app message");
+        let plaintext = bob
+            .decrypt_application(&ciphertext)
+            .expect("decrypt app message after commit merge");
+
+        assert_eq!(plaintext, b"post-commit message");
+        assert!(!commit_to_bob.is_empty());
+    }
+
+    #[tokio::test]
+    async fn two_members_exchange_application_message() {
+        let guild_id = GuildId(1);
+        let channel_id = ChannelId(10);
+
+        let alice_identity = MlsIdentity::new_with_name(b"alice".to_vec()).expect("alice identity");
+        let bob_identity = MlsIdentity::new_with_name(b"bob".to_vec()).expect("bob identity");
+
+        let mut alice =
+            MlsGroupHandle::new(MemoryStore::default(), guild_id, channel_id, alice_identity)
+                .await
+                .expect("alice handle");
+        let bob = MlsGroupHandle::new(MemoryStore::default(), guild_id, channel_id, bob_identity)
+            .await
+            .expect("bob handle");
+        let bob_kp = bob.key_package_bytes().expect("bob key package bytes");
+        alice.create_group(channel_id).await.expect("create group");
+
+        let (_commit, welcome) = alice.add_member(&bob_kp).await.expect("add member");
+        let welcome = welcome.expect("welcome message");
+
+        let mut bob = bob;
+        bob.join_group_from_welcome(&welcome)
+            .await
+            .expect("bob joins group");
+
+        let ciphertext = alice
+            .encrypt_application(b"hello bob")
+            .expect("encrypt app message");
+
+        let plaintext = bob
+            .decrypt_application(&ciphertext)
+            .expect("decrypt app message");
+
+        assert_eq!(plaintext, b"hello bob");
+    }
+
+    #[tokio::test]
+    async fn persisted_group_snapshot_round_trip_supports_future_epochs() {
+        let guild_id = GuildId(1);
+        let channel_id = ChannelId(42);
+        let alice_store = MemoryStore::default();
+        let bob_store = MemoryStore::default();
+
+        let alice_identity = MlsIdentity::new_with_name(b"alice".to_vec()).expect("alice identity");
+        let bob_identity = MlsIdentity::new_with_name(b"bob".to_vec()).expect("bob identity");
+
+        let mut alice =
+            MlsGroupHandle::new(alice_store.clone(), guild_id, channel_id, alice_identity)
+                .await
+                .expect("alice handle");
+        let mut bob = MlsGroupHandle::new(bob_store.clone(), guild_id, channel_id, bob_identity)
+            .await
+            .expect("bob handle");
+
+        let bob_kp = bob.key_package_bytes().expect("bob key package");
+        alice.create_group(channel_id).await.expect("create group");
+        let (_commit, welcome) = alice.add_member(&bob_kp).await.expect("add bob");
+        bob.join_group_from_welcome(&welcome.expect("welcome"))
+            .await
+            .expect("bob joins");
+
+        let pre_restart = alice
+            .encrypt_application(b"before restart")
+            .expect("encrypt pre-restart");
+        let pre_restart_plain = bob
+            .decrypt_application(&pre_restart)
+            .expect("decrypt pre-restart");
+        assert_eq!(pre_restart_plain, b"before restart");
+
+        let bob_identity_reloaded =
+            MlsIdentity::new_with_name(b"bob".to_vec()).expect("bob identity reload");
+        let mut bob = MlsGroupHandle::new(
+            bob_store.clone(),
+            guild_id,
+            channel_id,
+            bob_identity_reloaded,
+        )
+        .await
+        .expect("bob handle reload");
+
+        let charlie_identity =
+            MlsIdentity::new_with_name(b"charlie".to_vec()).expect("charlie identity");
+        let charlie = MlsGroupHandle::new(
+            MemoryStore::default(),
+            guild_id,
+            channel_id,
+            charlie_identity,
+        )
+        .await
+        .expect("charlie handle");
+        let charlie_kp = charlie.key_package_bytes().expect("charlie key package");
+
+        let (commit_for_existing, _welcome_for_charlie) =
+            alice.add_member(&charlie_kp).await.expect("add charlie");
+
+        let merge_result = bob
+            .decrypt_application(&commit_for_existing)
+            .expect("process commit after restart");
+        assert!(merge_result.is_empty());
+
+        let future_epoch_ciphertext = alice
+            .encrypt_application(b"new epoch message")
+            .expect("encrypt new epoch");
+        let future_epoch_plaintext = bob
+            .decrypt_application(&future_epoch_ciphertext)
+            .expect("decrypt new epoch");
+        assert_eq!(future_epoch_plaintext, b"new epoch message");
     }
 }
