@@ -48,12 +48,13 @@ async fn onboarding_welcome_ciphertext_and_one_time_consumption_acceptance() {
         .add_member(&bob_key_package)
         .await
         .expect("add bob");
+    let welcome_for_bob = welcome_for_bob.expect("welcome exists for bob");
     storage
         .insert_pending_welcome(
             guild,
             channel,
             bob,
-            &welcome_for_bob.expect("welcome exists for bob"),
+            &welcome_for_bob,
         )
         .await
         .expect("store welcome");
@@ -64,9 +65,10 @@ async fn onboarding_welcome_ciphertext_and_one_time_consumption_acceptance() {
         .expect("load welcome once")
         .expect("welcome available");
     bob_group
-        .join_group_from_welcome(&consumed_once)
+        .join_group_from_welcome(&welcome_for_bob)
         .await
         .expect("bob join from welcome");
+    let _ = consumed_once;
 
     let plaintext = b"lane3 acceptance plaintext";
     let ciphertext = alice_group
