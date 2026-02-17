@@ -437,6 +437,7 @@ struct RealtimeClientState {
     sender_directory: HashMap<i64, String>,
     attempted_channel_member_additions: HashSet<(GuildId, ChannelId, i64)>,
     initialized_mls_channels: HashSet<(GuildId, ChannelId)>,
+    pending_outbound_plaintexts: HashMap<String, String>,
     voice_session_keys: HashMap<VoiceConnectionKey, CachedVoiceSessionKey>,
 }
 
@@ -503,6 +504,7 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
                 sender_directory: HashMap::new(),
                 attempted_channel_member_additions: HashSet::new(),
                 initialized_mls_channels: HashSet::new(),
+                pending_outbound_plaintexts: HashMap::new(),
                 voice_session_keys: HashMap::new(),
             }),
             voice_connection: Mutex::new(None),
@@ -1078,14 +1080,31 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
     }
 
     async fn emit_decrypted_message(&self, message: &MessagePayload) -> Result<()> {
-        let guild_id = {
+        let (guild_id, user_id, pending_plaintext) = {
             let mut guard = self.inner.lock().await;
+            let user_id = guard
+                .user_id
+                .ok_or_else(|| anyhow!("not logged in: missing user_id"))?;
             if let Some(guild_id) = guard.channel_guilds.get(&message.channel_id).copied() {
-                guild_id
+                let pending_plaintext = if message.sender_id.0 == user_id {
+                    guard
+                        .pending_outbound_plaintexts
+                        .remove(&message.ciphertext_b64)
+                } else {
+                    None
+                };
+                (guild_id, user_id, pending_plaintext)
             } else if guard.selected_channel == Some(message.channel_id) {
                 if let Some(guild_id) = guard.selected_guild {
                     guard.channel_guilds.insert(message.channel_id, guild_id);
-                    guild_id
+                    let pending_plaintext = if message.sender_id.0 == user_id {
+                        guard
+                            .pending_outbound_plaintexts
+                            .remove(&message.ciphertext_b64)
+                    } else {
+                        None
+                    };
+                    (guild_id, user_id, pending_plaintext)
                 } else {
                     return Err(anyhow!(
                         "missing guild mapping for channel {}",
@@ -1099,6 +1118,17 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
                 ));
             }
         };
+
+        if message.sender_id.0 == user_id {
+            if let Some(plaintext) = pending_plaintext {
+                let _ = self.events.send(ClientEvent::MessageDecrypted {
+                    message: message.clone(),
+                    plaintext,
+                });
+            }
+            return Ok(());
+        }
+
         self.mls_session_manager
             .open_or_create_group(guild_id, message.channel_id)
             .await?;
@@ -1155,12 +1185,29 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
             attachment,
         };
 
-        self.http
+        {
+            let mut guard = self.inner.lock().await;
+            guard
+                .pending_outbound_plaintexts
+                .insert(payload.ciphertext_b64.clone(), text.to_string());
+        }
+
+        if let Err(err) = self
+            .http
             .post(format!("{server_url}/messages"))
             .json(&payload)
             .send()
-            .await?
-            .error_for_status()?;
+            .await
+            .and_then(|response| response.error_for_status())
+        {
+            self.inner
+                .lock()
+                .await
+                .pending_outbound_plaintexts
+                .remove(&payload.ciphertext_b64);
+            return Err(err.into());
+        }
+
         Ok(())
     }
 }
@@ -1236,6 +1283,7 @@ impl<C: CryptoProvider + 'static> ClientHandle for Arc<RealtimeClient<C>> {
             guard.ws_started = false;
             guard.channel_guilds.clear();
             guard.sender_directory.clear();
+            guard.pending_outbound_plaintexts.clear();
             guard.initialized_mls_channels.clear();
             guard.attempted_channel_member_additions.clear();
             zeroize_voice_session_cache(&mut guard);
@@ -1250,6 +1298,7 @@ impl<C: CryptoProvider + 'static> ClientHandle for Arc<RealtimeClient<C>> {
             guard.selected_channel = None;
             guard.channel_guilds.clear();
             guard.sender_directory.clear();
+            guard.pending_outbound_plaintexts.clear();
             guard.initialized_mls_channels.clear();
             guard.attempted_channel_member_additions.clear();
             zeroize_voice_session_cache(&mut guard);
@@ -1760,6 +1809,7 @@ mod tests {
         );
         {
             let mut inner = client.inner.lock().await;
+            inner.user_id = Some(99);
             inner.selected_guild = Some(GuildId(11));
             inner.selected_channel = Some(ChannelId(3));
         }
@@ -1781,6 +1831,7 @@ mod tests {
         );
         {
             let mut inner = client.inner.lock().await;
+            inner.user_id = Some(99);
             inner.channel_guilds.insert(ChannelId(3), GuildId(11));
         }
         let mut rx = client.subscribe_events();
@@ -1798,6 +1849,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn emits_plaintext_for_self_echo_without_mls_decrypt() {
+        let manager = TestMlsSessionManager::ok(Vec::new(), b"should-not-decrypt".to_vec());
+        let decrypt_inputs = manager.decrypted_ciphertexts.clone();
+        let client =
+            RealtimeClient::new_with_mls_session_manager(PassthroughCrypto, Arc::new(manager));
+        {
+            let mut inner = client.inner.lock().await;
+            inner.user_id = Some(5);
+            inner.channel_guilds.insert(ChannelId(3), GuildId(11));
+            inner
+                .pending_outbound_plaintexts
+                .insert(STANDARD.encode(b"cipher"), "self echo".to_string());
+        }
+        let mut rx = client.subscribe_events();
+
+        let mut message = sample_message();
+        message.sender_id = shared::domain::UserId(5);
+
+        client
+            .emit_decrypted_message(&message)
+            .await
+            .expect("self echo should bypass decrypt");
+
+        let event = rx.recv().await.expect("event");
+        match event {
+            ClientEvent::MessageDecrypted { plaintext, .. } => assert_eq!(plaintext, "self echo"),
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        let decrypt_inputs = decrypt_inputs.lock().await;
+        assert!(decrypt_inputs.is_empty());
+    }
+
+    #[tokio::test]
     async fn suppresses_non_application_messages_after_decrypt() {
         let client = RealtimeClient::new_with_mls_session_manager(
             PassthroughCrypto,
@@ -1805,6 +1890,7 @@ mod tests {
         );
         {
             let mut inner = client.inner.lock().await;
+            inner.user_id = Some(99);
             inner.channel_guilds.insert(ChannelId(3), GuildId(11));
         }
         let mut rx = client.subscribe_events();
