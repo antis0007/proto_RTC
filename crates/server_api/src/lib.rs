@@ -4,7 +4,10 @@ use livekit_integration::{mint_token, room_name_for_voice_channel, LiveKitConfig
 use shared::{
     domain::{ChannelId, ChannelKind, GuildId, Role, UserId},
     error::{ApiError, ErrorCode},
-    protocol::{ChannelSummary, GuildSummary, MemberSummary, MessagePayload, ServerEvent},
+    protocol::{
+        AttachmentMetadata, ChannelSummary, GuildSummary, MemberSummary, MessagePayload,
+        ServerEvent,
+    },
 };
 use storage::Storage;
 
@@ -94,6 +97,7 @@ pub async fn send_message(
     guild_id: GuildId,
     channel_id: ChannelId,
     ciphertext_b64: &str,
+    attachments: &[AttachmentMetadata],
 ) -> Result<ServerEvent, ApiError> {
     let (_, _, muted) = ensure_active_membership(ctx, guild_id, user_id).await?;
     if muted {
@@ -105,7 +109,7 @@ pub async fn send_message(
 
     let message_id = ctx
         .storage
-        .insert_message_ciphertext(channel_id, user_id, &ciphertext)
+        .insert_message_ciphertext(channel_id, user_id, &ciphertext, attachments)
         .await
         .map_err(internal)?;
     let sender_username = ctx
@@ -120,6 +124,7 @@ pub async fn send_message(
             sender_id: user_id,
             sender_username,
             ciphertext_b64: ciphertext_b64.to_string(),
+            attachments: attachments.to_vec(),
             sent_at: Utc::now(),
         },
     })
@@ -168,6 +173,7 @@ pub async fn list_messages(
             sender_id: message.sender_id,
             sender_username,
             ciphertext_b64: STANDARD.encode(message.ciphertext),
+            attachments: message.attachments,
             sent_at: message.created_at,
         });
     }
@@ -289,7 +295,7 @@ mod tests {
             .add_membership(guild, user, Role::Member, false, true)
             .await
             .expect("membership");
-        let err = send_message(&ctx, user, guild, channel, "b2theA==")
+        let err = send_message(&ctx, user, guild, channel, "b2theA==", &[])
             .await
             .expect_err("should fail");
         assert!(matches!(err.code, ErrorCode::Forbidden));
