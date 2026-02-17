@@ -8,6 +8,7 @@ license.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 shared = { path = "../shared" }
 thiserror.workspace = true
 openmls = "0.6"
