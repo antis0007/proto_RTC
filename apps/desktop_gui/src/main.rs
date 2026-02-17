@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     thread,
 };
 
@@ -7,6 +7,7 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use client_core::{ClientEvent, ClientHandle, PassthroughCrypto, RealtimeClient};
 use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 use eframe::egui;
+use serde::{Deserialize, Serialize};
 use shared::{
     domain::{ChannelId, ChannelKind, GuildId, MessageId, Role},
     protocol::{ChannelSummary, GuildSummary, MemberSummary, MessagePayload, ServerEvent},
@@ -107,6 +108,128 @@ impl ThemeSettings {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct UiReadabilitySettings {
+    text_scale: f32,
+    compact_density: bool,
+    show_timestamps: bool,
+    message_bubble_backgrounds: bool,
+}
+
+impl UiReadabilitySettings {
+    fn defaults() -> Self {
+        Self {
+            text_scale: 1.0,
+            compact_density: false,
+            show_timestamps: true,
+            message_bubble_backgrounds: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+enum PersistedThemePreset {
+    DiscordDark,
+    AtomOneDark,
+    EguiLight,
+}
+
+impl From<ThemePreset> for PersistedThemePreset {
+    fn from(value: ThemePreset) -> Self {
+        match value {
+            ThemePreset::DiscordDark => Self::DiscordDark,
+            ThemePreset::AtomOneDark => Self::AtomOneDark,
+            ThemePreset::EguiLight => Self::EguiLight,
+        }
+    }
+}
+
+impl From<PersistedThemePreset> for ThemePreset {
+    fn from(value: PersistedThemePreset) -> Self {
+        match value {
+            PersistedThemePreset::DiscordDark => Self::DiscordDark,
+            PersistedThemePreset::AtomOneDark => Self::AtomOneDark,
+            PersistedThemePreset::EguiLight => Self::EguiLight,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct PersistedDesktopSettings {
+    theme_preset: PersistedThemePreset,
+    accent_color: [u8; 4],
+    panel_rounding: u8,
+    list_row_shading: bool,
+    text_scale: f32,
+    compact_density: bool,
+    show_timestamps: bool,
+    message_bubble_backgrounds: bool,
+}
+
+impl Default for PersistedDesktopSettings {
+    fn default() -> Self {
+        let theme = ThemeSettings::discord_default();
+        let readability = UiReadabilitySettings::defaults();
+        Self {
+            theme_preset: theme.preset.into(),
+            accent_color: [
+                theme.accent_color.r(),
+                theme.accent_color.g(),
+                theme.accent_color.b(),
+                theme.accent_color.a(),
+            ],
+            panel_rounding: theme.panel_rounding,
+            list_row_shading: theme.list_row_shading,
+            text_scale: readability.text_scale,
+            compact_density: readability.compact_density,
+            show_timestamps: readability.show_timestamps,
+            message_bubble_backgrounds: readability.message_bubble_backgrounds,
+        }
+    }
+}
+
+impl PersistedDesktopSettings {
+    fn into_runtime(self) -> (ThemeSettings, UiReadabilitySettings) {
+        (
+            ThemeSettings {
+                preset: self.theme_preset.into(),
+                accent_color: egui::Color32::from_rgba_unmultiplied(
+                    self.accent_color[0],
+                    self.accent_color[1],
+                    self.accent_color[2],
+                    self.accent_color[3],
+                ),
+                panel_rounding: self.panel_rounding.min(16),
+                list_row_shading: self.list_row_shading,
+            },
+            UiReadabilitySettings {
+                text_scale: self.text_scale.clamp(0.8, 1.4),
+                compact_density: self.compact_density,
+                show_timestamps: self.show_timestamps,
+                message_bubble_backgrounds: self.message_bubble_backgrounds,
+            },
+        )
+    }
+
+    fn from_runtime(theme: ThemeSettings, readability: UiReadabilitySettings) -> Self {
+        Self {
+            theme_preset: theme.preset.into(),
+            accent_color: [
+                theme.accent_color.r(),
+                theme.accent_color.g(),
+                theme.accent_color.b(),
+                theme.accent_color.a(),
+            ],
+            panel_rounding: theme.panel_rounding,
+            list_row_shading: theme.list_row_shading,
+            text_scale: readability.text_scale,
+            compact_density: readability.compact_density,
+            show_timestamps: readability.show_timestamps,
+            message_bubble_backgrounds: readability.message_bubble_backgrounds,
+        }
+    }
+}
+
 struct DesktopGuiApp {
     cmd_tx: Sender<BackendCommand>,
     ui_rx: Receiver<UiEvent>,
@@ -132,6 +255,8 @@ struct DesktopGuiApp {
     view_state: AppViewState,
     theme: ThemeSettings,
     applied_theme: Option<ThemeSettings>,
+    readability: UiReadabilitySettings,
+    applied_readability: Option<UiReadabilitySettings>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,7 +266,12 @@ enum AppViewState {
 }
 
 impl DesktopGuiApp {
-    fn new(cmd_tx: Sender<BackendCommand>, ui_rx: Receiver<UiEvent>) -> Self {
+    fn new(
+        cmd_tx: Sender<BackendCommand>,
+        ui_rx: Receiver<UiEvent>,
+        persisted_settings: Option<PersistedDesktopSettings>,
+    ) -> Self {
+        let (theme, readability) = persisted_settings.unwrap_or_default().into_runtime();
         Self {
             cmd_tx,
             ui_rx,
@@ -165,8 +295,10 @@ impl DesktopGuiApp {
             sender_directory: HashMap::new(),
             settings_open: false,
             view_state: AppViewState::Login,
-            theme: ThemeSettings::discord_default(),
+            theme,
             applied_theme: None,
+            readability,
+            applied_readability: None,
         }
     }
 
@@ -276,14 +408,27 @@ impl DesktopGuiApp {
     }
 
     fn apply_theme_if_needed(&mut self, ctx: &egui::Context) {
-        if self.applied_theme == Some(self.theme) {
+        if self.applied_theme == Some(self.theme)
+            && self.applied_readability == Some(self.readability)
+        {
             return;
         }
 
         let mut style = (*ctx.style()).clone();
         style.visuals = visuals_for_theme(self.theme);
+        style.text_styles = scaled_text_styles(self.readability.text_scale);
+        if self.readability.compact_density {
+            style.spacing.item_spacing = egui::vec2(6.0, 4.0);
+            style.spacing.button_padding = egui::vec2(6.0, 4.0);
+            style.spacing.interact_size.y = 22.0;
+        } else {
+            style.spacing.item_spacing = egui::vec2(8.0, 6.0);
+            style.spacing.button_padding = egui::vec2(8.0, 5.0);
+            style.spacing.interact_size.y = 28.0;
+        }
         ctx.set_style(style);
         self.applied_theme = Some(self.theme);
+        self.applied_readability = Some(self.readability);
     }
 
     fn show_settings_window(&mut self, ctx: &egui::Context) {
@@ -327,9 +472,26 @@ impl DesktopGuiApp {
                     &mut self.theme.list_row_shading,
                     "Use shaded backgrounds for guild/channel rows",
                 );
+                ui.separator();
+                ui.label("Readability");
+                ui.add(
+                    egui::Slider::new(&mut self.readability.text_scale, 0.8..=1.4)
+                        .text("Text scale")
+                        .step_by(0.05),
+                );
+                ui.checkbox(&mut self.readability.compact_density, "Compact UI density");
+                ui.checkbox(
+                    &mut self.readability.show_timestamps,
+                    "Show message timestamps",
+                );
+                ui.checkbox(
+                    &mut self.readability.message_bubble_backgrounds,
+                    "Show chat message bubble backgrounds",
+                );
 
-                if ui.button("Reset to Discord default").clicked() {
+                if ui.button("Reset all settings to defaults").clicked() {
                     self.theme = ThemeSettings::discord_default();
+                    self.readability = UiReadabilitySettings::defaults();
                 }
             });
     }
@@ -585,7 +747,7 @@ impl DesktopGuiApp {
                         let response = egui::Frame::none()
                             .fill(row_fill)
                             .stroke(row_stroke)
-                            .rounding(egui::Rounding::same(6.0))
+                            .rounding(egui::Rounding::same(f32::from(self.theme.panel_rounding)))
                             .inner_margin(egui::Margin::symmetric(8.0, 6.0))
                             .show(ui, |ui| ui.selectable_label(selected, &guild.name))
                             .inner;
@@ -679,7 +841,7 @@ impl DesktopGuiApp {
                         let response = egui::Frame::none()
                             .fill(row_fill)
                             .stroke(row_stroke)
-                            .rounding(egui::Rounding::same(6.0))
+                            .rounding(egui::Rounding::same(f32::from(self.theme.panel_rounding)))
                             .inner_margin(egui::Margin::symmetric(8.0, 6.0))
                             .show(ui, |ui| {
                                 ui.horizontal(|ui| {
@@ -830,12 +992,36 @@ impl DesktopGuiApp {
                                 .unwrap_or_else(|| msg.sender_id.0.to_string());
                             let sent_at = msg.sent_at.format("%Y-%m-%d %H:%M:%S UTC").to_string();
 
-                            ui.horizontal_wrapped(|ui| {
-                                ui.label(egui::RichText::new(sender_display).strong());
-                                ui.label(egui::RichText::new(sent_at).small().weak());
+                            let message_margin = if self.readability.compact_density {
+                                egui::Margin::symmetric(6.0, 4.0)
+                            } else {
+                                egui::Margin::symmetric(8.0, 6.0)
+                            };
+                            let frame = if self.readability.message_bubble_backgrounds {
+                                egui::Frame::none()
+                                    .fill(ui.visuals().faint_bg_color.gamma_multiply(0.45))
+                            } else {
+                                egui::Frame::none()
+                            };
+                            frame
+                                .rounding(egui::Rounding::same(f32::from(
+                                    self.theme.panel_rounding,
+                                )))
+                                .inner_margin(message_margin)
+                                .show(ui, |ui| {
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.label(egui::RichText::new(sender_display).strong());
+                                        if self.readability.show_timestamps {
+                                            ui.label(egui::RichText::new(sent_at).small().weak());
+                                        }
+                                    });
+                                    ui.label(decoded);
+                                });
+                            ui.add_space(if self.readability.compact_density {
+                                4.0
+                            } else {
+                                6.0
                             });
-                            ui.label(decoded);
-                            ui.add_space(6.0);
                         }
                     } else {
                         ui.allocate_ui_with_layout(
@@ -920,6 +1106,16 @@ fn visuals_for_theme(theme: ThemeSettings) -> egui::Visuals {
     visuals
 }
 
+fn scaled_text_styles(text_scale: f32) -> BTreeMap<egui::TextStyle, egui::FontId> {
+    let mut styles = egui::Style::default().text_styles;
+    for font in styles.values_mut() {
+        font.size *= text_scale;
+    }
+    styles
+}
+
+const SETTINGS_STORAGE_KEY: &str = "desktop_gui.settings";
+
 impl eframe::App for DesktopGuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.process_ui_events();
@@ -931,6 +1127,13 @@ impl eframe::App for DesktopGuiApp {
         }
 
         ctx.request_repaint();
+    }
+
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        let settings = PersistedDesktopSettings::from_runtime(self.theme, self.readability);
+        if let Ok(serialized) = serde_json::to_string(&settings) {
+            storage.set_string(SETTINGS_STORAGE_KEY, serialized);
+        }
     }
 }
 
@@ -1070,6 +1273,17 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "Prototype RTC Desktop GUI",
         options,
-        Box::new(|_cc| Ok(Box::new(DesktopGuiApp::new(cmd_tx, ui_rx)))),
+        Box::new(|cc| {
+            let persisted_settings = cc.storage.and_then(|storage| {
+                storage
+                    .get_string(SETTINGS_STORAGE_KEY)
+                    .and_then(|text| serde_json::from_str::<PersistedDesktopSettings>(&text).ok())
+            });
+            Ok(Box::new(DesktopGuiApp::new(
+                cmd_tx,
+                ui_rx,
+                persisted_settings,
+            )))
+        }),
     )
 }
