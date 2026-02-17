@@ -7,21 +7,41 @@ use base64::{
     Engine as _,
 };
 use futures::StreamExt;
-use mls::{MlsGroupHandle, MlsIdentity, MlsStore};
+use mls::MlsIdentity;
 use openmls_rust_crypto::OpenMlsRustCrypto;
 use reqwest::Client;
-use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use shared::{
     domain::{ChannelId, FileId, GuildId, MessageId},
-    error::ApiError,
     protocol::{
         AttachmentPayload, ChannelSummary, ClientRequest, GuildSummary, KeyPackageResponse,
-        MemberSummary, MessagePayload, ServerEvent, UploadKeyPackageResponse, WelcomeResponse,
+        MemberSummary, MessagePayload, ServerEvent, UploadKeyPackageResponse,
     },
 };
 use tokio::sync::{broadcast, Mutex};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
+
+#[async_trait]
+pub trait MlsSessionManager: Send + Sync {
+    async fn encrypt_application(&self, channel_id: ChannelId, plaintext: &[u8])
+        -> Result<Vec<u8>>;
+}
+
+pub struct MissingMlsSessionManager;
+
+#[async_trait]
+impl MlsSessionManager for MissingMlsSessionManager {
+    async fn encrypt_application(
+        &self,
+        channel_id: ChannelId,
+        _plaintext: &[u8],
+    ) -> Result<Vec<u8>> {
+        Err(anyhow!(
+            "no active MLS group available for channel {}",
+            channel_id.0
+        ))
+    }
+}
 
 pub trait CryptoProvider: Send + Sync {
     fn encrypt_message(&self, plaintext: &[u8]) -> Vec<u8>;
@@ -174,140 +194,10 @@ pub trait ClientHandle: Send + Sync {
 
 pub struct RealtimeClient<C: CryptoProvider + 'static> {
     http: Client,
-    crypto: C,
-    mls_manager: MlsGroupManager,
+    _crypto: C,
+    mls_session_manager: Arc<dyn MlsSessionManager>,
     inner: Mutex<RealtimeClientState>,
     events: broadcast::Sender<ClientEvent>,
-}
-
-type GroupKey = (GuildId, ChannelId);
-type SharedMlsStore = Arc<dyn MlsStore>;
-type ActiveGroupHandle = Arc<Mutex<MlsGroupHandle<SharedMlsStore>>>;
-
-#[derive(Default)]
-struct InMemoryMlsStore {
-    identities: Mutex<HashMap<(i64, String), Vec<u8>>>,
-    groups: Mutex<HashMap<(GuildId, ChannelId), Vec<u8>>>,
-}
-
-#[async_trait]
-impl MlsStore for InMemoryMlsStore {
-    async fn save_identity_keys(
-        &self,
-        user_id: i64,
-        device_id: &str,
-        identity_bytes: &[u8],
-    ) -> Result<()> {
-        self.identities
-            .lock()
-            .await
-            .insert((user_id, device_id.to_string()), identity_bytes.to_vec());
-        Ok(())
-    }
-
-    async fn load_identity_keys(&self, user_id: i64, device_id: &str) -> Result<Option<Vec<u8>>> {
-        Ok(self
-            .identities
-            .lock()
-            .await
-            .get(&(user_id, device_id.to_string()))
-            .cloned())
-    }
-
-    async fn save_group_state(
-        &self,
-        guild_id: GuildId,
-        channel_id: ChannelId,
-        group_state_bytes: &[u8],
-    ) -> Result<()> {
-        self.groups
-            .lock()
-            .await
-            .insert((guild_id, channel_id), group_state_bytes.to_vec());
-        Ok(())
-    }
-
-    async fn load_group_state(
-        &self,
-        guild_id: GuildId,
-        channel_id: ChannelId,
-    ) -> Result<Option<Vec<u8>>> {
-        Ok(self
-            .groups
-            .lock()
-            .await
-            .get(&(guild_id, channel_id))
-            .cloned())
-    }
-}
-
-struct MlsGroupManager {
-    store: SharedMlsStore,
-    groups: Mutex<HashMap<GroupKey, ActiveGroupHandle>>,
-}
-
-impl MlsGroupManager {
-    fn new(store: SharedMlsStore) -> Self {
-        Self {
-            store,
-            groups: Mutex::new(HashMap::new()),
-        }
-    }
-
-    async fn get_active_group_for_channel<C: CryptoProvider + 'static>(
-        &self,
-        client: &RealtimeClient<C>,
-        channel_id: ChannelId,
-    ) -> Result<ActiveGroupHandle> {
-        let (server_url, user_id, guild_id) = client.context_for_channel(channel_id).await?;
-        let key = (guild_id, channel_id);
-
-        if let Some(existing) = self.groups.lock().await.get(&key).cloned() {
-            return Ok(existing);
-        }
-
-        let identity = MlsIdentity::new_with_name(format!("user-{user_id}"))?;
-        let handle = Arc::new(Mutex::new(MlsGroupHandle::new(
-            self.store.clone(),
-            guild_id,
-            channel_id,
-            identity,
-        )));
-
-        {
-            let mut group = handle.lock().await;
-            if group.load_persisted_state().await? {
-                self.groups.lock().await.insert(key, handle.clone());
-                return Ok(handle.clone());
-            }
-        }
-
-        if client
-            .is_first_member_for_context(guild_id, user_id)
-            .await?
-        {
-            let mut group = handle.lock().await;
-            group.create_group(channel_id).await?;
-            self.groups.lock().await.insert(key, handle.clone());
-            return Ok(handle.clone());
-        }
-
-        let welcome = client
-            .fetch_pending_welcome(server_url, user_id, guild_id, channel_id)
-            .await?;
-        let welcome = welcome.ok_or_else(|| {
-            anyhow!(
-                "MLS not initialized for this channel yet. Ask a member to send/refresh your welcome for this channel."
-            )
-        })?;
-        {
-            let mut group = handle.lock().await;
-            group.join_group_from_welcome(&welcome).await?;
-        }
-
-        self.groups.lock().await.insert(key, handle.clone());
-        Ok(handle)
-    }
 }
 
 struct RealtimeClientState {
@@ -328,7 +218,7 @@ struct ListMessagesQuery {
     before: Option<i64>,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct SendMessageHttpRequest {
     user_id: i64,
     guild_id: i64,
@@ -340,15 +230,18 @@ struct SendMessageHttpRequest {
 
 impl<C: CryptoProvider + 'static> RealtimeClient<C> {
     pub fn new(crypto: C) -> Arc<Self> {
-        Self::new_with_mls_store(crypto, Arc::new(InMemoryMlsStore::default()))
+        Self::new_with_mls_session_manager(crypto, Arc::new(MissingMlsSessionManager))
     }
 
-    pub fn new_with_mls_store(crypto: C, mls_store: SharedMlsStore) -> Arc<Self> {
+    pub fn new_with_mls_session_manager(
+        crypto: C,
+        mls_session_manager: Arc<dyn MlsSessionManager>,
+    ) -> Arc<Self> {
         let (events, _) = broadcast::channel(1024);
         Arc::new(Self {
             http: Client::new(),
-            crypto,
-            mls_manager: MlsGroupManager::new(mls_store),
+            _crypto: crypto,
+            mls_session_manager,
             inner: Mutex::new(RealtimeClientState {
                 server_url: None,
                 user_id: None,
@@ -360,97 +253,6 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
             }),
             events,
         })
-    }
-
-    pub async fn get_active_group_for_channel(
-        &self,
-        channel_id: ChannelId,
-    ) -> Result<ActiveGroupHandle> {
-        self.mls_manager
-            .get_active_group_for_channel(self, channel_id)
-            .await
-    }
-
-    async fn context_for_channel(&self, channel_id: ChannelId) -> Result<(String, i64, GuildId)> {
-        let guard = self.inner.lock().await;
-        let server_url = guard
-            .server_url
-            .clone()
-            .ok_or_else(|| anyhow!("not logged in: missing server_url"))?;
-        let user_id = guard
-            .user_id
-            .ok_or_else(|| anyhow!("not logged in: missing user_id"))?;
-        let guild_id = guard
-            .channel_guilds
-            .get(&channel_id)
-            .copied()
-            .or(guard.selected_guild)
-            .ok_or_else(|| anyhow!("no guild selected"))?;
-        Ok((server_url, user_id, guild_id))
-    }
-
-    async fn list_members_http(
-        &self,
-        guild_id: GuildId,
-        user_id: i64,
-    ) -> Result<Vec<MemberSummary>> {
-        let (server_url, _session_user) = self.session().await?;
-        let members: Vec<MemberSummary> = self
-            .http
-            .get(format!("{server_url}/guilds/{}/members", guild_id.0))
-            .query(&[("user_id", user_id)])
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
-        Ok(members)
-    }
-
-    async fn is_first_member_for_context(&self, guild_id: GuildId, user_id: i64) -> Result<bool> {
-        let members = self.list_members_http(guild_id, user_id).await?;
-        Ok(members.len() == 1 && members[0].user_id.0 == user_id)
-    }
-
-    async fn fetch_pending_welcome(
-        &self,
-        server_url: String,
-        user_id: i64,
-        guild_id: GuildId,
-        channel_id: ChannelId,
-    ) -> Result<Option<Vec<u8>>> {
-        let response = self
-            .http
-            .get(format!("{server_url}/mls/welcome"))
-            .query(&[
-                ("user_id", user_id.to_string()),
-                ("guild_id", guild_id.0.to_string()),
-                ("channel_id", channel_id.0.to_string()),
-            ])
-            .send()
-            .await?;
-
-        if response.status() == StatusCode::NOT_FOUND {
-            return Ok(None);
-        }
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response
-                .json::<ApiError>()
-                .await
-                .unwrap_or_else(|_| ApiError::new(shared::error::ErrorCode::Internal, "unknown"));
-            return Err(anyhow!(
-                "failed to fetch MLS welcome ({status}): {}",
-                body.message
-            ));
-        }
-
-        let welcome: WelcomeResponse = response.json().await?;
-        let decoded = STANDARD
-            .decode(welcome.welcome_b64)
-            .map_err(|e| anyhow!("invalid welcome payload from server: {e}"))?;
-        Ok(Some(decoded))
     }
 
     async fn record_sender_username(&self, message: &MessagePayload) {
@@ -642,7 +444,11 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
         attachment: Option<AttachmentPayload>,
     ) -> Result<()> {
         let (server_url, user_id, guild_id, channel_id) = self.active_context().await?;
-        let ciphertext = self.crypto.encrypt_message(text.as_bytes());
+        let plaintext_bytes = text.as_bytes();
+        let ciphertext = self
+            .mls_session_manager
+            .encrypt_application(channel_id, plaintext_bytes)
+            .await?;
         let payload = SendMessageHttpRequest {
             user_id,
             guild_id: guild_id.0,
@@ -797,9 +603,6 @@ impl<C: CryptoProvider + 'static> ClientHandle for Arc<RealtimeClient<C>> {
                 guard.selected_guild = Some(guild_id);
             }
         }
-        self.mls_manager
-            .get_active_group_for_channel(self, channel_id)
-            .await?;
         self.fetch_messages(channel_id, 100, None).await?;
         Ok(())
     }
@@ -906,5 +709,124 @@ impl<C: CryptoProvider + 'static> ClientHandle for Arc<RealtimeClient<C>> {
 
     fn subscribe_events(&self) -> broadcast::Receiver<ClientEvent> {
         self.events.subscribe()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{extract::State, routing::post, Json, Router};
+    use tokio::{net::TcpListener, sync::oneshot};
+
+    #[derive(Clone)]
+    struct ServerState {
+        tx: Arc<Mutex<Option<oneshot::Sender<SendMessageHttpRequest>>>>,
+    }
+
+    struct TestMlsSessionManager {
+        ciphertext: Vec<u8>,
+        fail_with: Option<String>,
+    }
+
+    #[async_trait]
+    impl MlsSessionManager for TestMlsSessionManager {
+        async fn encrypt_application(
+            &self,
+            _channel_id: ChannelId,
+            plaintext: &[u8],
+        ) -> Result<Vec<u8>> {
+            if let Some(err) = &self.fail_with {
+                return Err(anyhow!(err.clone()));
+            }
+            if plaintext.is_empty() {
+                return Err(anyhow!("plaintext must not be empty"));
+            }
+            Ok(self.ciphertext.clone())
+        }
+    }
+
+    async fn handle_send_message(
+        State(state): State<ServerState>,
+        Json(payload): Json<SendMessageHttpRequest>,
+    ) {
+        if let Some(tx) = state.tx.lock().await.take() {
+            let _ = tx.send(payload);
+        }
+    }
+
+    async fn spawn_message_server() -> Result<(String, oneshot::Receiver<SendMessageHttpRequest>)> {
+        std::env::set_var("NO_PROXY", "127.0.0.1,localhost");
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let (tx, rx) = oneshot::channel();
+        let state = ServerState {
+            tx: Arc::new(Mutex::new(Some(tx))),
+        };
+        let app = Router::new()
+            .route("/messages", post(handle_send_message))
+            .with_state(state);
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        Ok((format!("http://{addr}"), rx))
+    }
+
+    #[tokio::test]
+    async fn send_message_uses_mls_ciphertext_payload() {
+        let (server_url, payload_rx) = spawn_message_server().await.expect("spawn server");
+        let client = RealtimeClient::new_with_mls_session_manager(
+            PassthroughCrypto,
+            Arc::new(TestMlsSessionManager {
+                ciphertext: b"mls-ciphertext".to_vec(),
+                fail_with: None,
+            }),
+        );
+
+        {
+            let mut inner = client.inner.lock().await;
+            inner.server_url = Some(server_url);
+            inner.user_id = Some(7);
+            inner.selected_guild = Some(GuildId(11));
+            inner.selected_channel = Some(ChannelId(13));
+        }
+
+        client
+            .send_message("plaintext-message")
+            .await
+            .expect("send");
+
+        let payload = payload_rx.await.expect("payload");
+        let plaintext_b64 = STANDARD.encode("plaintext-message".as_bytes());
+        assert_ne!(payload.ciphertext_b64, plaintext_b64);
+        assert_eq!(
+            payload.ciphertext_b64,
+            STANDARD.encode("mls-ciphertext".as_bytes())
+        );
+    }
+
+    #[tokio::test]
+    async fn send_message_requires_active_mls_state() {
+        let (server_url, _payload_rx) = spawn_message_server().await.expect("spawn server");
+        let client = RealtimeClient::new_with_mls_session_manager(
+            PassthroughCrypto,
+            Arc::new(TestMlsSessionManager {
+                ciphertext: Vec::new(),
+                fail_with: Some("group not initialized".to_string()),
+            }),
+        );
+
+        {
+            let mut inner = client.inner.lock().await;
+            inner.server_url = Some(server_url);
+            inner.user_id = Some(7);
+            inner.selected_guild = Some(GuildId(11));
+            inner.selected_channel = Some(ChannelId(13));
+        }
+
+        let err = client
+            .send_message("plaintext-message")
+            .await
+            .expect_err("must fail");
+        assert!(err.to_string().contains("group not initialized"));
     }
 }

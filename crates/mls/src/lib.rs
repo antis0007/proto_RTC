@@ -4,7 +4,6 @@ use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::OpenMlsRustCrypto;
 use shared::domain::{ChannelId, GuildId};
-use std::sync::Arc;
 use tls_codec::{Deserialize as TlsDeserializeTrait, Serialize as TlsSerializeTrait};
 
 const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
@@ -71,46 +70,6 @@ pub trait MlsStore: Send + Sync {
     ) -> Result<Option<Vec<u8>>>;
 }
 
-#[async_trait]
-impl<T> MlsStore for Arc<T>
-where
-    T: MlsStore + ?Sized,
-{
-    async fn save_identity_keys(
-        &self,
-        user_id: i64,
-        device_id: &str,
-        identity_bytes: &[u8],
-    ) -> Result<()> {
-        (**self)
-            .save_identity_keys(user_id, device_id, identity_bytes)
-            .await
-    }
-
-    async fn load_identity_keys(&self, user_id: i64, device_id: &str) -> Result<Option<Vec<u8>>> {
-        (**self).load_identity_keys(user_id, device_id).await
-    }
-
-    async fn save_group_state(
-        &self,
-        guild_id: GuildId,
-        channel_id: ChannelId,
-        group_state_bytes: &[u8],
-    ) -> Result<()> {
-        (**self)
-            .save_group_state(guild_id, channel_id, group_state_bytes)
-            .await
-    }
-
-    async fn load_group_state(
-        &self,
-        guild_id: GuildId,
-        channel_id: ChannelId,
-    ) -> Result<Option<Vec<u8>>> {
-        (**self).load_group_state(guild_id, channel_id).await
-    }
-}
-
 pub struct MlsGroupHandle<S: MlsStore> {
     store: S,
     guild_id: GuildId,
@@ -167,20 +126,6 @@ impl<S: MlsStore> MlsGroupHandle<S> {
         let staged = StagedWelcome::new_from_welcome(&self.provider, &config, welcome, None)?;
         self.group = Some(staged.into_group(&self.provider)?);
         self.persist_group().await
-    }
-
-    pub async fn load_persisted_state(&mut self) -> Result<bool> {
-        let has_state = self
-            .store
-            .load_group_state(self.guild_id, self.channel_id)
-            .await?
-            .is_some();
-        if !has_state {
-            return Ok(false);
-        }
-
-        self.create_group(self.channel_id).await?;
-        Ok(true)
     }
 
     pub async fn add_member(

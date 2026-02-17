@@ -73,18 +73,6 @@ struct FileDownloadQuery {
 }
 
 #[derive(Debug, Deserialize)]
-struct UploadKeyPackageQuery {
-    user_id: i64,
-    guild_id: i64,
-}
-
-#[derive(Debug, Deserialize)]
-struct FetchKeyPackageQuery {
-    guild_id: i64,
-    user_id: i64,
-}
-
-#[derive(Debug, Deserialize)]
 struct ListMessagesQuery {
     user_id: i64,
     limit: Option<u32>,
