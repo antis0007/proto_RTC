@@ -110,19 +110,36 @@ fn normalize_database_url(raw_database_url: &str) -> String {
         return Settings::default().database_url;
     }
 
-    if raw_database_url.starts_with("sqlite::memory:")
-        || raw_database_url.starts_with("sqlite://")
-        || raw_database_url.contains("://")
-    {
+    if raw_database_url.starts_with("sqlite::memory:") || raw_database_url.contains("://") {
+        if let Some(path) = raw_database_url.strip_prefix("sqlite://") {
+            if is_windows_absolute_path(path) {
+                return format!("sqlite:{}", path.replace('\\', "/"));
+            }
+        }
         return raw_database_url.to_string();
     }
 
     if let Some(path) = raw_database_url.strip_prefix("sqlite:") {
-        let path = path.replace('\\', "/");
-        return format!("sqlite://{path}");
+        let normalized_path = path.replace('\\', "/");
+        if is_windows_absolute_path(&normalized_path) {
+            return format!("sqlite:{normalized_path}");
+        }
+        return format!("sqlite://{normalized_path}");
     }
 
-    format!("sqlite://{}", raw_database_url.replace('\\', "/"))
+    let normalized_path = raw_database_url.replace('\\', "/");
+    if is_windows_absolute_path(&normalized_path) {
+        return format!("sqlite:{normalized_path}");
+    }
+    format!("sqlite://{normalized_path}")
+}
+
+fn is_windows_absolute_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'/' || bytes[2] == b'\\')
 }
 
 fn ensure_parent_dir_exists(database_url: &str) -> anyhow::Result<()> {
@@ -197,6 +214,53 @@ mod tests {
         assert!(temp_root.join("data").exists());
 
         env::set_current_dir(original_dir).expect("restore cwd");
+        fs::remove_dir_all(temp_root).expect("cleanup");
+    }
+
+    #[test]
+    fn keeps_windows_absolute_path_with_single_sqlite_colon() {
+        assert_eq!(
+            normalize_database_url("sqlite:C:\\Users\\alice\\test.db"),
+            "sqlite:C:/Users/alice/test.db"
+        );
+    }
+
+    #[test]
+    fn normalizes_windows_plain_path_with_single_sqlite_colon() {
+        assert_eq!(
+            normalize_database_url("C:\\Users\\alice\\test.db"),
+            "sqlite:C:/Users/alice/test.db"
+        );
+    }
+
+    #[test]
+    fn converts_sqlite_double_slash_windows_path() {
+        assert_eq!(
+            normalize_database_url("sqlite://C:/Users/alice/test.db"),
+            "sqlite:C:/Users/alice/test.db"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepared_database_url_creates_openable_sqlite_file() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+
+        let temp_root = env::temp_dir().join(format!("proto_rtc_server_open_test_{suffix}"));
+        let db_path = temp_root.join("nested").join("server.db");
+
+        let prepared = prepare_database_url(db_path.to_string_lossy().as_ref()).expect("prepare");
+        let storage = storage::Storage::new(&prepared).await.expect("open sqlite");
+        drop(storage);
+
+        assert!(
+            db_path.exists(),
+            "database file should be created: {}",
+            db_path.display()
+        );
+
         fs::remove_dir_all(temp_root).expect("cleanup");
     }
 }
