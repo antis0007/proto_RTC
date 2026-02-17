@@ -8,7 +8,10 @@ use std::{
 };
 
 use arboard::{Clipboard, ImageData};
-use client_core::{AttachmentUpload, ClientEvent, ClientHandle, PassthroughCrypto, RealtimeClient};
+use client_core::{
+    AttachmentUpload, ClientEvent, ClientHandle, PassthroughCrypto, RealtimeClient,
+    VoiceConnectOptions, VoiceParticipantState, VoiceSessionSnapshot,
+};
 use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 use eframe::egui;
 use egui::TextureHandle;
@@ -62,6 +65,11 @@ enum BackendCommand {
     JoinWithInvite {
         invite_code: String,
     },
+    ConnectVoice {
+        guild_id: GuildId,
+        channel_id: ChannelId,
+    },
+    DisconnectVoice,
 }
 
 enum UiEvent {
@@ -87,6 +95,70 @@ enum UiEvent {
         message: MessagePayload,
         plaintext: String,
     },
+    VoiceSessionStateChanged(Option<VoiceSessionSnapshot>),
+    VoiceParticipantsUpdated {
+        guild_id: GuildId,
+        channel_id: ChannelId,
+        participants: Vec<VoiceParticipantState>,
+    },
+    VoiceOperationFailed(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VoiceSessionConnectionStatus {
+    Idle,
+    Connecting,
+    Connected,
+    Disconnecting,
+    Error,
+}
+
+#[derive(Debug, Clone)]
+struct VoiceSessionUiState {
+    selected_voice_channel: Option<ChannelId>,
+    active_session: Option<VoiceSessionSnapshot>,
+    participants_by_channel: HashMap<ChannelId, Vec<VoiceParticipantState>>,
+    connection_status: VoiceSessionConnectionStatus,
+    muted: bool,
+    deafened: bool,
+    screen_share_enabled: bool,
+    last_error: Option<String>,
+}
+
+impl VoiceSessionUiState {
+    fn new() -> Self {
+        Self {
+            selected_voice_channel: None,
+            active_session: None,
+            participants_by_channel: HashMap::new(),
+            connection_status: VoiceSessionConnectionStatus::Idle,
+            muted: false,
+            deafened: false,
+            screen_share_enabled: false,
+            last_error: None,
+        }
+    }
+
+    fn occupancy_for_channel(&self, channel_id: ChannelId) -> usize {
+        self.participants_by_channel
+            .get(&channel_id)
+            .map(|participants| participants.len())
+            .unwrap_or(0)
+    }
+
+    fn active_participant_count(&self) -> usize {
+        self.active_session
+            .as_ref()
+            .map(|snapshot| self.occupancy_for_channel(snapshot.channel_id))
+            .unwrap_or(0)
+    }
+
+    fn is_channel_connected(&self, channel_id: ChannelId) -> bool {
+        self.active_session
+            .as_ref()
+            .map(|session| session.channel_id == channel_id)
+            .unwrap_or(false)
+    }
 }
 
 #[derive(Clone)]
@@ -132,6 +204,7 @@ impl AuthAction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ThemePreset {
     DiscordDark,
+    DiscordLegacy,
     AtomOneDark,
     EguiLight,
 }
@@ -140,6 +213,7 @@ impl ThemePreset {
     fn label(self) -> &'static str {
         match self {
             ThemePreset::DiscordDark => "Discord (Dark)",
+            ThemePreset::DiscordLegacy => "Discord (Legacy)",
             ThemePreset::AtomOneDark => "Atom One Dark",
             ThemePreset::EguiLight => "Egui Light",
         }
@@ -187,6 +261,7 @@ impl UiReadabilitySettings {
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 enum PersistedThemePreset {
     DiscordDark,
+    DiscordLegacy,
     AtomOneDark,
     EguiLight,
 }
@@ -195,6 +270,7 @@ impl From<ThemePreset> for PersistedThemePreset {
     fn from(value: ThemePreset) -> Self {
         match value {
             ThemePreset::DiscordDark => Self::DiscordDark,
+            ThemePreset::DiscordLegacy => Self::DiscordLegacy,
             ThemePreset::AtomOneDark => Self::AtomOneDark,
             ThemePreset::EguiLight => Self::EguiLight,
         }
@@ -205,6 +281,7 @@ impl From<PersistedThemePreset> for ThemePreset {
     fn from(value: PersistedThemePreset) -> Self {
         match value {
             PersistedThemePreset::DiscordDark => Self::DiscordDark,
+            PersistedThemePreset::DiscordLegacy => Self::DiscordLegacy,
             PersistedThemePreset::AtomOneDark => Self::AtomOneDark,
             PersistedThemePreset::EguiLight => Self::EguiLight,
         }
@@ -312,6 +389,7 @@ struct DesktopGuiApp {
     sender_directory: HashMap<i64, String>,
     attachment_previews: HashMap<FileId, AttachmentPreviewState>,
     expanded_preview: Option<FileId>,
+    voice_ui: VoiceSessionUiState,
     settings_open: bool,
     view_state: AppViewState,
     theme: ThemeSettings,
@@ -387,6 +465,7 @@ impl DesktopGuiApp {
             sender_directory: HashMap::new(),
             attachment_previews: HashMap::new(),
             expanded_preview: None,
+            voice_ui: VoiceSessionUiState::new(),
             settings_open: false,
             view_state: AppViewState::Login,
             theme,
@@ -413,6 +492,7 @@ impl DesktopGuiApp {
                     self.sender_directory.clear();
                     self.attachment_previews.clear();
                     self.expanded_preview = None;
+                    self.voice_ui = VoiceSessionUiState::new();
                     queue_command(&self.cmd_tx, BackendCommand::ListGuilds, &mut self.status);
                 }
                 UiEvent::Info(message) => {
@@ -429,6 +509,37 @@ impl DesktopGuiApp {
                 UiEvent::Error(err) => {
                     self.auth_session_established = false;
                     self.status = format!("Error: {err}");
+                }
+                UiEvent::VoiceOperationFailed(err) => {
+                    self.voice_ui.connection_status = VoiceSessionConnectionStatus::Error;
+                    self.voice_ui.last_error = Some(err.clone());
+                    self.status = format!("Voice error: {err}");
+                }
+                UiEvent::VoiceSessionStateChanged(snapshot) => match snapshot {
+                    Some(active) => {
+                        self.voice_ui.connection_status = VoiceSessionConnectionStatus::Connected;
+                        self.voice_ui.selected_voice_channel = Some(active.channel_id);
+                        self.voice_ui.active_session = Some(active);
+                        self.voice_ui.last_error = None;
+                    }
+                    None => {
+                        self.voice_ui.connection_status = VoiceSessionConnectionStatus::Idle;
+                        self.voice_ui.active_session = None;
+                        self.voice_ui.muted = false;
+                        self.voice_ui.deafened = false;
+                        self.voice_ui.screen_share_enabled = false;
+                    }
+                },
+                UiEvent::VoiceParticipantsUpdated {
+                    guild_id,
+                    channel_id,
+                    participants,
+                } => {
+                    if self.selected_guild == Some(guild_id) {
+                        self.voice_ui
+                            .participants_by_channel
+                            .insert(channel_id, participants);
+                    }
                 }
                 UiEvent::AttachmentPreviewLoaded {
                     file_id,
@@ -526,6 +637,25 @@ impl DesktopGuiApp {
             .map(|message| message.wire.message_id)
     }
 
+    fn selected_voice_channel(&self) -> Option<&ChannelSummary> {
+        let channel_id = self.voice_ui.selected_voice_channel?;
+        self.channels
+            .iter()
+            .find(|channel| channel.channel_id == channel_id && channel.kind == ChannelKind::Voice)
+    }
+
+    fn voice_status_badge(&self) -> (&'static str, egui::Color32) {
+        match self.voice_ui.connection_status {
+            VoiceSessionConnectionStatus::Idle => ("idle", egui::Color32::GRAY),
+            VoiceSessionConnectionStatus::Connecting => ("connecting", egui::Color32::YELLOW),
+            VoiceSessionConnectionStatus::Connected => ("connected", egui::Color32::GREEN),
+            VoiceSessionConnectionStatus::Disconnecting => {
+                ("disconnecting", egui::Color32::LIGHT_BLUE)
+            }
+            VoiceSessionConnectionStatus::Error => ("error", egui::Color32::RED),
+        }
+    }
+
     fn apply_theme_if_needed(&mut self, ctx: &egui::Context) {
         if self.applied_theme == Some(self.theme)
             && self.applied_readability == Some(self.readability)
@@ -567,6 +697,11 @@ impl DesktopGuiApp {
                             &mut self.theme.preset,
                             ThemePreset::DiscordDark,
                             ThemePreset::DiscordDark.label(),
+                        );
+                        ui.selectable_value(
+                            &mut self.theme.preset,
+                            ThemePreset::DiscordLegacy,
+                            ThemePreset::DiscordLegacy.label(),
                         );
                         ui.selectable_value(
                             &mut self.theme.preset,
@@ -1052,19 +1187,25 @@ impl DesktopGuiApp {
 
                     for guild in &self.guilds {
                         let selected = self.selected_guild == Some(guild.guild_id);
-                        let base_bg = if self.theme.list_row_shading {
-                            ui.visuals().faint_bg_color
-                        } else {
-                            egui::Color32::TRANSPARENT
-                        };
-                        let selected_bg = ui.visuals().selection.bg_fill.gamma_multiply(
+                        let discord_dark = theme_discord_dark_palette(self.theme);
+                        let base_bg = discord_dark.map(|p| p.guild_list_bg).unwrap_or_else(|| {
                             if self.theme.list_row_shading {
-                                0.35
+                                ui.visuals().faint_bg_color
                             } else {
-                                0.22
-                            },
-                        );
-                        let row_fill = if selected { selected_bg } else { base_bg };
+                                egui::Color32::TRANSPARENT
+                            }
+                        });
+                        let selected_bg = discord_dark
+                            .map(|p| p.guild_entry_active)
+                            .unwrap_or_else(|| {
+                                ui.visuals().selection.bg_fill.gamma_multiply(
+                                    if self.theme.list_row_shading {
+                                        0.35
+                                    } else {
+                                        0.22
+                                    },
+                                )
+                            });
                         let row_stroke = if selected {
                             egui::Stroke::new(
                                 1.0,
@@ -1079,13 +1220,42 @@ impl DesktopGuiApp {
                             egui::Stroke::NONE
                         };
 
+                        let text_color = if selected {
+                            discord_dark
+                                .map(|p| p.guild_text_highlighted)
+                                .unwrap_or(ui.visuals().strong_text_color())
+                        } else {
+                            discord_dark
+                                .map(|p| p.guild_text_unhighlighted)
+                                .unwrap_or(ui.visuals().text_color())
+                        };
+
                         let response = egui::Frame::none()
-                            .fill(row_fill)
+                            .fill(if selected { selected_bg } else { base_bg })
                             .stroke(row_stroke)
                             .rounding(egui::Rounding::same(f32::from(self.theme.panel_rounding)))
                             .inner_margin(egui::Margin::symmetric(8.0, 6.0))
-                            .show(ui, |ui| ui.selectable_label(selected, &guild.name))
+                            .show(ui, |ui| {
+                                ui.selectable_label(
+                                    selected,
+                                    egui::RichText::new(&guild.name).color(text_color),
+                                )
+                            })
                             .inner;
+                        if response.hovered() && !selected {
+                            if let Some(palette) = discord_dark {
+                                ui.ctx()
+                                    .layer_painter(egui::LayerId::new(
+                                        egui::Order::Background,
+                                        egui::Id::new("guild_hover_row"),
+                                    ))
+                                    .rect_filled(
+                                        response.rect,
+                                        egui::Rounding::same(f32::from(self.theme.panel_rounding)),
+                                        palette.guild_entry_hover,
+                                    );
+                            }
+                        }
                         if response.clicked() {
                             self.selected_guild = Some(guild.guild_id);
                             self.selected_channel = None;
@@ -1172,6 +1342,17 @@ impl DesktopGuiApp {
                         } else {
                             egui::Stroke::NONE
                         };
+                        let occupancy = if channel.kind == ChannelKind::Voice {
+                            Some(self.voice_ui.occupancy_for_channel(channel.channel_id))
+                        } else {
+                            None
+                        };
+                        let connection_hint =
+                            if self.voice_ui.is_channel_connected(channel.channel_id) {
+                                Some("connected")
+                            } else {
+                                None
+                            };
 
                         let response = egui::Frame::none()
                             .fill(row_fill)
@@ -1184,13 +1365,22 @@ impl DesktopGuiApp {
                                         [18.0, 18.0],
                                         egui::Label::new(egui::RichText::new(icon).monospace()),
                                     );
-                                    ui.selectable_label(selected, &channel.name)
+                                    let _ = ui.selectable_label(selected, &channel.name);
+                                    if let Some(count) = occupancy {
+                                        ui.label(format!("({count})"));
+                                        if let Some(hint) = connection_hint {
+                                            ui.small(hint);
+                                        }
+                                    }
                                 })
-                                .inner
+                                .response
                             })
                             .inner;
                         if response.clicked() {
                             self.selected_channel = Some(channel.channel_id);
+                            if channel.kind == ChannelKind::Voice {
+                                self.voice_ui.selected_voice_channel = Some(channel.channel_id);
+                            }
                             queue_command(
                                 &self.cmd_tx,
                                 BackendCommand::SelectChannel {
@@ -1200,6 +1390,39 @@ impl DesktopGuiApp {
                             );
                         }
                         ui.add_space(4.0);
+                    }
+
+                    if let Some(channel) = self.selected_voice_channel().cloned() {
+                        ui.separator();
+                        let connected_here = self.voice_ui.is_channel_connected(channel.channel_id);
+                        let cta_label = if connected_here {
+                            "Leave voice"
+                        } else {
+                            "Join voice"
+                        };
+                        if ui.button(cta_label).clicked() {
+                            if connected_here {
+                                self.voice_ui.connection_status =
+                                    VoiceSessionConnectionStatus::Disconnecting;
+                                queue_command(
+                                    &self.cmd_tx,
+                                    BackendCommand::DisconnectVoice,
+                                    &mut self.status,
+                                );
+                            } else {
+                                self.voice_ui.connection_status =
+                                    VoiceSessionConnectionStatus::Connecting;
+                                self.voice_ui.last_error = None;
+                                queue_command(
+                                    &self.cmd_tx,
+                                    BackendCommand::ConnectVoice {
+                                        guild_id: channel.guild_id,
+                                        channel_id: channel.channel_id,
+                                    },
+                                    &mut self.status,
+                                );
+                            }
+                        }
                     }
                 });
 
@@ -1252,7 +1475,41 @@ impl DesktopGuiApp {
 
                 ui.separator();
                 ui.heading("Voice");
-                ui.label("No participants");
+                let (badge_text, badge_color) = self.voice_status_badge();
+                ui.colored_label(badge_color, format!("Status: {badge_text}"));
+
+                if let Some(channel) = self.selected_voice_channel() {
+                    ui.label(format!("Selected: {}", channel.name));
+                    ui.small(format!(
+                        "Occupancy: {} participant(s)",
+                        self.voice_ui.occupancy_for_channel(channel.channel_id)
+                    ));
+                }
+
+                if let Some(active) = &self.voice_ui.active_session {
+                    let active_name = self
+                        .channels
+                        .iter()
+                        .find(|channel| channel.channel_id == active.channel_id)
+                        .map(|channel| channel.name.as_str())
+                        .unwrap_or("Unknown voice channel");
+                    ui.label(format!("Connected channel: {active_name}"));
+                    ui.label(format!(
+                        "Participants: {}",
+                        self.voice_ui.active_participant_count()
+                    ));
+                    ui.horizontal_wrapped(|ui| {
+                        ui.toggle_value(&mut self.voice_ui.muted, "Mute");
+                        ui.toggle_value(&mut self.voice_ui.deafened, "Deafen");
+                        ui.toggle_value(&mut self.voice_ui.screen_share_enabled, "Screen share");
+                    });
+                } else {
+                    ui.label("Not connected to voice.");
+                }
+
+                if let Some(err) = &self.voice_ui.last_error {
+                    ui.colored_label(egui::Color32::RED, format!("Last voice error: {err}"));
+                }
             });
 
         egui::TopBottomPanel::bottom("composer_panel")
@@ -1265,12 +1522,20 @@ impl DesktopGuiApp {
                         if ui.button("📎").on_hover_text("Attach file").clicked() {
                             self.pending_attachment = rfd::FileDialog::new().pick_file();
                         }
-                        let response = ui.add_sized(
-                            [ui.available_width() - 130.0, 72.0],
-                            egui::TextEdit::multiline(&mut self.composer).hint_text(
-                                "Message #channel (Enter to send, Shift+Enter for newline)",
-                            ),
-                        );
+                        let response = ui
+                            .scope(|ui| {
+                                if let Some(palette) = theme_discord_dark_palette(self.theme) {
+                                    ui.visuals_mut().extreme_bg_color =
+                                        palette.message_box_background;
+                                }
+                                ui.add_sized(
+                                    [ui.available_width() - 130.0, 72.0],
+                                    egui::TextEdit::multiline(&mut self.composer).hint_text(
+                                        "Message #channel (Enter to send, Shift+Enter for newline)",
+                                    ),
+                                )
+                            })
+                            .inner;
                         let send_shortcut = response.has_focus()
                             && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
                         let clicked_send = ui
@@ -1348,7 +1613,41 @@ impl DesktopGuiApp {
                                 });
                             }
                         }
+                        ui.add_space(6.0);
                     }
+
+                    ui.horizontal(|ui| {
+                        if ui.button("📎").on_hover_text("Attach file").clicked() {
+                            self.pending_attachment = rfd::FileDialog::new().pick_file();
+                        }
+                        let response = ui.add_sized(
+                            [ui.available_width() - 130.0, 72.0],
+                            egui::TextEdit::multiline(&mut self.composer).hint_text(
+                                "Message #channel (Enter to send, Shift+Enter for newline)",
+                            ),
+                        );
+                        let send_shortcut = response.has_focus()
+                            && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
+                        let clicked_send = ui
+                            .add_sized([80.0, 72.0], egui::Button::new("⬆ Send"))
+                            .clicked();
+                        let has_text = !self.composer.trim().is_empty();
+                        let has_attachment = self.pending_attachment.is_some();
+                        if (send_shortcut || clicked_send) && (has_text || has_attachment) {
+                            let text = self.composer.trim_end_matches('\n').to_string();
+                            self.composer.clear();
+                            let attachment_path = self.pending_attachment.take();
+                            queue_command(
+                                &self.cmd_tx,
+                                BackendCommand::SendMessage {
+                                    text,
+                                    attachment_path,
+                                },
+                                &mut self.status,
+                            );
+                            response.request_focus();
+                        }
+                    });
                 });
                 if !can_send {
                     ui.centered_and_justified(|ui| {
@@ -1395,13 +1694,18 @@ impl DesktopGuiApp {
                             } else {
                                 egui::Margin::symmetric(8.0, 6.0)
                             };
+                            let discord_dark = theme_discord_dark_palette(self.theme);
+                            let base_message_bg = discord_dark
+                                .map(|p| p.message_box_background)
+                                .unwrap_or_else(|| {
+                                    ui.visuals().faint_bg_color.gamma_multiply(0.45)
+                                });
                             let frame = if self.readability.message_bubble_backgrounds {
-                                egui::Frame::none()
-                                    .fill(ui.visuals().faint_bg_color.gamma_multiply(0.45))
+                                egui::Frame::none().fill(base_message_bg)
                             } else {
                                 egui::Frame::none()
                             };
-                            frame
+                            let message_response = frame
                                 .rounding(egui::Rounding::same(f32::from(
                                     self.theme.panel_rounding,
                                 )))
@@ -1437,7 +1741,24 @@ impl DesktopGuiApp {
                                             });
                                         }
                                     }
-                                });
+                                })
+                                .response;
+                            if message_response.hovered() {
+                                if let Some(palette) = discord_dark {
+                                    ui.ctx()
+                                        .layer_painter(egui::LayerId::new(
+                                            egui::Order::Background,
+                                            egui::Id::new("message_hover_row"),
+                                        ))
+                                        .rect_filled(
+                                            message_response.rect,
+                                            egui::Rounding::same(f32::from(
+                                                self.theme.panel_rounding,
+                                            )),
+                                            palette.message_row_hover,
+                                        );
+                                }
+                            }
                             ui.add_space(if self.readability.compact_density {
                                 4.0
                             } else {
@@ -1449,20 +1770,13 @@ impl DesktopGuiApp {
                             ui.available_size(),
                             egui::Layout::centered_and_justified(egui::Direction::TopDown),
                             |ui| {
-                                ui.heading("No messages");
-                                ui.weak("This conversation is quiet for now.");
+                                ui.heading("Select a channel");
+                                ui.weak(
+                                    "Choose a channel from the left to view and send messages.",
+                                );
                             },
                         );
                     }
-                } else {
-                    ui.allocate_ui_with_layout(
-                        ui.available_size(),
-                        egui::Layout::centered_and_justified(egui::Direction::TopDown),
-                        |ui| {
-                            ui.heading("Select a channel");
-                            ui.weak("Choose a channel from the left to view and send messages.");
-                        },
-                    );
                 }
             });
 
@@ -1742,9 +2056,41 @@ fn queue_command(cmd_tx: &Sender<BackendCommand>, cmd: BackendCommand, status: &
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct DiscordDarkPalette {
+    message_box_background: egui::Color32,
+    message_row_hover: egui::Color32,
+    guild_list_bg: egui::Color32,
+    guild_entry_hover: egui::Color32,
+    guild_entry_active: egui::Color32,
+    guild_text_unhighlighted: egui::Color32,
+    guild_text_highlighted: egui::Color32,
+}
+
+fn theme_discord_dark_palette(theme: ThemeSettings) -> Option<DiscordDarkPalette> {
+    (theme.preset == ThemePreset::DiscordDark).then_some(DiscordDarkPalette {
+        message_box_background: egui::Color32::from_rgb(26, 26, 30),
+        message_row_hover: egui::Color32::from_rgb(36, 36, 40),
+        guild_list_bg: egui::Color32::from_rgb(18, 18, 20),
+        guild_entry_hover: egui::Color32::from_rgb(29, 29, 30),
+        guild_entry_active: egui::Color32::from_rgb(44, 44, 48),
+        guild_text_unhighlighted: egui::Color32::from_rgb(129, 130, 138),
+        guild_text_highlighted: egui::Color32::from_rgb(251, 251, 251),
+    })
+}
+
 fn visuals_for_theme(theme: ThemeSettings) -> egui::Visuals {
     let mut visuals = match theme.preset {
         ThemePreset::DiscordDark => {
+            let mut v = egui::Visuals::dark();
+            v.override_text_color = Some(egui::Color32::from_rgb(251, 251, 251));
+            v.window_fill = egui::Color32::from_rgb(18, 18, 20);
+            v.panel_fill = egui::Color32::from_rgb(18, 18, 20);
+            v.extreme_bg_color = egui::Color32::from_rgb(26, 26, 30);
+            v.faint_bg_color = egui::Color32::from_rgb(29, 29, 30);
+            v
+        }
+        ThemePreset::DiscordLegacy => {
             let mut v = egui::Visuals::dark();
             v.override_text_color = Some(egui::Color32::from_rgb(220, 221, 222));
             v.window_fill = egui::Color32::from_rgb(54, 57, 63);
@@ -1861,6 +2207,18 @@ fn spawn_backend_thread(cmd_rx: Receiver<BackendCommand>, ui_tx: Sender<UiEvent>
                                                 } => {
                                                     UiEvent::MessageDecrypted { message, plaintext }
                                                 }
+                                                ClientEvent::VoiceSessionStateChanged(snapshot) => {
+                                                    UiEvent::VoiceSessionStateChanged(snapshot)
+                                                }
+                                                ClientEvent::VoiceParticipantsUpdated {
+                                                    guild_id,
+                                                    channel_id,
+                                                    participants,
+                                                } => UiEvent::VoiceParticipantsUpdated {
+                                                    guild_id,
+                                                    channel_id,
+                                                    participants,
+                                                },
                                                 ClientEvent::Error(err) => UiEvent::Error(err),
                                             };
                                             let _ = ui_tx_clone.try_send(evt);
@@ -2012,6 +2370,27 @@ fn spawn_backend_thread(cmd_rx: Receiver<BackendCommand>, ui_tx: Sender<UiEvent>
                             Err(err) => {
                                 let _ = ui_tx.try_send(UiEvent::Error(err.to_string()));
                             }
+                        }
+                    }
+                    BackendCommand::ConnectVoice {
+                        guild_id,
+                        channel_id,
+                    } => {
+                        if let Err(err) = client
+                            .connect_voice_session(VoiceConnectOptions {
+                                guild_id,
+                                channel_id,
+                                can_publish_mic: true,
+                                can_publish_screen: true,
+                            })
+                            .await
+                        {
+                            let _ = ui_tx.try_send(UiEvent::VoiceOperationFailed(err.to_string()));
+                        }
+                    }
+                    BackendCommand::DisconnectVoice => {
+                        if let Err(err) = client.disconnect_voice_session().await {
+                            let _ = ui_tx.try_send(UiEvent::VoiceOperationFailed(err.to_string()));
                         }
                     }
                 }

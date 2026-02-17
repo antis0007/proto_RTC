@@ -20,6 +20,11 @@ tokio-stream.workspace = true
 tokio-tungstenite = { version = "0.23", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 tracing.workspace = true
 url.workspace = true
+thiserror.workspace = true
+hkdf = "0.12"
+livekit_integration = { path = "../livekit_integration" }
+sha2 = "0.10"
+zeroize = "1"
 
 [dev-dependencies]
 axum.workspace = true
