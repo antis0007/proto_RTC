@@ -1658,6 +1658,10 @@ mod tests {
             PassthroughCrypto,
             Arc::new(TestMlsSessionManager::ok(Vec::new(), b"hello".to_vec())),
         );
+        {
+            let mut inner = client.inner.lock().await;
+            inner.channel_guilds.insert(ChannelId(3), GuildId(11));
+        }
         let mut rx = client.subscribe_events();
 
         client
@@ -1678,6 +1682,10 @@ mod tests {
             PassthroughCrypto,
             Arc::new(TestMlsSessionManager::ok(Vec::new(), Vec::new())),
         );
+        {
+            let mut inner = client.inner.lock().await;
+            inner.channel_guilds.insert(ChannelId(3), GuildId(11));
+        }
         let mut rx = client.subscribe_events();
 
         client
