@@ -1840,6 +1840,7 @@ mod tests {
             channel_id: ChannelId(13),
             user_id: shared::domain::UserId(42),
             welcome_b64,
+            consumed_at: None,
         }))
     }
 
