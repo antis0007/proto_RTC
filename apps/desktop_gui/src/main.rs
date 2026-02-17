@@ -40,6 +40,7 @@ enum BackendCommand {
         text: String,
     },
     UploadAttachment {
+        upload_id: u64,
         file_path: PathBuf,
         display_name: String,
         mime_type: Option<String>,
@@ -62,7 +63,11 @@ enum UiEvent {
     InviteCreated(String),
     Error(String),
     UploadState(AttachmentUploadUiState),
-    AttachmentUploaded { file_id: FileId, file_name: String },
+    AttachmentUploaded {
+        upload_id: u64,
+        file_id: FileId,
+        file_name: String,
+    },
     Server(ServerEvent),
 }
 
@@ -76,6 +81,7 @@ enum AttachmentUploadUiState {
 
 #[derive(Debug, Clone)]
 struct PendingAttachment {
+    upload_id: u64,
     file_name: String,
     mime_type: Option<String>,
     file_id: Option<FileId>,
@@ -131,6 +137,7 @@ struct DesktopGuiApp {
     status: String,
     attachment_upload_state: AttachmentUploadUiState,
     pending_attachment: Option<PendingAttachment>,
+    next_upload_id: u64,
     settings_open: bool,
     theme: ThemeSettings,
     applied_theme: Option<ThemeSettings>,
@@ -154,6 +161,7 @@ impl DesktopGuiApp {
             status: "Not logged in".to_string(),
             attachment_upload_state: AttachmentUploadUiState::Idle,
             pending_attachment: None,
+            next_upload_id: 1,
             settings_open: false,
             theme: ThemeSettings::discord_default(),
             applied_theme: None,
@@ -207,9 +215,13 @@ impl DesktopGuiApp {
                         }
                     }
                 }
-                UiEvent::AttachmentUploaded { file_id, file_name } => {
+                UiEvent::AttachmentUploaded {
+                    upload_id,
+                    file_id,
+                    file_name,
+                } => {
                     if let Some(attachment) = &mut self.pending_attachment {
-                        if attachment.file_name == file_name {
+                        if attachment.upload_id == upload_id && attachment.file_name == file_name {
                             attachment.file_id = Some(file_id);
                         }
                     }
@@ -465,6 +477,9 @@ impl eframe::App for DesktopGuiApp {
                         self.selected_guild = Some(guild.guild_id);
                         self.selected_channel = None;
                         self.channels.clear();
+                        queue_command(&self.cmd_tx, BackendCommand::CancelUpload, &mut self.status);
+                        self.pending_attachment = None;
+                        self.attachment_upload_state = AttachmentUploadUiState::Idle;
                         queue_command(
                             &self.cmd_tx,
                             BackendCommand::ListChannels {
@@ -502,6 +517,9 @@ impl eframe::App for DesktopGuiApp {
                     let selected = self.selected_channel == Some(channel.channel_id);
                     if ui.selectable_label(selected, label).clicked() {
                         self.selected_channel = Some(channel.channel_id);
+                        queue_command(&self.cmd_tx, BackendCommand::CancelUpload, &mut self.status);
+                        self.pending_attachment = None;
+                        self.attachment_upload_state = AttachmentUploadUiState::Idle;
                         queue_command(
                             &self.cmd_tx,
                             BackendCommand::SelectChannel {
@@ -600,6 +618,8 @@ impl eframe::App for DesktopGuiApp {
                 if ui.button("Attach").clicked() {
                     if let Some((guild_id, channel_id)) = self.uploadable_channel_context() {
                         if let Some(path) = FileDialog::new().pick_file() {
+                            let upload_id = self.next_upload_id;
+                            self.next_upload_id = self.next_upload_id.saturating_add(1);
                             let display_name = path
                                 .file_name()
                                 .and_then(|name| name.to_str())
@@ -608,6 +628,7 @@ impl eframe::App for DesktopGuiApp {
                             let mime_type =
                                 MimeGuess::from_path(&path).first_raw().map(str::to_string);
                             self.pending_attachment = Some(PendingAttachment {
+                                upload_id,
                                 file_name: display_name.clone(),
                                 mime_type: mime_type.clone(),
                                 file_id: None,
@@ -619,6 +640,7 @@ impl eframe::App for DesktopGuiApp {
                             queue_command(
                                 &self.cmd_tx,
                                 BackendCommand::UploadAttachment {
+                                    upload_id,
                                     file_path: path,
                                     display_name,
                                     mime_type,
@@ -795,6 +817,7 @@ fn spawn_backend_thread(cmd_rx: Receiver<BackendCommand>, ui_tx: Sender<UiEvent>
                         }
                     }
                     BackendCommand::UploadAttachment {
+                        upload_id,
                         file_path,
                         display_name,
                         mime_type,
@@ -841,6 +864,7 @@ fn spawn_backend_thread(cmd_rx: Receiver<BackendCommand>, ui_tx: Sender<UiEvent>
                                         Ok(file_id) => {
                                             let _ =
                                                 ui_tx_clone.try_send(UiEvent::AttachmentUploaded {
+                                                    upload_id,
                                                     file_id,
                                                     file_name: display_name_for_task.clone(),
                                                 });
@@ -872,6 +896,7 @@ fn spawn_backend_thread(cmd_rx: Receiver<BackendCommand>, ui_tx: Sender<UiEvent>
                         }));
 
                         last_upload = Some(BackendCommand::UploadAttachment {
+                            upload_id,
                             file_path: retry_file_path,
                             display_name: retry_display_name,
                             mime_type: retry_mime_type,
@@ -881,6 +906,7 @@ fn spawn_backend_thread(cmd_rx: Receiver<BackendCommand>, ui_tx: Sender<UiEvent>
                     }
                     BackendCommand::RetryUpload => {
                         if let Some(BackendCommand::UploadAttachment {
+                            upload_id,
                             file_path,
                             display_name,
                             mime_type,
@@ -914,6 +940,7 @@ fn spawn_backend_thread(cmd_rx: Receiver<BackendCommand>, ui_tx: Sender<UiEvent>
                                         Ok(file_id) => {
                                             let _ =
                                                 ui_tx_clone.try_send(UiEvent::AttachmentUploaded {
+                                                    upload_id,
                                                     file_id,
                                                     file_name: display_name.clone(),
                                                 });
