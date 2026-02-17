@@ -457,6 +457,7 @@ mod tests {
 
         let _ = bob
             .decrypt_application(&commit_for_existing)
+            .await
             .expect("process inbound commit and merge it");
 
         let ciphertext = alice
@@ -464,6 +465,7 @@ mod tests {
             .expect("encrypt app message");
         let plaintext = bob
             .decrypt_application(&ciphertext)
+            .await
             .expect("decrypt app message after commit merge");
 
         assert_eq!(plaintext, b"post-commit message");
@@ -502,6 +504,7 @@ mod tests {
 
         let plaintext = bob
             .decrypt_application(&ciphertext)
+            .await
             .expect("decrypt app message");
 
         assert_eq!(plaintext, b"hello bob");
@@ -537,6 +540,7 @@ mod tests {
             .expect("encrypt pre-restart");
         let pre_restart_plain = bob
             .decrypt_application(&pre_restart)
+            .await
             .expect("decrypt pre-restart");
         assert_eq!(pre_restart_plain, b"before restart");
 
@@ -568,6 +572,7 @@ mod tests {
 
         let merge_result = bob
             .decrypt_application(&commit_for_existing)
+            .await
             .expect("process commit after restart");
         assert!(merge_result.is_empty());
 
@@ -576,6 +581,7 @@ mod tests {
             .expect("encrypt new epoch");
         let future_epoch_plaintext = bob
             .decrypt_application(&future_epoch_ciphertext)
+            .await
             .expect("decrypt new epoch");
         assert_eq!(future_epoch_plaintext, b"new epoch message");
     }
