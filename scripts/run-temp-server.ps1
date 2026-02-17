@@ -26,16 +26,12 @@ if (-not $env:TEMP_DB) {
   $env:TEMP_DB = Join-Path ([System.IO.Path]::GetTempPath()) ("proto_rtc_temp_server_{0}.db" -f ([System.Guid]::NewGuid().ToString('N')))
 }
 
-if (-not $env:SERVER_BIND) { $env:SERVER_BIND = '0.0.0.0:8443' }
+if (-not $env:SERVER_BIND) { $env:SERVER_BIND = '127.0.0.1:8443' }
 if (-not $env:SERVER_PUBLIC_URL) { $env:SERVER_PUBLIC_URL = 'http://127.0.0.1:8443' }
-$tempDbForUrl = $env:TEMP_DB -replace '\\', '/'
-if ($tempDbForUrl -match '^[A-Za-z]:/') {
-  $env:DATABASE_URL = "sqlite:///$tempDbForUrl"
-} elseif ($tempDbForUrl.StartsWith('/')) {
-  $env:DATABASE_URL = "sqlite://$tempDbForUrl"
-} else {
-  $env:DATABASE_URL = "sqlite://$tempDbForUrl"
-}
+
+# FIX: avoid sqlite:///C:/... which becomes "/C:/" in some parsers on Windows
+$env:DATABASE_URL = "sqlite:$($env:TEMP_DB)"
+
 if (-not $env:APP__BIND_ADDR) { $env:APP__BIND_ADDR = $env:SERVER_BIND }
 $env:APP__DATABASE_URL = $env:DATABASE_URL
 if (-not $env:APP__LIVEKIT_API_KEY) { $env:APP__LIVEKIT_API_KEY = $(if ($env:LIVEKIT_API_KEY) { $env:LIVEKIT_API_KEY } else { 'devkey' }) }
@@ -44,8 +40,10 @@ if (-not $env:APP__LIVEKIT_URL -and $env:LIVEKIT_URL) { $env:APP__LIVEKIT_URL = 
 
 Write-Host "Starting temporary server with DB: $($env:TEMP_DB)"
 Write-Host "Bind: $($env:SERVER_BIND)"
+Write-Host "DATABASE_URL: $($env:DATABASE_URL)"
+
 try {
-  cargo run -p server -- @ExtraArgs
+  cargo run -p server -- @($ExtraArgs)
 } finally {
   if (Test-Path $env:TEMP_DB) {
     Remove-Item -Path $env:TEMP_DB -Force -ErrorAction SilentlyContinue
