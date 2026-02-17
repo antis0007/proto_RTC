@@ -7,15 +7,17 @@ use base64::{
     Engine as _,
 };
 use futures::StreamExt;
-use mls::MlsIdentity;
+use mls::{MlsGroupHandle, MlsIdentity, MlsStore};
 use openmls_rust_crypto::OpenMlsRustCrypto;
 use reqwest::Client;
+use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use shared::{
     domain::{ChannelId, FileId, GuildId, MessageId},
+    error::ApiError,
     protocol::{
         AttachmentPayload, ChannelSummary, ClientRequest, GuildSummary, KeyPackageResponse,
-        MemberSummary, MessagePayload, ServerEvent, UploadKeyPackageResponse,
+        MemberSummary, MessagePayload, ServerEvent, UploadKeyPackageResponse, WelcomeResponse,
     },
 };
 use tokio::sync::{broadcast, Mutex};
@@ -173,8 +175,139 @@ pub trait ClientHandle: Send + Sync {
 pub struct RealtimeClient<C: CryptoProvider + 'static> {
     http: Client,
     crypto: C,
+    mls_manager: MlsGroupManager,
     inner: Mutex<RealtimeClientState>,
     events: broadcast::Sender<ClientEvent>,
+}
+
+type GroupKey = (GuildId, ChannelId);
+type SharedMlsStore = Arc<dyn MlsStore>;
+type ActiveGroupHandle = Arc<Mutex<MlsGroupHandle<SharedMlsStore>>>;
+
+#[derive(Default)]
+struct InMemoryMlsStore {
+    identities: Mutex<HashMap<(i64, String), Vec<u8>>>,
+    groups: Mutex<HashMap<(GuildId, ChannelId), Vec<u8>>>,
+}
+
+#[async_trait]
+impl MlsStore for InMemoryMlsStore {
+    async fn save_identity_keys(
+        &self,
+        user_id: i64,
+        device_id: &str,
+        identity_bytes: &[u8],
+    ) -> Result<()> {
+        self.identities
+            .lock()
+            .await
+            .insert((user_id, device_id.to_string()), identity_bytes.to_vec());
+        Ok(())
+    }
+
+    async fn load_identity_keys(&self, user_id: i64, device_id: &str) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .identities
+            .lock()
+            .await
+            .get(&(user_id, device_id.to_string()))
+            .cloned())
+    }
+
+    async fn save_group_state(
+        &self,
+        guild_id: GuildId,
+        channel_id: ChannelId,
+        group_state_bytes: &[u8],
+    ) -> Result<()> {
+        self.groups
+            .lock()
+            .await
+            .insert((guild_id, channel_id), group_state_bytes.to_vec());
+        Ok(())
+    }
+
+    async fn load_group_state(
+        &self,
+        guild_id: GuildId,
+        channel_id: ChannelId,
+    ) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .groups
+            .lock()
+            .await
+            .get(&(guild_id, channel_id))
+            .cloned())
+    }
+}
+
+struct MlsGroupManager {
+    store: SharedMlsStore,
+    groups: Mutex<HashMap<GroupKey, ActiveGroupHandle>>,
+}
+
+impl MlsGroupManager {
+    fn new(store: SharedMlsStore) -> Self {
+        Self {
+            store,
+            groups: Mutex::new(HashMap::new()),
+        }
+    }
+
+    async fn get_active_group_for_channel<C: CryptoProvider + 'static>(
+        &self,
+        client: &RealtimeClient<C>,
+        channel_id: ChannelId,
+    ) -> Result<ActiveGroupHandle> {
+        let (server_url, user_id, guild_id) = client.context_for_channel(channel_id).await?;
+        let key = (guild_id, channel_id);
+
+        if let Some(existing) = self.groups.lock().await.get(&key).cloned() {
+            return Ok(existing);
+        }
+
+        let identity = MlsIdentity::new_with_name(format!("user-{user_id}"))?;
+        let handle = Arc::new(Mutex::new(MlsGroupHandle::new(
+            self.store.clone(),
+            guild_id,
+            channel_id,
+            identity,
+        )));
+
+        {
+            let mut group = handle.lock().await;
+            if group.load_persisted_state().await? {
+                self.groups.lock().await.insert(key, handle.clone());
+                return Ok(handle.clone());
+            }
+        }
+
+        if client
+            .is_first_member_for_context(guild_id, user_id)
+            .await?
+        {
+            let mut group = handle.lock().await;
+            group.create_group(channel_id).await?;
+            self.groups.lock().await.insert(key, handle.clone());
+            return Ok(handle.clone());
+        }
+
+        let welcome = client
+            .fetch_pending_welcome(server_url, user_id, guild_id, channel_id)
+            .await?;
+        let welcome = welcome.ok_or_else(|| {
+            anyhow!(
+                "MLS not initialized for this channel yet. Ask a member to send/refresh your welcome for this channel."
+            )
+        })?;
+        {
+            let mut group = handle.lock().await;
+            group.join_group_from_welcome(&welcome).await?;
+        }
+
+        self.groups.lock().await.insert(key, handle.clone());
+        Ok(handle)
+    }
 }
 
 struct RealtimeClientState {
@@ -207,10 +340,15 @@ struct SendMessageHttpRequest {
 
 impl<C: CryptoProvider + 'static> RealtimeClient<C> {
     pub fn new(crypto: C) -> Arc<Self> {
+        Self::new_with_mls_store(crypto, Arc::new(InMemoryMlsStore::default()))
+    }
+
+    pub fn new_with_mls_store(crypto: C, mls_store: SharedMlsStore) -> Arc<Self> {
         let (events, _) = broadcast::channel(1024);
         Arc::new(Self {
             http: Client::new(),
             crypto,
+            mls_manager: MlsGroupManager::new(mls_store),
             inner: Mutex::new(RealtimeClientState {
                 server_url: None,
                 user_id: None,
@@ -222,6 +360,97 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
             }),
             events,
         })
+    }
+
+    pub async fn get_active_group_for_channel(
+        &self,
+        channel_id: ChannelId,
+    ) -> Result<ActiveGroupHandle> {
+        self.mls_manager
+            .get_active_group_for_channel(self, channel_id)
+            .await
+    }
+
+    async fn context_for_channel(&self, channel_id: ChannelId) -> Result<(String, i64, GuildId)> {
+        let guard = self.inner.lock().await;
+        let server_url = guard
+            .server_url
+            .clone()
+            .ok_or_else(|| anyhow!("not logged in: missing server_url"))?;
+        let user_id = guard
+            .user_id
+            .ok_or_else(|| anyhow!("not logged in: missing user_id"))?;
+        let guild_id = guard
+            .channel_guilds
+            .get(&channel_id)
+            .copied()
+            .or(guard.selected_guild)
+            .ok_or_else(|| anyhow!("no guild selected"))?;
+        Ok((server_url, user_id, guild_id))
+    }
+
+    async fn list_members_http(
+        &self,
+        guild_id: GuildId,
+        user_id: i64,
+    ) -> Result<Vec<MemberSummary>> {
+        let (server_url, _session_user) = self.session().await?;
+        let members: Vec<MemberSummary> = self
+            .http
+            .get(format!("{server_url}/guilds/{}/members", guild_id.0))
+            .query(&[("user_id", user_id)])
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok(members)
+    }
+
+    async fn is_first_member_for_context(&self, guild_id: GuildId, user_id: i64) -> Result<bool> {
+        let members = self.list_members_http(guild_id, user_id).await?;
+        Ok(members.len() == 1 && members[0].user_id.0 == user_id)
+    }
+
+    async fn fetch_pending_welcome(
+        &self,
+        server_url: String,
+        user_id: i64,
+        guild_id: GuildId,
+        channel_id: ChannelId,
+    ) -> Result<Option<Vec<u8>>> {
+        let response = self
+            .http
+            .get(format!("{server_url}/mls/welcome"))
+            .query(&[
+                ("user_id", user_id.to_string()),
+                ("guild_id", guild_id.0.to_string()),
+                ("channel_id", channel_id.0.to_string()),
+            ])
+            .send()
+            .await?;
+
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response
+                .json::<ApiError>()
+                .await
+                .unwrap_or_else(|_| ApiError::new(shared::error::ErrorCode::Internal, "unknown"));
+            return Err(anyhow!(
+                "failed to fetch MLS welcome ({status}): {}",
+                body.message
+            ));
+        }
+
+        let welcome: WelcomeResponse = response.json().await?;
+        let decoded = STANDARD
+            .decode(welcome.welcome_b64)
+            .map_err(|e| anyhow!("invalid welcome payload from server: {e}"))?;
+        Ok(Some(decoded))
     }
 
     async fn record_sender_username(&self, message: &MessagePayload) {
@@ -568,6 +797,9 @@ impl<C: CryptoProvider + 'static> ClientHandle for Arc<RealtimeClient<C>> {
                 guard.selected_guild = Some(guild_id);
             }
         }
+        self.mls_manager
+            .get_active_group_for_channel(self, channel_id)
+            .await?;
         self.fetch_messages(channel_id, 100, None).await?;
         Ok(())
     }
