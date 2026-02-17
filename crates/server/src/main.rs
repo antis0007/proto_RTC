@@ -100,6 +100,14 @@ struct SendMessageRequest {
     attachment: Option<AttachmentPayload>,
 }
 
+#[derive(Debug, Deserialize)]
+struct StorePendingWelcomeQuery {
+    user_id: i64,
+    guild_id: i64,
+    channel_id: i64,
+    target_user_id: i64,
+}
+
 const MAX_ATTACHMENT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_FILENAME_BYTES: usize = 180;
 
@@ -152,6 +160,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/files/:file_id", get(download_file))
         .route(mls_key_packages_route(), post(upload_key_package))
         .route(mls_key_packages_route(), get(fetch_key_package))
+        .route(mls_welcome_route(), post(store_pending_welcome))
         .route(mls_welcome_route(), get(fetch_pending_welcome))
         .route("/ws", get(ws_handler))
         .with_state(state)
@@ -519,6 +528,49 @@ async fn fetch_pending_welcome(
     }))
 }
 
+async fn store_pending_welcome(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<StorePendingWelcomeQuery>,
+    body: Bytes,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    ensure_active_membership_in_channel(
+        &state.api,
+        UserId(q.user_id),
+        GuildId(q.guild_id),
+        ChannelId(q.channel_id),
+    )
+    .await
+    .map_err(|e| (StatusCode::BAD_REQUEST, Json(e)))?;
+
+    ensure_active_membership_in_channel(
+        &state.api,
+        UserId(q.target_user_id),
+        GuildId(q.guild_id),
+        ChannelId(q.channel_id),
+    )
+    .await
+    .map_err(|e| (StatusCode::BAD_REQUEST, Json(e)))?;
+
+    state
+        .api
+        .storage
+        .insert_pending_welcome(
+            GuildId(q.guild_id),
+            ChannelId(q.channel_id),
+            UserId(q.target_user_id),
+            &body,
+        )
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError::new(ErrorCode::Internal, e.to_string())),
+            )
+        })?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
@@ -806,6 +858,49 @@ mod tests {
             .await
             .expect("second response");
         assert_eq!(second_response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn store_pending_welcome_allows_target_to_fetch_and_join_later() {
+        let (app, storage, user_id, guild_id, channel_id) = test_app().await;
+        let target = storage.create_user("bob").await.expect("user");
+        storage
+            .add_membership(
+                GuildId(guild_id),
+                target,
+                shared::domain::Role::Member,
+                false,
+                false,
+            )
+            .await
+            .expect("membership");
+
+        let store_request = Request::post(format!(
+            "/mls/welcome?user_id={user_id}&guild_id={guild_id}&channel_id={channel_id}&target_user_id={}",
+            target.0
+        ))
+        .body(Body::from("welcome-later"))
+        .expect("request");
+        let store_response = app.clone().oneshot(store_request).await.expect("response");
+        assert_eq!(store_response.status(), StatusCode::NO_CONTENT);
+
+        let fetch_request = Request::get(format!(
+            "/mls/welcome?user_id={}&guild_id={guild_id}&channel_id={channel_id}",
+            target.0
+        ))
+        .body(Body::empty())
+        .expect("request");
+        let fetch_response = app.clone().oneshot(fetch_request).await.expect("response");
+        assert_eq!(fetch_response.status(), StatusCode::OK);
+
+        let body = body::to_bytes(fetch_response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let dto: MlsWelcomeResponse = serde_json::from_slice(&body).expect("json");
+        assert_eq!(
+            STANDARD.decode(dto.welcome_b64).expect("base64"),
+            b"welcome-later"
+        );
     }
 
     #[tokio::test]
