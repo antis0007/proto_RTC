@@ -162,6 +162,10 @@ impl<S: MlsStore> MlsGroupHandle<S> {
 
         match processed.into_content() {
             ProcessedMessageContent::ApplicationMessage(app_msg) => Ok(app_msg.into_bytes()),
+            ProcessedMessageContent::StagedCommitMessage(staged_commit) => {
+                group.merge_staged_commit(&self.provider, *staged_commit)?;
+                Ok(Vec::new())
+            }
             _ => Err(anyhow!("message was not an application message")),
         }
     }
@@ -182,8 +186,9 @@ impl<S: MlsStore> MlsGroupHandle<S> {
 
     async fn persist_group(&self) -> Result<()> {
         if let Some(group) = &self.group {
+            let state = group.tls_serialize_detached()?;
             self.store
-                .save_group_state(self.guild_id, self.channel_id, group.group_id().as_slice())
+                .save_group_state(self.guild_id, self.channel_id, &state)
                 .await?;
         }
         Ok(())
@@ -255,6 +260,54 @@ mod tests {
                 .get(&(guild_id.0, channel_id.0))
                 .cloned())
         }
+    }
+
+    #[tokio::test]
+    async fn merge_commit_before_decrypting_next_application() {
+        let guild_id = GuildId(1);
+        let channel_id = ChannelId(20);
+
+        let alice_identity = MlsIdentity::new_with_name(b"alice".to_vec()).expect("alice identity");
+        let bob_identity = MlsIdentity::new_with_name(b"bob".to_vec()).expect("bob identity");
+        let charlie_identity =
+            MlsIdentity::new_with_name(b"charlie".to_vec()).expect("charlie identity");
+
+        let provider = OpenMlsRustCrypto::default();
+        let bob_kp = bob_identity
+            .key_package_bytes(&provider)
+            .expect("bob key package bytes");
+        let charlie_kp = charlie_identity
+            .key_package_bytes(&provider)
+            .expect("charlie key package bytes");
+
+        let mut alice =
+            MlsGroupHandle::new(MemoryStore::default(), guild_id, channel_id, alice_identity);
+        alice.create_group(channel_id).await.expect("create group");
+
+        let (commit_to_bob, welcome_for_bob) = alice.add_member(&bob_kp).await.expect("add bob");
+
+        let mut bob =
+            MlsGroupHandle::new(MemoryStore::default(), guild_id, channel_id, bob_identity);
+        bob.join_group_from_welcome(&welcome_for_bob.expect("welcome bob"))
+            .await
+            .expect("bob joins");
+
+        let (commit_for_existing, _welcome_for_charlie) =
+            alice.add_member(&charlie_kp).await.expect("add charlie");
+
+        let _ = bob
+            .decrypt_application(&commit_for_existing)
+            .expect("process inbound commit and merge it");
+
+        let ciphertext = alice
+            .encrypt_application(b"post-commit message")
+            .expect("encrypt app message");
+        let plaintext = bob
+            .decrypt_application(&ciphertext)
+            .expect("decrypt app message after commit merge");
+
+        assert_eq!(plaintext, b"post-commit message");
+        assert!(!commit_to_bob.is_empty());
     }
 
     #[tokio::test]
