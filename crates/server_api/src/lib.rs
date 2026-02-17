@@ -4,9 +4,11 @@ use livekit_integration::{mint_token, room_name_for_voice_channel, LiveKitConfig
 use shared::{
     domain::{ChannelId, ChannelKind, GuildId, Role, UserId},
     error::{ApiError, ErrorCode},
-    protocol::{ChannelSummary, GuildSummary, MemberSummary, MessagePayload, ServerEvent},
+    protocol::{
+        AttachmentPayload, ChannelSummary, GuildSummary, MemberSummary, MessagePayload, ServerEvent,
+    },
 };
-use storage::Storage;
+use storage::{Storage, StoredAttachment};
 
 #[derive(Clone)]
 pub struct ApiContext {
@@ -94,6 +96,7 @@ pub async fn send_message(
     guild_id: GuildId,
     channel_id: ChannelId,
     ciphertext_b64: &str,
+    attachment: Option<AttachmentPayload>,
 ) -> Result<ServerEvent, ApiError> {
     let (_, _, muted) = ensure_active_membership(ctx, guild_id, user_id).await?;
     if muted {
@@ -103,9 +106,16 @@ pub async fn send_message(
         .decode(ciphertext_b64)
         .map_err(|_| ApiError::new(ErrorCode::Validation, "invalid base64 ciphertext"))?;
 
+    let stored_attachment = attachment.as_ref().map(|attachment| StoredAttachment {
+        file_id: attachment.file_id,
+        filename: attachment.filename.clone(),
+        size_bytes: attachment.size_bytes,
+        mime_type: attachment.mime_type.clone(),
+    });
+
     let message_id = ctx
         .storage
-        .insert_message_ciphertext(channel_id, user_id, &ciphertext)
+        .insert_message_ciphertext(channel_id, user_id, &ciphertext, stored_attachment.as_ref())
         .await
         .map_err(internal)?;
     let sender_username = ctx
@@ -120,6 +130,7 @@ pub async fn send_message(
             sender_id: user_id,
             sender_username,
             ciphertext_b64: ciphertext_b64.to_string(),
+            attachment,
             sent_at: Utc::now(),
         },
     })
@@ -168,6 +179,12 @@ pub async fn list_messages(
             sender_id: message.sender_id,
             sender_username,
             ciphertext_b64: STANDARD.encode(message.ciphertext),
+            attachment: message.attachment.map(|attachment| AttachmentPayload {
+                file_id: attachment.file_id,
+                filename: attachment.filename,
+                size_bytes: attachment.size_bytes,
+                mime_type: attachment.mime_type,
+            }),
             sent_at: message.created_at,
         });
     }
@@ -289,7 +306,7 @@ mod tests {
             .add_membership(guild, user, Role::Member, false, true)
             .await
             .expect("membership");
-        let err = send_message(&ctx, user, guild, channel, "b2theA==")
+        let err = send_message(&ctx, user, guild, channel, "b2theA==", None)
             .await
             .expect_err("should fail");
         assert!(matches!(err.code, ErrorCode::Forbidden));
@@ -306,5 +323,52 @@ mod tests {
 
         let members = list_members(&ctx, user, guild).await.expect("members");
         assert!(members.iter().any(|m| m.user_id == bob && m.muted));
+    }
+
+    #[tokio::test]
+    async fn send_and_list_message_with_attachment() {
+        let (ctx, user, guild, channel) = setup().await;
+        let file_id = ctx
+            .storage
+            .store_file_ciphertext(
+                user,
+                guild,
+                channel,
+                b"ciphertext",
+                Some("application/octet-stream"),
+                Some("blob.bin"),
+            )
+            .await
+            .expect("file");
+
+        let event = send_message(
+            &ctx,
+            user,
+            guild,
+            channel,
+            "aGVsbG8=",
+            Some(AttachmentPayload {
+                file_id,
+                filename: "blob.bin".to_string(),
+                size_bytes: 10,
+                mime_type: Some("application/octet-stream".to_string()),
+            }),
+        )
+        .await
+        .expect("send");
+
+        let ServerEvent::MessageReceived { message } = event else {
+            panic!("expected message event");
+        };
+        assert!(message.attachment.is_some());
+
+        let listed = list_messages(&ctx, user, channel, 20, None)
+            .await
+            .expect("list");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            listed[0].attachment.as_ref().expect("attachment").file_id,
+            file_id
+        );
     }
 }

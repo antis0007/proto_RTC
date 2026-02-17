@@ -68,7 +68,18 @@ pub struct MessagePayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sender_username: Option<String>,
     pub ciphertext_b64: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attachment: Option<AttachmentPayload>,
     pub sent_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttachmentPayload {
+    pub file_id: FileId,
+    pub filename: String,
+    pub size_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

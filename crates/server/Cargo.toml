@@ -22,3 +22,6 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 url.workspace = true
 livekit_integration = { path = "../livekit_integration" }
+
+[dev-dependencies]
+tower = "0.5"
