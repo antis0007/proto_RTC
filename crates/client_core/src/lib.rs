@@ -778,6 +778,7 @@ mod tests {
     struct TestMlsSessionManager {
         encrypt_ciphertext: Vec<u8>,
         decrypt_plaintext: Vec<u8>,
+        ciphertext: Vec<u8>,
         fail_with: Option<String>,
     }
 
@@ -806,6 +807,7 @@ mod tests {
                 return Err(anyhow!(err.clone()));
             }
             Ok(self.decrypt_plaintext.clone())
+            Ok(self.ciphertext.clone())
         }
     }
 
@@ -843,6 +845,7 @@ mod tests {
             Arc::new(TestMlsSessionManager {
                 encrypt_ciphertext: b"mls-ciphertext".to_vec(),
                 decrypt_plaintext: Vec::new(),
+                ciphertext: b"mls-ciphertext".to_vec(),
                 fail_with: None,
             }),
         );
@@ -877,6 +880,7 @@ mod tests {
             Arc::new(TestMlsSessionManager {
                 encrypt_ciphertext: Vec::new(),
                 decrypt_plaintext: Vec::new(),
+                ciphertext: Vec::new(),
                 fail_with: Some("group not initialized".to_string()),
             }),
         );
