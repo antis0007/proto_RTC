@@ -1,4 +1,4 @@
-.PHONY: server gui cli tools dev test-local-stack test fmt lint
+.PHONY: server gui cli tools dev test-local-stack pre-e2ee-gate test fmt lint
 
 server:
 	bash scripts/run-server.sh
@@ -16,6 +16,8 @@ dev: server
 
 test-local-stack:
 	bash scripts/test-local-stack.sh
+
+pre-e2ee-gate: test-local-stack
 
 test:
 	cargo test --workspace --all-targets
