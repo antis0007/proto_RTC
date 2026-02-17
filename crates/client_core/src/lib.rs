@@ -12,7 +12,7 @@ use openmls_rust_crypto::OpenMlsRustCrypto;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use shared::{
-    domain::{ChannelId, GuildId, MessageId},
+    domain::{ChannelId, FileId, GuildId, MessageId},
     protocol::{ChannelSummary, ClientRequest, GuildSummary, MessagePayload, ServerEvent},
 };
 use tokio::sync::{broadcast, Mutex};
@@ -154,6 +154,13 @@ pub trait ClientHandle: Send + Sync {
     async fn send_message(&self, text: &str) -> Result<()>;
     async fn create_invite(&self, guild_id: GuildId) -> Result<String>;
     async fn join_with_invite(&self, invite_code: &str) -> Result<()>;
+    async fn upload_file(
+        &self,
+        guild_id: GuildId,
+        channel_id: ChannelId,
+        mime_type: Option<&str>,
+        bytes: Vec<u8>,
+    ) -> Result<FileId>;
     fn subscribe_events(&self) -> broadcast::Receiver<ClientEvent>;
 }
 
@@ -187,6 +194,18 @@ struct SendMessageHttpRequest {
     guild_id: i64,
     channel_id: i64,
     ciphertext_b64: String,
+}
+
+#[derive(Serialize)]
+struct FileUploadQuery {
+    user_id: i64,
+    guild_id: i64,
+    channel_id: i64,
+}
+
+#[derive(Deserialize)]
+struct FileUploadResponse {
+    file_id: i64,
 }
 
 impl<C: CryptoProvider + 'static> RealtimeClient<C> {
@@ -527,6 +546,38 @@ impl<C: CryptoProvider + 'static> ClientHandle for Arc<RealtimeClient<C>> {
         }
 
         Ok(())
+    }
+
+    async fn upload_file(
+        &self,
+        guild_id: GuildId,
+        channel_id: ChannelId,
+        mime_type: Option<&str>,
+        bytes: Vec<u8>,
+    ) -> Result<FileId> {
+        let (server_url, user_id) = self.session().await?;
+        let mut request =
+            self.http
+                .post(format!("{server_url}/files/upload"))
+                .query(&FileUploadQuery {
+                    user_id,
+                    guild_id: guild_id.0,
+                    channel_id: channel_id.0,
+                });
+
+        if let Some(content_type) = mime_type {
+            request = request.header(reqwest::header::CONTENT_TYPE, content_type);
+        }
+
+        let response: FileUploadResponse = request
+            .body(bytes)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+
+        Ok(FileId(response.file_id))
     }
 
     fn subscribe_events(&self) -> broadcast::Receiver<ClientEvent> {

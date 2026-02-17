@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    path::PathBuf,
     thread,
 };
 
@@ -7,11 +8,17 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use client_core::{ClientEvent, ClientHandle, PassthroughCrypto, RealtimeClient};
 use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 use eframe::egui;
+use mime_guess::MimeGuess;
+use rfd::FileDialog;
 use shared::{
-    domain::{ChannelId, ChannelKind, GuildId, MessageId},
-    protocol::{ChannelSummary, GuildSummary, MessagePayload, ServerEvent},
+    domain::{ChannelId, ChannelKind, FileId, GuildId, MessageId},
+    protocol::{
+        ChannelSummary, GuildSummary, MessageAttachment, MessageContent, MessagePayload,
+        ServerEvent,
+    },
 };
 
+#[derive(Clone)]
 enum BackendCommand {
     Login {
         server_url: String,
@@ -32,6 +39,15 @@ enum BackendCommand {
     SendMessage {
         text: String,
     },
+    UploadAttachment {
+        file_path: PathBuf,
+        display_name: String,
+        mime_type: Option<String>,
+        guild_id: GuildId,
+        channel_id: ChannelId,
+    },
+    RetryUpload,
+    CancelUpload,
     CreateInvite {
         guild_id: GuildId,
     },
@@ -45,7 +61,24 @@ enum UiEvent {
     Info(String),
     InviteCreated(String),
     Error(String),
+    UploadState(AttachmentUploadUiState),
+    AttachmentUploaded { file_id: FileId, file_name: String },
     Server(ServerEvent),
+}
+
+#[derive(Debug, Clone)]
+enum AttachmentUploadUiState {
+    Idle,
+    InProgress { file_name: String, progress: f32 },
+    Failed { file_name: String, error: String },
+    Completed { file_name: String },
+}
+
+#[derive(Debug, Clone)]
+struct PendingAttachment {
+    file_name: String,
+    mime_type: Option<String>,
+    file_id: Option<FileId>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,6 +129,8 @@ struct DesktopGuiApp {
     messages: HashMap<ChannelId, Vec<MessagePayload>>,
     message_ids: HashMap<ChannelId, HashSet<MessageId>>,
     status: String,
+    attachment_upload_state: AttachmentUploadUiState,
+    pending_attachment: Option<PendingAttachment>,
     settings_open: bool,
     theme: ThemeSettings,
     applied_theme: Option<ThemeSettings>,
@@ -117,6 +152,8 @@ impl DesktopGuiApp {
             messages: HashMap::new(),
             message_ids: HashMap::new(),
             status: "Not logged in".to_string(),
+            attachment_upload_state: AttachmentUploadUiState::Idle,
+            pending_attachment: None,
             settings_open: false,
             theme: ThemeSettings::discord_default(),
             applied_theme: None,
@@ -134,6 +171,8 @@ impl DesktopGuiApp {
                     self.message_ids.clear();
                     self.selected_guild = None;
                     self.selected_channel = None;
+                    self.pending_attachment = None;
+                    self.attachment_upload_state = AttachmentUploadUiState::Idle;
                     queue_command(&self.cmd_tx, BackendCommand::ListGuilds, &mut self.status);
                 }
                 UiEvent::Info(message) => {
@@ -146,6 +185,34 @@ impl DesktopGuiApp {
                 }
                 UiEvent::Error(err) => {
                     self.status = format!("Error: {err}");
+                }
+                UiEvent::UploadState(upload_state) => {
+                    self.attachment_upload_state = upload_state.clone();
+                    match upload_state {
+                        AttachmentUploadUiState::Idle => {}
+                        AttachmentUploadUiState::InProgress {
+                            file_name,
+                            progress,
+                        } => {
+                            self.status = format!(
+                                "Uploading {file_name}: {:.0}%",
+                                (progress * 100.0).clamp(0.0, 100.0)
+                            );
+                        }
+                        AttachmentUploadUiState::Failed { file_name, error } => {
+                            self.status = format!("Upload failed for {file_name}: {error}");
+                        }
+                        AttachmentUploadUiState::Completed { file_name } => {
+                            self.status = format!("Attachment {file_name} uploaded");
+                        }
+                    }
+                }
+                UiEvent::AttachmentUploaded { file_id, file_name } => {
+                    if let Some(attachment) = &mut self.pending_attachment {
+                        if attachment.file_name == file_name {
+                            attachment.file_id = Some(file_id);
+                        }
+                    }
                 }
                 UiEvent::Server(server_event) => match server_event {
                     ServerEvent::GuildUpdated { guild } => {
@@ -203,6 +270,23 @@ impl DesktopGuiApp {
             .get(&channel_id)
             .and_then(|messages| messages.first())
             .map(|message| message.message_id)
+    }
+
+    fn decode_message_content(message: &MessagePayload) -> MessageContent {
+        let decoded = STANDARD
+            .decode(message.ciphertext_b64.as_bytes())
+            .ok()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .unwrap_or_else(|| "<binary message>".to_string());
+
+        serde_json::from_str::<MessageContent>(&decoded).unwrap_or(MessageContent {
+            text: decoded,
+            attachments: Vec::new(),
+        })
+    }
+
+    fn uploadable_channel_context(&self) -> Option<(GuildId, ChannelId)> {
+        Some((self.selected_guild?, self.selected_channel?))
     }
 
     fn apply_theme_if_needed(&mut self, ctx: &egui::Context) {
@@ -460,12 +544,16 @@ impl eframe::App for DesktopGuiApp {
                 if let Some(channel_id) = self.selected_channel {
                     if let Some(messages) = self.messages.get(&channel_id) {
                         for msg in messages {
-                            let decoded = STANDARD
-                                .decode(msg.ciphertext_b64.as_bytes())
-                                .ok()
-                                .and_then(|bytes| String::from_utf8(bytes).ok())
-                                .unwrap_or_else(|| "<binary message>".to_string());
-                            ui.label(format!("{}: {}", msg.sender_id.0, decoded));
+                            let content = Self::decode_message_content(msg);
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(format!("{}: {}", msg.sender_id.0, content.text));
+                                for attachment in content.attachments {
+                                    ui.label(format!(
+                                        "📎 {} (file #{})",
+                                        attachment.file_name, attachment.file_id.0
+                                    ));
+                                }
+                            });
                         }
                     } else {
                         ui.label("No messages yet");
@@ -476,23 +564,124 @@ impl eframe::App for DesktopGuiApp {
             });
 
             ui.separator();
+            if let Some(attachment) = &self.pending_attachment {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(format!("Pending attachment: {}", attachment.file_name));
+                    if let Some(file_id) = attachment.file_id {
+                        ui.label(format!("uploaded as file #{}", file_id.0));
+                    }
+                });
+            }
+
+            match &self.attachment_upload_state {
+                AttachmentUploadUiState::InProgress {
+                    file_name,
+                    progress,
+                } => {
+                    ui.label(format!(
+                        "Uploading {file_name}: {:.0}%",
+                        (progress * 100.0).clamp(0.0, 100.0)
+                    ));
+                }
+                AttachmentUploadUiState::Failed { file_name, error } => {
+                    ui.label(format!("Upload failed for {file_name}: {error}"));
+                }
+                AttachmentUploadUiState::Completed { file_name } => {
+                    ui.label(format!("Upload completed: {file_name}"));
+                }
+                AttachmentUploadUiState::Idle => {}
+            }
+
             ui.horizontal(|ui| {
                 let response = ui.add(
                     egui::TextEdit::singleline(&mut self.composer)
                         .hint_text("Type a message and press Enter"),
                 );
+                if ui.button("Attach").clicked() {
+                    if let Some((guild_id, channel_id)) = self.uploadable_channel_context() {
+                        if let Some(path) = FileDialog::new().pick_file() {
+                            let display_name = path
+                                .file_name()
+                                .and_then(|name| name.to_str())
+                                .unwrap_or("attachment")
+                                .to_string();
+                            let mime_type =
+                                MimeGuess::from_path(&path).first_raw().map(str::to_string);
+                            self.pending_attachment = Some(PendingAttachment {
+                                file_name: display_name.clone(),
+                                mime_type: mime_type.clone(),
+                                file_id: None,
+                            });
+                            self.attachment_upload_state = AttachmentUploadUiState::InProgress {
+                                file_name: display_name.clone(),
+                                progress: 0.0,
+                            };
+                            queue_command(
+                                &self.cmd_tx,
+                                BackendCommand::UploadAttachment {
+                                    file_path: path,
+                                    display_name,
+                                    mime_type,
+                                    guild_id,
+                                    channel_id,
+                                },
+                                &mut self.status,
+                            );
+                        }
+                    } else {
+                        self.status = "Select a guild and channel before attaching files".into();
+                    }
+                }
+                if matches!(
+                    self.attachment_upload_state,
+                    AttachmentUploadUiState::InProgress { .. }
+                ) && ui.button("Cancel upload").clicked()
+                {
+                    queue_command(&self.cmd_tx, BackendCommand::CancelUpload, &mut self.status);
+                }
+                if matches!(
+                    self.attachment_upload_state,
+                    AttachmentUploadUiState::Failed { .. }
+                ) && ui.button("Retry upload").clicked()
+                {
+                    queue_command(&self.cmd_tx, BackendCommand::RetryUpload, &mut self.status);
+                }
                 let pressed_enter =
                     response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                 let clicked_send = ui.button("Send").clicked();
-                let should_send =
-                    (pressed_enter || clicked_send) && !self.composer.trim().is_empty();
+                let has_uploaded_attachment = self
+                    .pending_attachment
+                    .as_ref()
+                    .and_then(|attachment| attachment.file_id)
+                    .is_some();
+                let should_send = (pressed_enter || clicked_send)
+                    && (!self.composer.trim().is_empty() || has_uploaded_attachment);
                 if should_send {
-                    let text = std::mem::take(&mut self.composer);
+                    let attachments = self
+                        .pending_attachment
+                        .as_ref()
+                        .and_then(|attachment| {
+                            attachment.file_id.map(|file_id| MessageAttachment {
+                                file_id,
+                                file_name: attachment.file_name.clone(),
+                                mime_type: attachment.mime_type.clone(),
+                            })
+                        })
+                        .into_iter()
+                        .collect::<Vec<_>>();
+                    let payload = MessageContent {
+                        text: std::mem::take(&mut self.composer),
+                        attachments,
+                    };
+                    let text =
+                        serde_json::to_string(&payload).unwrap_or_else(|_| payload.text.clone());
                     queue_command(
                         &self.cmd_tx,
                         BackendCommand::SendMessage { text },
                         &mut self.status,
                     );
+                    self.pending_attachment = None;
+                    self.attachment_upload_state = AttachmentUploadUiState::Idle;
                     response.request_focus();
                 }
             });
@@ -511,6 +700,8 @@ fn spawn_backend_thread(cmd_rx: Receiver<BackendCommand>, ui_tx: Sender<UiEvent>
 
         runtime.block_on(async move {
             let client = RealtimeClient::new(PassthroughCrypto);
+            let mut upload_task: Option<tokio::task::JoinHandle<()>> = None;
+            let mut last_upload: Option<BackendCommand> = None;
 
             let mut subscribed = false;
             while let Ok(cmd) = cmd_rx.recv() {
@@ -602,6 +793,163 @@ fn spawn_backend_thread(cmd_rx: Receiver<BackendCommand>, ui_tx: Sender<UiEvent>
                                 let _ = ui_tx.try_send(UiEvent::Error(err.to_string()));
                             }
                         }
+                    }
+                    BackendCommand::UploadAttachment {
+                        file_path,
+                        display_name,
+                        mime_type,
+                        guild_id,
+                        channel_id,
+                    } => {
+                        if let Some(task) = upload_task.take() {
+                            task.abort();
+                        }
+
+                        let retry_file_path = file_path.clone();
+                        let retry_display_name = display_name.clone();
+                        let retry_mime_type = mime_type.clone();
+
+                        let _ = ui_tx.try_send(UiEvent::UploadState(
+                            AttachmentUploadUiState::InProgress {
+                                file_name: display_name.clone(),
+                                progress: 0.05,
+                            },
+                        ));
+
+                        let ui_tx_clone = ui_tx.clone();
+                        let client_clone = client.clone();
+                        let display_name_for_task = display_name.clone();
+                        let mime_for_task = mime_type.clone();
+                        upload_task = Some(tokio::spawn(async move {
+                            match tokio::fs::read(&file_path).await {
+                                Ok(file_bytes) => {
+                                    let _ = ui_tx_clone.try_send(UiEvent::UploadState(
+                                        AttachmentUploadUiState::InProgress {
+                                            file_name: display_name_for_task.clone(),
+                                            progress: 0.4,
+                                        },
+                                    ));
+                                    match client_clone
+                                        .upload_file(
+                                            guild_id,
+                                            channel_id,
+                                            mime_for_task.as_deref(),
+                                            file_bytes,
+                                        )
+                                        .await
+                                    {
+                                        Ok(file_id) => {
+                                            let _ =
+                                                ui_tx_clone.try_send(UiEvent::AttachmentUploaded {
+                                                    file_id,
+                                                    file_name: display_name_for_task.clone(),
+                                                });
+                                            let _ = ui_tx_clone.try_send(UiEvent::UploadState(
+                                                AttachmentUploadUiState::Completed {
+                                                    file_name: display_name_for_task,
+                                                },
+                                            ));
+                                        }
+                                        Err(err) => {
+                                            let _ = ui_tx_clone.try_send(UiEvent::UploadState(
+                                                AttachmentUploadUiState::Failed {
+                                                    file_name: display_name_for_task,
+                                                    error: err.to_string(),
+                                                },
+                                            ));
+                                        }
+                                    }
+                                }
+                                Err(err) => {
+                                    let _ = ui_tx_clone.try_send(UiEvent::UploadState(
+                                        AttachmentUploadUiState::Failed {
+                                            file_name: display_name_for_task,
+                                            error: format!("failed reading local file: {err}"),
+                                        },
+                                    ));
+                                }
+                            }
+                        }));
+
+                        last_upload = Some(BackendCommand::UploadAttachment {
+                            file_path: retry_file_path,
+                            display_name: retry_display_name,
+                            mime_type: retry_mime_type,
+                            guild_id,
+                            channel_id,
+                        });
+                    }
+                    BackendCommand::RetryUpload => {
+                        if let Some(BackendCommand::UploadAttachment {
+                            file_path,
+                            display_name,
+                            mime_type,
+                            guild_id,
+                            channel_id,
+                        }) = last_upload.clone()
+                        {
+                            let _ = ui_tx.try_send(UiEvent::Info("Retrying upload".to_string()));
+                            let _ = ui_tx.try_send(UiEvent::UploadState(
+                                AttachmentUploadUiState::InProgress {
+                                    file_name: display_name.clone(),
+                                    progress: 0.0,
+                                },
+                            ));
+                            if let Some(task) = upload_task.take() {
+                                task.abort();
+                            }
+                            let ui_tx_clone = ui_tx.clone();
+                            let client_clone = client.clone();
+                            upload_task = Some(tokio::spawn(async move {
+                                match tokio::fs::read(&file_path).await {
+                                    Ok(file_bytes) => match client_clone
+                                        .upload_file(
+                                            guild_id,
+                                            channel_id,
+                                            mime_type.as_deref(),
+                                            file_bytes,
+                                        )
+                                        .await
+                                    {
+                                        Ok(file_id) => {
+                                            let _ =
+                                                ui_tx_clone.try_send(UiEvent::AttachmentUploaded {
+                                                    file_id,
+                                                    file_name: display_name.clone(),
+                                                });
+                                            let _ = ui_tx_clone.try_send(UiEvent::UploadState(
+                                                AttachmentUploadUiState::Completed {
+                                                    file_name: display_name,
+                                                },
+                                            ));
+                                        }
+                                        Err(err) => {
+                                            let _ = ui_tx_clone.try_send(UiEvent::UploadState(
+                                                AttachmentUploadUiState::Failed {
+                                                    file_name: display_name,
+                                                    error: err.to_string(),
+                                                },
+                                            ));
+                                        }
+                                    },
+                                    Err(err) => {
+                                        let _ = ui_tx_clone.try_send(UiEvent::UploadState(
+                                            AttachmentUploadUiState::Failed {
+                                                file_name: display_name,
+                                                error: format!("failed reading local file: {err}"),
+                                            },
+                                        ));
+                                    }
+                                }
+                            }));
+                        }
+                    }
+                    BackendCommand::CancelUpload => {
+                        if let Some(task) = upload_task.take() {
+                            task.abort();
+                        }
+                        let _ = ui_tx.try_send(UiEvent::UploadState(AttachmentUploadUiState::Idle));
+                        let _ = ui_tx.try_send(UiEvent::Info("Upload canceled".to_string()));
                     }
                 }
             }
