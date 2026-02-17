@@ -17,6 +17,10 @@ enum BackendCommand {
         server_url: String,
         username: String,
         password_or_invite: String,
+        password: Option<String>,
+        token: Option<String>,
+        remember_me: Option<bool>,
+        auth_action: AuthAction,
     },
     ListGuilds,
     ListChannels {
@@ -50,6 +54,21 @@ enum UiEvent {
     SenderDirectoryUpdated { user_id: i64, username: String },
     Error(String),
     Server(ServerEvent),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthAction {
+    SignIn,
+    CreateAccount,
+}
+
+impl AuthAction {
+    fn label(self) -> &'static str {
+        match self {
+            AuthAction::SignIn => "Sign in",
+            AuthAction::CreateAccount => "Create account",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,6 +113,11 @@ struct DesktopGuiApp {
     server_url: String,
     username: String,
     password_or_invite: String,
+    password: String,
+    auth_token: String,
+    remember_me: bool,
+    auth_action: AuthAction,
+    auth_session_established: bool,
     composer: String,
     guilds: Vec<GuildSummary>,
     channels: Vec<ChannelSummary>,
@@ -124,6 +148,11 @@ impl DesktopGuiApp {
             server_url: "http://127.0.0.1:8443".to_string(),
             username: "alice".to_string(),
             password_or_invite: String::new(),
+            password: String::new(),
+            auth_token: String::new(),
+            remember_me: false,
+            auth_action: AuthAction::SignIn,
+            auth_session_established: false,
             composer: String::new(),
             guilds: Vec::new(),
             channels: Vec::new(),
@@ -145,6 +174,7 @@ impl DesktopGuiApp {
         while let Ok(event) = self.ui_rx.try_recv() {
             match event {
                 UiEvent::LoginOk => {
+                    self.auth_session_established = true;
                     self.view_state = AppViewState::Main;
                     self.status = "Logged in - syncing guilds".to_string();
                     self.guilds.clear();
@@ -169,6 +199,7 @@ impl DesktopGuiApp {
                     self.sender_directory.insert(user_id, username);
                 }
                 UiEvent::Error(err) => {
+                    self.auth_session_established = false;
                     self.status = format!("Error: {err}");
                 }
                 UiEvent::Server(server_event) => match server_event {
@@ -385,6 +416,31 @@ impl DesktopGuiApp {
                 ui.text_edit_singleline(&mut self.server_url);
                 ui.label("Username:");
                 ui.text_edit_singleline(&mut self.username);
+                ui.label("Invite (legacy):");
+                ui.text_edit_singleline(&mut self.password_or_invite);
+            });
+
+            ui.horizontal(|ui| {
+                ui.selectable_value(
+                    &mut self.auth_action,
+                    AuthAction::SignIn,
+                    AuthAction::SignIn.label(),
+                );
+                ui.selectable_value(
+                    &mut self.auth_action,
+                    AuthAction::CreateAccount,
+                    AuthAction::CreateAccount.label(),
+                );
+                ui.separator();
+                ui.label("Password:");
+                ui.add(egui::TextEdit::singleline(&mut self.password).password(true));
+                ui.label("Token:");
+                ui.add(egui::TextEdit::singleline(&mut self.auth_token));
+                ui.checkbox(&mut self.remember_me, "Remember me");
+
+                let action_label = self.auth_action.label();
+                if ui.button(action_label).clicked() {
+                    self.auth_session_established = false;
             });
 
             ui.horizontal_wrapped(|ui| {
@@ -398,11 +454,42 @@ impl DesktopGuiApp {
                             server_url: self.server_url.clone(),
                             username: self.username.clone(),
                             password_or_invite: self.password_or_invite.clone(),
+                            password: (!self.password.trim().is_empty())
+                                .then(|| self.password.clone()),
+                            token: (!self.auth_token.trim().is_empty())
+                                .then(|| self.auth_token.clone()),
+                            remember_me: self.remember_me.then_some(true),
+                            auth_action: self.auth_action,
                         },
                         &mut self.status,
                     );
                 }
 
+                if ui.button("Refresh Guilds").clicked() {
+                    queue_command(&self.cmd_tx, BackendCommand::ListGuilds, &mut self.status);
+                }
+                if ui.button("Join Invite").clicked() {
+                    let invite_code = self.password_or_invite.trim().to_string();
+                    if invite_code.is_empty() {
+                        self.status = "Enter an invite code first".to_string();
+                    } else {
+                        queue_command(
+                            &self.cmd_tx,
+                            BackendCommand::JoinWithInvite { invite_code },
+                            &mut self.status,
+                        );
+                    }
+                }
+            });
+
+            if self.password.trim().is_empty() && self.auth_token.trim().is_empty() {
+                ui.colored_label(
+                    egui::Color32::YELLOW,
+                    "Legacy username-only mode active. Password/token auth is reserved for upcoming secure auth backend work.",
+                );
+            }
+
+            ui.label(&self.status);
                 let constrained = ui.available_width() < 220.0;
                 if constrained {
                     ui.menu_button("⋯ More", |ui| {
@@ -459,15 +546,36 @@ impl DesktopGuiApp {
         egui::SidePanel::left("guilds_panel")
             .default_width(140.0)
             .show(ctx, |ui| {
-                ui.heading("Guilds");
-                if let Some(guild_id) = self.selected_guild {
-                    if ui.button("Create Invite").clicked() {
-                        queue_command(
-                            &self.cmd_tx,
-                            BackendCommand::CreateInvite { guild_id },
-                            &mut self.status,
-                        );
+                ui.add_enabled_ui(self.auth_session_established, |ui| {
+                    ui.heading("Guilds");
+                    if let Some(guild_id) = self.selected_guild {
+                        if ui.button("Create Invite").clicked() {
+                            queue_command(
+                                &self.cmd_tx,
+                                BackendCommand::CreateInvite { guild_id },
+                                &mut self.status,
+                            );
+                        }
                     }
+                    for guild in &self.guilds {
+                        let selected = self.selected_guild == Some(guild.guild_id);
+                        if ui.selectable_label(selected, &guild.name).clicked() {
+                            self.selected_guild = Some(guild.guild_id);
+                            self.selected_channel = None;
+                            self.channels.clear();
+                            queue_command(
+                                &self.cmd_tx,
+                                BackendCommand::ListChannels {
+                                    guild_id: guild.guild_id,
+                                },
+                                &mut self.status,
+                            );
+                        }
+                    }
+                });
+                if !self.auth_session_established {
+                    ui.separator();
+                    ui.label("Sign in or create an account to access guilds.");
                 }
                 for guild in &self.guilds {
                     let selected = self.selected_guild == Some(guild.guild_id);
@@ -526,15 +634,40 @@ impl DesktopGuiApp {
         egui::SidePanel::left("channels_panel")
             .default_width(220.0)
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.heading("Channels");
-                    if ui.button("Refresh").clicked() {
-                        if let Some(guild_id) = self.selected_guild {
+                ui.add_enabled_ui(self.auth_session_established, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.heading("Channels");
+                        if ui.button("Refresh").clicked() {
+                            if let Some(guild_id) = self.selected_guild {
+                                queue_command(
+                                    &self.cmd_tx,
+                                    BackendCommand::ListChannels { guild_id },
+                                    &mut self.status,
+                                );
+                            } else {
+                                self.status = "Select a guild first".to_string();
+                            }
+                        }
+                    });
+                    for channel in &self.channels {
+                        let icon = match channel.kind {
+                            ChannelKind::Text => "#",
+                            ChannelKind::Voice => "🔊",
+                        };
+                        let label = format!("{icon} {}", channel.name);
+                        let selected = self.selected_channel == Some(channel.channel_id);
+                        if ui.selectable_label(selected, label).clicked() {
+                            self.selected_channel = Some(channel.channel_id);
                             queue_command(
                                 &self.cmd_tx,
-                                BackendCommand::ListChannels { guild_id },
+                                BackendCommand::SelectChannel {
+                                    channel_id: channel.channel_id,
+                                },
                                 &mut self.status,
                             );
+                        }
+                    }
+                });
                             queue_command(
                                 &self.cmd_tx,
                                 BackendCommand::ListMembers { guild_id },
@@ -688,18 +821,63 @@ impl DesktopGuiApp {
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading("Messages");
-                if let Some(channel_id) = self.selected_channel {
-                    if ui.button("Load older").clicked() {
-                        if let Some(before) = self.oldest_message_id(channel_id) {
-                            queue_command(
-                                &self.cmd_tx,
-                                BackendCommand::LoadMoreMessages { channel_id, before },
-                                &mut self.status,
-                            );
+            ui.add_enabled_ui(self.auth_session_established, |ui| {
+                ui.horizontal(|ui| {
+                    ui.heading("Messages");
+                    if let Some(channel_id) = self.selected_channel {
+                        if ui.button("Load older").clicked() {
+                            if let Some(before) = self.oldest_message_id(channel_id) {
+                                queue_command(
+                                    &self.cmd_tx,
+                                    BackendCommand::LoadMoreMessages { channel_id, before },
+                                    &mut self.status,
+                                );
+                            }
                         }
                     }
+                });
+                ui.separator();
+
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    if let Some(channel_id) = self.selected_channel {
+                        if let Some(messages) = self.messages.get(&channel_id) {
+                            for msg in messages {
+                                let decoded = STANDARD
+                                    .decode(msg.ciphertext_b64.as_bytes())
+                                    .ok()
+                                    .and_then(|bytes| String::from_utf8(bytes).ok())
+                                    .unwrap_or_else(|| "<binary message>".to_string());
+                                ui.label(format!("{}: {}", msg.sender_id.0, decoded));
+                            }
+                        } else {
+                            ui.label("No messages yet");
+                        }
+                    } else {
+                        ui.label("Select a channel");
+                    }
+                });
+
+                ui.separator();
+                ui.horizontal(|ui| {
+                    let response = ui.add(
+                        egui::TextEdit::singleline(&mut self.composer)
+                            .hint_text("Type a message and press Enter"),
+                    );
+                    let pressed_enter =
+                        response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    let clicked_send = ui.button("Send").clicked();
+                    let should_send =
+                        (pressed_enter || clicked_send) && !self.composer.trim().is_empty();
+                    if should_send {
+                        let text = std::mem::take(&mut self.composer);
+                        queue_command(
+                            &self.cmd_tx,
+                            BackendCommand::SendMessage { text },
+                            &mut self.status,
+                        );
+                        response.request_focus();
+                    }
+                });
                 }
             });
             ui.separator();
@@ -748,6 +926,14 @@ impl DesktopGuiApp {
                     );
                 }
             });
+
+            if !self.auth_session_established {
+                ui.separator();
+                ui.colored_label(
+                    egui::Color32::YELLOW,
+                    "Chat is disabled until an authenticated session is established.",
+                );
+            }
         });
     }
 }
@@ -833,11 +1019,17 @@ fn spawn_backend_thread(cmd_rx: Receiver<BackendCommand>, ui_tx: Sender<UiEvent>
                         server_url,
                         username,
                         password_or_invite,
+                        password,
+                        token,
+                        remember_me: _remember_me,
+                        auth_action: _auth_action,
                     } => {
-                        match client
-                            .login(&server_url, &username, &password_or_invite)
-                            .await
-                        {
+                        let credential = password
+                            .as_deref()
+                            .filter(|value| !value.trim().is_empty())
+                            .or_else(|| token.as_deref().filter(|value| !value.trim().is_empty()))
+                            .unwrap_or(password_or_invite.as_str());
+                        match client.login(&server_url, &username, credential).await {
                             Ok(()) => {
                                 if !subscribed {
                                     subscribed = true;
