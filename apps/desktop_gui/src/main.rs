@@ -7,6 +7,7 @@ use std::{
     time::SystemTime,
 };
 
+use arboard::{Clipboard, ImageData};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use client_core::{AttachmentUpload, ClientEvent, ClientHandle, PassthroughCrypto, RealtimeClient};
 use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
@@ -76,6 +77,7 @@ enum UiEvent {
     AttachmentPreviewLoaded {
         file_id: FileId,
         image: PreviewImage,
+        original_bytes: Vec<u8>,
     },
     AttachmentPreviewFailed {
         file_id: FileId,
@@ -96,6 +98,7 @@ enum AttachmentPreviewState {
     Loading,
     Ready {
         image: PreviewImage,
+        original_bytes: Vec<u8>,
         texture: Option<egui::TextureHandle>,
     },
     Error(String),
@@ -312,6 +315,7 @@ enum AttachmentPreview {
     Image {
         texture: TextureHandle,
         size: egui::Vec2,
+        preview_png: Vec<u8>,
     },
     DecodeFailed,
 }
@@ -416,11 +420,16 @@ impl DesktopGuiApp {
                     self.auth_session_established = false;
                     self.status = format!("Error: {err}");
                 }
-                UiEvent::AttachmentPreviewLoaded { file_id, image } => {
+                UiEvent::AttachmentPreviewLoaded {
+                    file_id,
+                    image,
+                    original_bytes,
+                } => {
                     self.attachment_previews.insert(
                         file_id,
                         AttachmentPreviewState::Ready {
                             image,
+                            original_bytes,
                             texture: None,
                         },
                     );
@@ -756,9 +765,11 @@ impl DesktopGuiApp {
             color_image,
             egui::TextureOptions::LINEAR,
         );
+        let preview_png = encode_rgba_png(rgba.as_raw(), w, h).unwrap_or_default();
         let preview = AttachmentPreview::Image {
             texture,
             size: egui::vec2(w as f32, h as f32),
+            preview_png,
         };
         self.attachment_preview_cache
             .insert(cache_key, preview.clone());
@@ -768,6 +779,134 @@ impl DesktopGuiApp {
     fn attachment_size_text(path: &std::path::Path) -> String {
         let bytes = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
         human_readable_bytes(bytes)
+    }
+
+    fn copy_image_to_clipboard(&mut self, bytes: &[u8], label: &str) {
+        match decode_image_for_clipboard(bytes)
+            .and_then(|(rgba, width, height)| write_clipboard_image(&rgba, width, height))
+        {
+            Ok(()) => self.status = format!("Copied {label} to clipboard"),
+            Err(err) => self.status = format!("Failed to copy {label}: {err}"),
+        }
+    }
+
+    fn save_image_bytes_as(&mut self, bytes: &[u8], suggested_name: &str) {
+        if let Some(path) = rfd::FileDialog::new()
+            .set_file_name(suggested_name)
+            .save_file()
+        {
+            match fs::write(&path, bytes) {
+                Ok(()) => {
+                    self.status = format!("Saved image to {}", path.display());
+                }
+                Err(err) => {
+                    self.status = format!("Failed to save image: {err}");
+                }
+            }
+        }
+    }
+
+    fn open_file_in_external_viewer(&mut self, path: &std::path::Path) {
+        #[cfg(target_os = "windows")]
+        let result = std::process::Command::new("cmd")
+            .args(["/C", "start", "", &path.to_string_lossy()])
+            .spawn();
+
+        #[cfg(target_os = "macos")]
+        let result = std::process::Command::new("open").arg(path).spawn();
+
+        #[cfg(all(unix, not(target_os = "macos")))]
+        let result = std::process::Command::new("xdg-open").arg(path).spawn();
+
+        if let Err(err) = result {
+            self.status = format!("Failed to open external viewer: {err}");
+        }
+    }
+
+    fn render_image_context_menu(
+        &mut self,
+        ui: &mut egui::Ui,
+        file_name: &str,
+        full_bytes: Option<&[u8]>,
+        preview_bytes: Option<&[u8]>,
+        external_path: Option<&std::path::Path>,
+        metadata: Option<&str>,
+    ) {
+        ui.set_min_width(260.0);
+        ui.label(egui::RichText::new("Image actions").strong());
+        ui.small("Full quality uses original bytes. Preview quality uses the rendered thumbnail.");
+        ui.separator();
+
+        let copy_full = ui
+            .add_enabled(
+                full_bytes.is_some(),
+                egui::Button::new("Copy image (full quality)"),
+            )
+            .on_hover_text("Best quality; may not be available yet if bytes are still loading.")
+            .clicked();
+        if copy_full {
+            if let Some(bytes) = full_bytes {
+                self.copy_image_to_clipboard(bytes, "full-quality image");
+            }
+            ui.close_menu();
+        }
+
+        let copy_preview = ui
+            .add_enabled(
+                preview_bytes.is_some(),
+                egui::Button::new("Copy image (preview quality)"),
+            )
+            .on_hover_text("Copies the downscaled preview exactly as shown in chat.")
+            .clicked();
+        if copy_preview {
+            if let Some(bytes) = preview_bytes {
+                self.copy_image_to_clipboard(bytes, "preview image");
+            }
+            ui.close_menu();
+        }
+
+        let save_full = ui
+            .add_enabled(full_bytes.is_some(), egui::Button::new("Save image as…"))
+            .on_hover_text("Saves original bytes when available.")
+            .clicked();
+        if save_full {
+            if let Some(bytes) = full_bytes {
+                self.save_image_bytes_as(bytes, file_name);
+            }
+            ui.close_menu();
+        }
+
+        let open_external = ui
+            .add_enabled(
+                external_path.is_some(),
+                egui::Button::new("Open image in external viewer"),
+            )
+            .on_hover_text("Uses your platform default image viewer.")
+            .clicked();
+        if open_external {
+            if let Some(path) = external_path {
+                self.open_file_in_external_viewer(path);
+            }
+            ui.close_menu();
+        }
+
+        ui.separator();
+        if ui.button("Copy file name").clicked() {
+            ui.ctx().copy_text(file_name.to_string());
+            self.status = "Copied file name to clipboard".to_string();
+            ui.close_menu();
+        }
+
+        if ui
+            .add_enabled(metadata.is_some(), egui::Button::new("Copy metadata"))
+            .clicked()
+        {
+            if let Some(text) = metadata {
+                ui.ctx().copy_text(text.to_string());
+                self.status = "Copied image metadata to clipboard".to_string();
+            }
+            ui.close_menu();
+        }
     }
 
     fn show_main_workspace(&mut self, ctx: &egui::Context) {
@@ -1153,16 +1292,31 @@ impl DesktopGuiApp {
                             .unwrap_or("attachment");
                         let size_text = Self::attachment_size_text(&path);
                         match self.load_attachment_preview(ctx, &path) {
-                            Some(AttachmentPreview::Image { texture, size }) => {
+                            Some(AttachmentPreview::Image {
+                                texture,
+                                size,
+                                preview_png,
+                            }) => {
                                 egui::Frame::group(ui.style()).show(ui, |ui| {
                                     ui.horizontal(|ui| {
                                         ui.label(format!("🖼 {file_name}"));
                                         ui.small(size_text.clone());
                                     });
-                                    ui.add(
+                                    let response = ui.add(
                                         egui::Image::new((texture.id(), size))
                                             .max_size(egui::vec2(240.0, 240.0)),
                                     );
+                                    let metadata = format!("name: {file_name}\nsize: {size_text}");
+                                    response.context_menu(|ui| {
+                                        self.render_image_context_menu(
+                                            ui,
+                                            file_name,
+                                            fs::read(&path).ok().as_deref(),
+                                            Some(preview_png.as_slice()),
+                                            Some(path.as_path()),
+                                            Some(&metadata),
+                                        );
+                                    });
                                 });
                             }
                             Some(AttachmentPreview::DecodeFailed) => {
@@ -1345,7 +1499,11 @@ impl DesktopGuiApp {
                 );
                 self.render_attachment_download_row(ui, attachment);
             }
-            AttachmentPreviewState::Ready { image, texture } => {
+            AttachmentPreviewState::Ready {
+                image,
+                original_bytes,
+                texture,
+            } => {
                 if texture.is_none() {
                     let color_image = egui::ColorImage::from_rgba_unmultiplied(
                         [image.width, image.height],
@@ -1358,28 +1516,55 @@ impl DesktopGuiApp {
                     ));
                 }
 
-                if let Some(texture) = texture.as_ref() {
+                let texture_handle = texture.as_ref().cloned();
+                let preview_image = image.clone();
+                let full_bytes = original_bytes.clone();
+
+                if let Some(texture) = texture_handle {
                     let max_width = (ui.available_width() * 0.75).clamp(120.0, 360.0);
                     let mut preview_size = texture.size_vec2();
                     if preview_size.x > max_width {
                         preview_size *= max_width / preview_size.x;
                     }
                     preview_size.y = preview_size.y.min(240.0);
-                    let clicked = ui
+                    let response = ui
                         .add(
                             egui::ImageButton::new(
-                                egui::Image::new(texture).fit_to_exact_size(preview_size),
+                                egui::Image::new(&texture).fit_to_exact_size(preview_size),
                             )
                             .frame(false),
                         )
-                        .on_hover_text(format!(
-                            "Open full preview ({})",
-                            human_readable_bytes(attachment.size_bytes)
-                        ))
-                        .clicked();
-                    if clicked {
+                        .on_hover_text(
+                            "Left click to open large preview · Right click for actions",
+                        );
+                    if response.clicked() {
                         self.expanded_preview = Some(attachment.file_id);
                     }
+
+                    let preview_bytes = encode_rgba_png(
+                        &preview_image.rgba,
+                        preview_image.width,
+                        preview_image.height,
+                    )
+                    .ok();
+                    let metadata = format!(
+                        "name: {}\nsize: {} bytes\npreview: {}x{}",
+                        attachment.filename,
+                        attachment.size_bytes,
+                        preview_image.width,
+                        preview_image.height
+                    );
+                    response.context_menu(|ui| {
+                        self.render_image_context_menu(
+                            ui,
+                            &attachment.filename,
+                            Some(full_bytes.as_slice()),
+                            preview_bytes.as_deref(),
+                            None,
+                            Some(&metadata),
+                        );
+                    });
+
                     ui.small(format!(
                         "🖼 {} ({})",
                         attachment.filename,
@@ -1489,6 +1674,38 @@ fn is_image_filename(filename: &str) -> bool {
             )
         })
         .unwrap_or(false)
+}
+
+fn encode_rgba_png(rgba: &[u8], width: usize, height: usize) -> Result<Vec<u8>, String> {
+    let image = image::RgbaImage::from_raw(width as u32, height as u32, rgba.to_vec())
+        .ok_or_else(|| "invalid RGBA buffer".to_string())?;
+    let dynamic = image::DynamicImage::ImageRgba8(image);
+    let mut out = std::io::Cursor::new(Vec::new());
+    dynamic
+        .write_to(&mut out, image::ImageFormat::Png)
+        .map_err(|err| err.to_string())?;
+    Ok(out.into_inner())
+}
+
+fn decode_image_for_clipboard(bytes: &[u8]) -> Result<(Vec<u8>, usize, usize), String> {
+    let decoded = image::load_from_memory(bytes).map_err(|err| err.to_string())?;
+    let rgba = decoded.to_rgba8();
+    Ok((
+        rgba.as_raw().to_vec(),
+        rgba.width() as usize,
+        rgba.height() as usize,
+    ))
+}
+
+fn write_clipboard_image(rgba: &[u8], width: usize, height: usize) -> Result<(), String> {
+    let mut clipboard = Clipboard::new().map_err(|err| err.to_string())?;
+    clipboard
+        .set_image(ImageData {
+            width,
+            height,
+            bytes: std::borrow::Cow::Owned(rgba.to_vec()),
+        })
+        .map_err(|err| err.to_string())
 }
 
 fn decode_preview_image(bytes: &[u8]) -> Result<PreviewImage, String> {
@@ -1710,6 +1927,7 @@ fn spawn_backend_thread(cmd_rx: Receiver<BackendCommand>, ui_tx: Sender<UiEvent>
                                     let _ = ui_tx.try_send(UiEvent::AttachmentPreviewLoaded {
                                         file_id,
                                         image,
+                                        original_bytes: bytes,
                                     });
                                 }
                                 Err(err) => {
