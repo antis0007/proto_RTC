@@ -50,12 +50,7 @@ async fn onboarding_welcome_ciphertext_and_one_time_consumption_acceptance() {
         .expect("add bob");
     let welcome_for_bob = welcome_for_bob.expect("welcome exists for bob");
     storage
-        .insert_pending_welcome(
-            guild,
-            channel,
-            bob,
-            &welcome_for_bob,
-        )
+        .insert_pending_welcome(guild, channel, bob, &welcome_for_bob)
         .await
         .expect("store welcome");
 
