@@ -25,10 +25,18 @@ enum BackendCommand {
     SendMessage {
         text: String,
     },
+    CreateInvite {
+        guild_id: GuildId,
+    },
+    JoinWithInvite {
+        invite_code: String,
+    },
 }
 
 enum UiEvent {
     LoginOk,
+    Info(String),
+    InviteCreated(String),
     Error(String),
     Server(ServerEvent),
 }
@@ -90,7 +98,7 @@ impl DesktopGuiApp {
         Self {
             cmd_tx,
             ui_rx,
-            server_url: "http://127.0.0.1:8080".to_string(),
+            server_url: "http://127.0.0.1:8443".to_string(),
             username: "alice".to_string(),
             password_or_invite: String::new(),
             composer: String::new(),
@@ -113,13 +121,31 @@ impl DesktopGuiApp {
                     self.status = "Logged in".to_string();
                     queue_command(&self.cmd_tx, BackendCommand::ListGuilds, &mut self.status);
                 }
+                UiEvent::Info(message) => {
+                    self.status = message;
+                }
+                UiEvent::InviteCreated(invite_code) => {
+                    self.password_or_invite = invite_code;
+                    self.status =
+                        "Invite code created; share this code with another user".to_string();
+                }
                 UiEvent::Error(err) => {
                     self.status = format!("Error: {err}");
                 }
                 UiEvent::Server(server_event) => match server_event {
                     ServerEvent::GuildUpdated { guild } => {
-                        if !self.guilds.iter().any(|g| g.guild_id == guild.guild_id) {
+                        let guild_id = guild.guild_id;
+                        if !self.guilds.iter().any(|g| g.guild_id == guild_id) {
                             self.guilds.push(guild);
+                        }
+                        if self.selected_guild.is_none() {
+                            self.selected_guild = Some(guild_id);
+                            self.channels.clear();
+                            queue_command(
+                                &self.cmd_tx,
+                                BackendCommand::ListChannels { guild_id },
+                                &mut self.status,
+                            );
                         }
                     }
                     ServerEvent::ChannelUpdated { channel } => {
@@ -282,6 +308,21 @@ impl eframe::App for DesktopGuiApp {
                         &mut self.status,
                     );
                 }
+                if ui.button("Refresh Guilds").clicked() {
+                    queue_command(&self.cmd_tx, BackendCommand::ListGuilds, &mut self.status);
+                }
+                if ui.button("Join Invite").clicked() {
+                    let invite_code = self.password_or_invite.trim().to_string();
+                    if invite_code.is_empty() {
+                        self.status = "Enter an invite code first".to_string();
+                    } else {
+                        queue_command(
+                            &self.cmd_tx,
+                            BackendCommand::JoinWithInvite { invite_code },
+                            &mut self.status,
+                        );
+                    }
+                }
             });
             ui.label(&self.status);
         });
@@ -292,6 +333,15 @@ impl eframe::App for DesktopGuiApp {
             .default_width(140.0)
             .show(ctx, |ui| {
                 ui.heading("Guilds");
+                if let Some(guild_id) = self.selected_guild {
+                    if ui.button("Create Invite").clicked() {
+                        queue_command(
+                            &self.cmd_tx,
+                            BackendCommand::CreateInvite { guild_id },
+                            &mut self.status,
+                        );
+                    }
+                }
                 for guild in &self.guilds {
                     let selected = self.selected_guild == Some(guild.guild_id);
                     if ui.selectable_label(selected, &guild.name).clicked() {
@@ -311,7 +361,20 @@ impl eframe::App for DesktopGuiApp {
         egui::SidePanel::left("channels_panel")
             .default_width(220.0)
             .show(ctx, |ui| {
-                ui.heading("Channels");
+                ui.horizontal(|ui| {
+                    ui.heading("Channels");
+                    if ui.button("Refresh").clicked() {
+                        if let Some(guild_id) = self.selected_guild {
+                            queue_command(
+                                &self.cmd_tx,
+                                BackendCommand::ListChannels { guild_id },
+                                &mut self.status,
+                            );
+                        } else {
+                            self.status = "Select a guild first".to_string();
+                        }
+                    }
+                });
                 for channel in &self.channels {
                     let icon = match channel.kind {
                         ChannelKind::Text => "#",
@@ -411,7 +474,6 @@ fn spawn_backend_thread(cmd_rx: Receiver<BackendCommand>, ui_tx: Sender<UiEvent>
                             .await
                         {
                             Ok(()) => {
-                                let _ = ui_tx.try_send(UiEvent::LoginOk);
                                 if !subscribed {
                                     subscribed = true;
                                     let mut events = client.subscribe_events();
@@ -426,6 +488,13 @@ fn spawn_backend_thread(cmd_rx: Receiver<BackendCommand>, ui_tx: Sender<UiEvent>
                                         }
                                     });
                                 }
+                                let invite_code = password_or_invite.trim().to_string();
+                                if !invite_code.is_empty() {
+                                    if let Err(err) = client.join_with_invite(&invite_code).await {
+                                        let _ = ui_tx.try_send(UiEvent::Error(err.to_string()));
+                                    }
+                                }
+                                let _ = ui_tx.try_send(UiEvent::LoginOk);
                             }
                             Err(err) => {
                                 let _ = ui_tx.try_send(UiEvent::Error(err.to_string()));
@@ -450,6 +519,31 @@ fn spawn_backend_thread(cmd_rx: Receiver<BackendCommand>, ui_tx: Sender<UiEvent>
                     BackendCommand::SendMessage { text } => {
                         if let Err(err) = client.send_message(&text).await {
                             let _ = ui_tx.try_send(UiEvent::Error(err.to_string()));
+                        }
+                    }
+                    BackendCommand::CreateInvite { guild_id } => {
+                        match client.create_invite(guild_id).await {
+                            Ok(invite_code) => {
+                                let _ = ui_tx.try_send(UiEvent::InviteCreated(invite_code));
+                            }
+                            Err(err) => {
+                                let _ = ui_tx.try_send(UiEvent::Error(err.to_string()));
+                            }
+                        }
+                    }
+                    BackendCommand::JoinWithInvite { invite_code } => {
+                        match client.join_with_invite(&invite_code).await {
+                            Ok(()) => {
+                                let _ = ui_tx.try_send(UiEvent::Info(
+                                    "Joined guild from invite".to_string(),
+                                ));
+                                if let Err(err) = client.list_guilds().await {
+                                    let _ = ui_tx.try_send(UiEvent::Error(err.to_string()));
+                                }
+                            }
+                            Err(err) => {
+                                let _ = ui_tx.try_send(UiEvent::Error(err.to_string()));
+                            }
                         }
                     }
                 }

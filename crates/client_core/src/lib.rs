@@ -48,6 +48,17 @@ struct LoginResponse {
     user_id: i64,
 }
 
+#[derive(Debug, Serialize)]
+struct JoinGuildRequest {
+    user_id: i64,
+    invite_code: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct InviteResponse {
+    invite_code: String,
+}
+
 pub struct CommunityClient<C: CryptoProvider> {
     http: Client,
     server_url: String,
@@ -118,6 +129,8 @@ pub trait ClientHandle: Send + Sync {
     async fn list_channels(&self, guild_id: GuildId) -> Result<()>;
     async fn select_channel(&self, channel_id: ChannelId) -> Result<()>;
     async fn send_message(&self, text: &str) -> Result<()>;
+    async fn create_invite(&self, guild_id: GuildId) -> Result<String>;
+    async fn join_with_invite(&self, invite_code: &str) -> Result<()>;
     fn subscribe_events(&self) -> broadcast::Receiver<ClientEvent>;
 }
 
@@ -329,6 +342,34 @@ impl<C: CryptoProvider + 'static> ClientHandle for Arc<RealtimeClient<C>> {
         self.http
             .post(format!("{server_url}/messages"))
             .json(&payload)
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
+    async fn create_invite(&self, guild_id: GuildId) -> Result<String> {
+        let (server_url, user_id) = self.session().await?;
+        let response: InviteResponse = self
+            .http
+            .post(format!("{server_url}/guilds/{}/invites", guild_id.0))
+            .query(&[("user_id", user_id)])
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok(response.invite_code)
+    }
+
+    async fn join_with_invite(&self, invite_code: &str) -> Result<()> {
+        let (server_url, user_id) = self.session().await?;
+        self.http
+            .post(format!("{server_url}/guilds/join"))
+            .json(&JoinGuildRequest {
+                user_id,
+                invite_code: invite_code.to_string(),
+            })
             .send()
             .await?
             .error_for_status()?;
