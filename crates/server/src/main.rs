@@ -15,9 +15,10 @@ use base64::{
 use livekit_integration::LiveKitConfig;
 use serde::{Deserialize, Serialize};
 use server_api::{
-    ensure_active_membership_in_channel, list_channels, list_guilds, list_members, list_messages,
-    mls_key_packages_route, mls_welcome_route, send_message, ApiContext, KeyPackageResponse,
-    MlsKeyPackageQuery, MlsWelcomeQuery, MlsWelcomeResponse, UploadKeyPackageResponse,
+    ensure_active_membership_in_channel, ensure_active_membership_in_guild, list_channels,
+    list_guilds, list_members, list_messages, mls_key_packages_route, mls_welcome_route,
+    send_message, ApiContext, KeyPackageResponse, MlsKeyPackageQuery, MlsWelcomeQuery,
+    MlsWelcomeResponse, UploadKeyPackageResponse,
 };
 use shared::{
     domain::{ChannelId, ChannelKind, FileId, GuildId, UserId},
@@ -116,13 +117,23 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt().with_env_filter("info").init();
 
     let settings = load_settings();
-    let database_url = prepare_database_url(&settings.database_url)?;
+    if settings.server_bind.trim().is_empty() {
+        anyhow::bail!("SERVER_BIND / bind_addr must not be empty");
+    }
+    let database_url = prepare_database_url(&settings.database_url).map_err(|error| {
+        error!(raw_database_url = %settings.database_url, %error, "database url preparation failed");
+        error
+    })?;
     let storage = Storage::new(&database_url).await.map_err(|error| {
         error!(
             %database_url,
             %error,
             "failed to open SQLite database; verify parent directory exists and permissions are correct"
         );
+        error
+    })?;
+    storage.health_check().await.map_err(|error| {
+        error!(%database_url, %error, "database health check failed after initialization");
         error
     })?;
     let api = ApiContext {
@@ -138,7 +149,21 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState { api, events };
     let app = build_router(Arc::new(state));
 
-    let addr: SocketAddr = settings.server_bind.parse()?;
+    for route in [
+        "/healthz",
+        "/messages",
+        "/channels/:channel_id/messages",
+        "/files/upload",
+        "/files/:file_id",
+        mls_welcome_route(),
+    ] {
+        info!(%route, "route registered");
+    }
+
+    let addr: SocketAddr = settings.server_bind.parse().map_err(|error| {
+        error!(server_bind = %settings.server_bind, %error, "invalid server bind address");
+        error
+    })?;
     info!(%addr, "server listening");
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
@@ -166,8 +191,30 @@ fn build_router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
-async fn healthz() -> &'static str {
-    "ok"
+fn api_error_status(error: &ApiError) -> StatusCode {
+    match error.code {
+        ErrorCode::Unauthorized => StatusCode::UNAUTHORIZED,
+        ErrorCode::Forbidden => StatusCode::FORBIDDEN,
+        ErrorCode::NotFound => StatusCode::NOT_FOUND,
+        ErrorCode::Validation => StatusCode::BAD_REQUEST,
+        ErrorCode::RateLimited => StatusCode::TOO_MANY_REQUESTS,
+        ErrorCode::Internal => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+async fn healthz(
+    State(state): State<Arc<AppState>>,
+) -> Result<&'static str, (StatusCode, Json<ApiError>)> {
+    state.api.storage.health_check().await.map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError::new(
+                ErrorCode::Internal,
+                format!("storage health check failed: {error}"),
+            )),
+        )
+    })?;
+    Ok("ok")
 }
 
 async fn login(
@@ -274,23 +321,14 @@ async fn upload_file(
         }
     }
 
-    state
-        .api
-        .storage
-        .membership_status(GuildId(q.guild_id), UserId(q.user_id))
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiError::new(ErrorCode::Internal, e.to_string())),
-            )
-        })?
-        .ok_or_else(|| {
-            (
-                StatusCode::FORBIDDEN,
-                Json(ApiError::new(ErrorCode::Forbidden, "user is not a member")),
-            )
-        })?;
+    ensure_active_membership_in_channel(
+        &state.api,
+        UserId(q.user_id),
+        GuildId(q.guild_id),
+        ChannelId(q.channel_id),
+    )
+    .await
+    .map_err(|error| (api_error_status(&error), Json(error)))?;
 
     let channel_guild = state
         .api
@@ -367,23 +405,9 @@ async fn download_file(
                 Json(ApiError::new(ErrorCode::NotFound, "file not found")),
             )
         })?;
-    state
-        .api
-        .storage
-        .membership_status(file.guild_id, UserId(q.user_id))
+    ensure_active_membership_in_guild(&state.api, UserId(q.user_id), file.guild_id)
         .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiError::new(ErrorCode::Internal, e.to_string())),
-            )
-        })?
-        .ok_or_else(|| {
-            (
-                StatusCode::FORBIDDEN,
-                Json(ApiError::new(ErrorCode::Forbidden, "user is not a member")),
-            )
-        })?;
+        .map_err(|error| (api_error_status(&error), Json(error)))?;
 
     let mut headers = HeaderMap::new();
     let content_type = file
@@ -493,7 +517,7 @@ async fn fetch_pending_welcome(
         ChannelId(q.channel_id),
     )
     .await
-    .map_err(|e| (StatusCode::BAD_REQUEST, Json(e)))?;
+    .map_err(|error| (api_error_status(&error), Json(error)))?;
 
     let welcome_bytes = state
         .api
@@ -540,7 +564,7 @@ async fn store_pending_welcome(
         ChannelId(q.channel_id),
     )
     .await
-    .map_err(|e| (StatusCode::BAD_REQUEST, Json(e)))?;
+    .map_err(|error| (api_error_status(&error), Json(error)))?;
 
     ensure_active_membership_in_channel(
         &state.api,
@@ -549,7 +573,7 @@ async fn store_pending_welcome(
         ChannelId(q.channel_id),
     )
     .await
-    .map_err(|e| (StatusCode::BAD_REQUEST, Json(e)))?;
+    .map_err(|error| (api_error_status(&error), Json(error)))?;
 
     state
         .api
@@ -613,7 +637,7 @@ async fn http_list_guilds(
 ) -> Result<Json<Vec<shared::protocol::GuildSummary>>, (StatusCode, Json<ApiError>)> {
     let guilds = list_guilds(&state.api, UserId(q.user_id))
         .await
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(e)))?;
+        .map_err(|error| (api_error_status(&error), Json(error)))?;
     Ok(Json(guilds))
 }
 
@@ -624,7 +648,7 @@ async fn http_list_channels(
 ) -> Result<Json<Vec<shared::protocol::ChannelSummary>>, (StatusCode, Json<ApiError>)> {
     let channels = list_channels(&state.api, UserId(q.user_id), GuildId(guild_id))
         .await
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(e)))?;
+        .map_err(|error| (api_error_status(&error), Json(error)))?;
     Ok(Json(channels))
 }
 
@@ -635,7 +659,7 @@ async fn http_list_members(
 ) -> Result<Json<Vec<shared::protocol::MemberSummary>>, (StatusCode, Json<ApiError>)> {
     let members = list_members(&state.api, UserId(q.user_id), GuildId(guild_id))
         .await
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(e)))?;
+        .map_err(|error| (api_error_status(&error), Json(error)))?;
     Ok(Json(members))
 }
 
@@ -653,7 +677,7 @@ async fn http_list_messages(
         q.before,
     )
     .await
-    .map_err(|e| (StatusCode::BAD_REQUEST, Json(e)))?;
+    .map_err(|error| (api_error_status(&error), Json(error)))?;
     Ok(Json(messages))
 }
 
@@ -758,7 +782,7 @@ async fn http_send_message(
         req.attachment,
     )
     .await
-    .map_err(|e| (StatusCode::BAD_REQUEST, Json(e)))?;
+    .map_err(|error| (api_error_status(&error), Json(error)))?;
     let _ = state.events.send(event.clone());
     Ok(Json(event))
 }
@@ -795,6 +819,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn healthz_reports_ok_when_storage_is_ready() {
+        let (app, _storage, _user_id, _guild_id, _channel_id) = test_app().await;
+        let request = Request::get("/healthz")
+            .body(Body::empty())
+            .expect("request");
+        let response = app.oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert_eq!(body.as_ref(), b"ok");
+    }
+
+    #[tokio::test]
     async fn file_upload_and_download_requires_membership() {
         let (app, _storage, user_id, guild_id, channel_id) = test_app().await;
         let upload = Request::post(format!(
@@ -810,6 +849,59 @@ mod tests {
             .expect("request");
         let response = app.oneshot(download).await.expect("download response");
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn send_and_fetch_messages_enforce_membership_and_channel_scope() {
+        let (app, storage, user_id, guild_id, channel_id) = test_app().await;
+
+        let send_request = Request::post("/messages")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "user_id": user_id,
+                    "guild_id": guild_id,
+                    "channel_id": channel_id,
+                    "ciphertext_b64": "aGVsbG8=",
+                })
+                .to_string(),
+            ))
+            .expect("request");
+        let send_response = app.clone().oneshot(send_request).await.expect("response");
+        assert_eq!(send_response.status(), StatusCode::OK);
+
+        let list_request = Request::get(format!(
+            "/channels/{channel_id}/messages?user_id={user_id}&limit=10"
+        ))
+        .body(Body::empty())
+        .expect("request");
+        let list_response = app.clone().oneshot(list_request).await.expect("response");
+        assert_eq!(list_response.status(), StatusCode::OK);
+
+        let outsider = storage.create_user("outsider").await.expect("user");
+        let outsider_send = Request::post("/messages")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "user_id": outsider.0,
+                    "guild_id": guild_id,
+                    "channel_id": channel_id,
+                    "ciphertext_b64": "aGVsbG8=",
+                })
+                .to_string(),
+            ))
+            .expect("request");
+        let outsider_send_response = app.clone().oneshot(outsider_send).await.expect("response");
+        assert_eq!(outsider_send_response.status(), StatusCode::FORBIDDEN);
+
+        let outsider_list = Request::get(format!(
+            "/channels/{channel_id}/messages?user_id={}&limit=10",
+            outsider.0
+        ))
+        .body(Body::empty())
+        .expect("request");
+        let outsider_list_response = app.oneshot(outsider_list).await.expect("response");
+        assert_eq!(outsider_list_response.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
@@ -928,7 +1020,7 @@ mod tests {
             .oneshot(unauthorized_request)
             .await
             .expect("response");
-        assert_eq!(unauthorized_response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(unauthorized_response.status(), StatusCode::FORBIDDEN);
 
         let authorized_request = Request::get(format!(
             "/mls/welcome?user_id={user_id}&guild_id={guild_id}&channel_id={channel_id}"

@@ -73,6 +73,14 @@ impl Storage {
         &self.pool
     }
 
+    pub async fn health_check(&self) -> Result<()> {
+        let _: i64 = sqlx::query_scalar("SELECT 1")
+            .fetch_one(&self.pool)
+            .await
+            .context("sqlite ping failed")?;
+        Ok(())
+    }
+
     pub async fn create_user(&self, username: &str) -> Result<UserId> {
         let rec = sqlx::query(
             "INSERT INTO users (username) VALUES (?)
@@ -609,6 +617,12 @@ mod tests {
             .expect("guild list");
         assert_eq!(guilds.len(), 1);
         assert_eq!(guilds[0].0, guild);
+    }
+
+    #[tokio::test]
+    async fn health_check_succeeds_for_live_pool() {
+        let storage = Storage::new("sqlite::memory:").await.expect("db");
+        storage.health_check().await.expect("health check");
     }
 
     #[tokio::test]
