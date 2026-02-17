@@ -230,7 +230,7 @@ where
         &self,
         options: LiveKitRoomOptions,
     ) -> Result<Arc<dyn LiveKitRoomSession>> {
-        self.connect(options).await.map_err(Into::into)
+        self.connect(options).await
     }
 }
 
