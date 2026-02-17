@@ -33,7 +33,11 @@ impl Storage {
     }
 
     pub async fn create_user(&self, username: &str) -> Result<UserId> {
-        let rec = sqlx::query("INSERT INTO users (username) VALUES (?) RETURNING id")
+        let rec = sqlx::query(
+            "INSERT INTO users (username) VALUES (?)
+             ON CONFLICT(username) DO UPDATE SET username=excluded.username
+             RETURNING id",
+        )
             .bind(username)
             .fetch_one(&self.pool)
             .await?;

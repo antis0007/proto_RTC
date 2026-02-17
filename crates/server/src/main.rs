@@ -9,10 +9,11 @@ use axum::{
     Json, Router,
 };
 use livekit_integration::LiveKitConfig;
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::{Deserialize, Serialize};
 use server_api::{list_channels, list_guilds, send_message, ApiContext};
 use shared::{
-    domain::{ChannelId, FileId, GuildId, UserId},
+    domain::{ChannelId, ChannelKind, FileId, GuildId, UserId},
     error::{ApiError, ErrorCode},
     protocol::ServerEvent,
 };
@@ -58,6 +59,17 @@ struct UserQuery {
 }
 
 #[derive(Debug, Deserialize)]
+struct JoinGuildRequest {
+    user_id: i64,
+    invite_code: String,
+}
+
+#[derive(Debug, Serialize)]
+struct InviteResponse {
+    invite_code: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct SendMessageRequest {
     user_id: i64,
     guild_id: i64,
@@ -95,6 +107,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/login", post(login))
         .route("/guilds", get(http_list_guilds))
         .route("/guilds/:guild_id/channels", get(http_list_channels))
+        .route("/guilds/:guild_id/invites", post(http_create_invite))
+        .route("/guilds/join", post(http_join_guild))
         .route("/messages", post(http_send_message))
         .route("/files/upload", post(upload_file))
         .route("/files/:file_id", get(download_file))
@@ -127,6 +141,44 @@ async fn login(
                 Json(ApiError::new(ErrorCode::Validation, e.to_string())),
             )
         })?;
+
+    let guilds = state
+        .api
+        .storage
+        .list_guilds_for_user(user_id)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError::new(ErrorCode::Internal, e.to_string())),
+            )
+        })?;
+
+    if guilds.is_empty() {
+        let guild_id = state
+            .api
+            .storage
+            .create_guild("General", user_id)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ApiError::new(ErrorCode::Internal, e.to_string())),
+                )
+            })?;
+
+        state
+            .api
+            .storage
+            .create_channel(guild_id, "general", ChannelKind::Text)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ApiError::new(ErrorCode::Internal, e.to_string())),
+                )
+            })?;
+    }
 
     Ok(Json(LoginResponse { user_id: user_id.0 }))
 }
@@ -235,6 +287,81 @@ async fn http_list_channels(
         .await
         .map_err(|e| (StatusCode::BAD_REQUEST, Json(e)))?;
     Ok(Json(channels))
+}
+
+async fn http_create_invite(
+    State(state): State<Arc<AppState>>,
+    Path(guild_id): Path<i64>,
+    Query(q): Query<UserQuery>,
+) -> Result<Json<InviteResponse>, (StatusCode, Json<ApiError>)> {
+    let guild_id = GuildId(guild_id);
+    let user_id = UserId(q.user_id);
+    state
+        .api
+        .storage
+        .membership_status(guild_id, user_id)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError::new(ErrorCode::Internal, e.to_string())),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::FORBIDDEN,
+                Json(ApiError::new(ErrorCode::Forbidden, "user is not a member")),
+            )
+        })?;
+
+    let payload = format!("guild:{}", guild_id.0);
+    let invite_code = URL_SAFE_NO_PAD.encode(payload.as_bytes());
+    Ok(Json(InviteResponse { invite_code }))
+}
+
+async fn http_join_guild(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<JoinGuildRequest>,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    let decoded = URL_SAFE_NO_PAD
+        .decode(req.invite_code.as_bytes())
+        .map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ApiError::new(ErrorCode::Validation, "invalid invite code")),
+            )
+        })?;
+    let decoded_text = String::from_utf8(decoded).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ApiError::new(ErrorCode::Validation, "invalid invite code")),
+        )
+    })?;
+
+    let guild_id = decoded_text
+        .strip_prefix("guild:")
+        .and_then(|id| id.parse::<i64>().ok())
+        .map(GuildId)
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ApiError::new(ErrorCode::Validation, "invalid invite code")),
+            )
+        })?;
+
+    state
+        .api
+        .storage
+        .add_membership(guild_id, UserId(req.user_id), shared::domain::Role::Member, false, false)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError::new(ErrorCode::Internal, e.to_string())),
+            )
+        })?;
+
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn http_send_message(
