@@ -2466,22 +2466,6 @@ fn spawn_backend_thread(cmd_rx: Receiver<BackendCommand>, ui_tx: Sender<UiEvent>
                     return;
                 }
             };
-            if let Err(err) = std::fs::create_dir_all(&base) {
-                let _ = ui_tx.try_send(UiEvent::Error(UiError::from_message(
-                    UiErrorContext::BackendStartup,
-                    format!(
-                        "backend worker startup failure: failed to create MLS state directory '{}': {err}",
-                        base.display()
-                    ),
-                )));
-                tracing::error!(
-                    "failed to create MLS state directory '{}': {err}",
-                    base.display()
-                );
-                return;
-            }
-            let mls_db_url = DurableMlsSessionManager::sqlite_url_for_gui_data_dir(&base);
-
             let attempted = attempted_dir_strategy.join(" -> ");
             if let Err(err) = std::fs::create_dir_all(&mls_state_dir) {
                 let _ = ui_tx.try_send(UiEvent::Error(UiError::from_message(
