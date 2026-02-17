@@ -8,7 +8,10 @@ use std::{
 };
 
 use arboard::{Clipboard, ImageData};
-use client_core::{AttachmentUpload, ClientEvent, ClientHandle, PassthroughCrypto, RealtimeClient};
+use client_core::{
+    AttachmentUpload, ClientEvent, ClientHandle, PassthroughCrypto, RealtimeClient,
+    VoiceConnectOptions, VoiceParticipantState, VoiceSessionSnapshot,
+};
 use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 use eframe::egui;
 use egui::TextureHandle;
@@ -62,6 +65,11 @@ enum BackendCommand {
     JoinWithInvite {
         invite_code: String,
     },
+    ConnectVoice {
+        guild_id: GuildId,
+        channel_id: ChannelId,
+    },
+    DisconnectVoice,
 }
 
 enum UiEvent {
@@ -87,6 +95,70 @@ enum UiEvent {
         message: MessagePayload,
         plaintext: String,
     },
+    VoiceSessionStateChanged(Option<VoiceSessionSnapshot>),
+    VoiceParticipantsUpdated {
+        guild_id: GuildId,
+        channel_id: ChannelId,
+        participants: Vec<VoiceParticipantState>,
+    },
+    VoiceOperationFailed(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VoiceSessionConnectionStatus {
+    Idle,
+    Connecting,
+    Connected,
+    Disconnecting,
+    Error,
+}
+
+#[derive(Debug, Clone)]
+struct VoiceSessionUiState {
+    selected_voice_channel: Option<ChannelId>,
+    active_session: Option<VoiceSessionSnapshot>,
+    participants_by_channel: HashMap<ChannelId, Vec<VoiceParticipantState>>,
+    connection_status: VoiceSessionConnectionStatus,
+    muted: bool,
+    deafened: bool,
+    screen_share_enabled: bool,
+    last_error: Option<String>,
+}
+
+impl VoiceSessionUiState {
+    fn new() -> Self {
+        Self {
+            selected_voice_channel: None,
+            active_session: None,
+            participants_by_channel: HashMap::new(),
+            connection_status: VoiceSessionConnectionStatus::Idle,
+            muted: false,
+            deafened: false,
+            screen_share_enabled: false,
+            last_error: None,
+        }
+    }
+
+    fn occupancy_for_channel(&self, channel_id: ChannelId) -> usize {
+        self.participants_by_channel
+            .get(&channel_id)
+            .map(|participants| participants.len())
+            .unwrap_or(0)
+    }
+
+    fn active_participant_count(&self) -> usize {
+        self.active_session
+            .as_ref()
+            .map(|snapshot| self.occupancy_for_channel(snapshot.channel_id))
+            .unwrap_or(0)
+    }
+
+    fn is_channel_connected(&self, channel_id: ChannelId) -> bool {
+        self.active_session
+            .as_ref()
+            .map(|session| session.channel_id == channel_id)
+            .unwrap_or(false)
+    }
 }
 
 #[derive(Clone)]
@@ -312,6 +384,7 @@ struct DesktopGuiApp {
     sender_directory: HashMap<i64, String>,
     attachment_previews: HashMap<FileId, AttachmentPreviewState>,
     expanded_preview: Option<FileId>,
+    voice_ui: VoiceSessionUiState,
     settings_open: bool,
     view_state: AppViewState,
     theme: ThemeSettings,
@@ -387,6 +460,7 @@ impl DesktopGuiApp {
             sender_directory: HashMap::new(),
             attachment_previews: HashMap::new(),
             expanded_preview: None,
+            voice_ui: VoiceSessionUiState::new(),
             settings_open: false,
             view_state: AppViewState::Login,
             theme,
@@ -413,6 +487,7 @@ impl DesktopGuiApp {
                     self.sender_directory.clear();
                     self.attachment_previews.clear();
                     self.expanded_preview = None;
+                    self.voice_ui = VoiceSessionUiState::new();
                     queue_command(&self.cmd_tx, BackendCommand::ListGuilds, &mut self.status);
                 }
                 UiEvent::Info(message) => {
@@ -429,6 +504,37 @@ impl DesktopGuiApp {
                 UiEvent::Error(err) => {
                     self.auth_session_established = false;
                     self.status = format!("Error: {err}");
+                }
+                UiEvent::VoiceOperationFailed(err) => {
+                    self.voice_ui.connection_status = VoiceSessionConnectionStatus::Error;
+                    self.voice_ui.last_error = Some(err.clone());
+                    self.status = format!("Voice error: {err}");
+                }
+                UiEvent::VoiceSessionStateChanged(snapshot) => match snapshot {
+                    Some(active) => {
+                        self.voice_ui.connection_status = VoiceSessionConnectionStatus::Connected;
+                        self.voice_ui.selected_voice_channel = Some(active.channel_id);
+                        self.voice_ui.active_session = Some(active);
+                        self.voice_ui.last_error = None;
+                    }
+                    None => {
+                        self.voice_ui.connection_status = VoiceSessionConnectionStatus::Idle;
+                        self.voice_ui.active_session = None;
+                        self.voice_ui.muted = false;
+                        self.voice_ui.deafened = false;
+                        self.voice_ui.screen_share_enabled = false;
+                    }
+                },
+                UiEvent::VoiceParticipantsUpdated {
+                    guild_id,
+                    channel_id,
+                    participants,
+                } => {
+                    if self.selected_guild == Some(guild_id) {
+                        self.voice_ui
+                            .participants_by_channel
+                            .insert(channel_id, participants);
+                    }
                 }
                 UiEvent::AttachmentPreviewLoaded {
                     file_id,
@@ -524,6 +630,25 @@ impl DesktopGuiApp {
             .get(&channel_id)
             .and_then(|messages| messages.first())
             .map(|message| message.wire.message_id)
+    }
+
+    fn selected_voice_channel(&self) -> Option<&ChannelSummary> {
+        let channel_id = self.voice_ui.selected_voice_channel?;
+        self.channels
+            .iter()
+            .find(|channel| channel.channel_id == channel_id && channel.kind == ChannelKind::Voice)
+    }
+
+    fn voice_status_badge(&self) -> (&'static str, egui::Color32) {
+        match self.voice_ui.connection_status {
+            VoiceSessionConnectionStatus::Idle => ("idle", egui::Color32::GRAY),
+            VoiceSessionConnectionStatus::Connecting => ("connecting", egui::Color32::YELLOW),
+            VoiceSessionConnectionStatus::Connected => ("connected", egui::Color32::GREEN),
+            VoiceSessionConnectionStatus::Disconnecting => {
+                ("disconnecting", egui::Color32::LIGHT_BLUE)
+            }
+            VoiceSessionConnectionStatus::Error => ("error", egui::Color32::RED),
+        }
     }
 
     fn apply_theme_if_needed(&mut self, ctx: &egui::Context) {
@@ -1172,6 +1297,17 @@ impl DesktopGuiApp {
                         } else {
                             egui::Stroke::NONE
                         };
+                        let occupancy = if channel.kind == ChannelKind::Voice {
+                            Some(self.voice_ui.occupancy_for_channel(channel.channel_id))
+                        } else {
+                            None
+                        };
+                        let connection_hint =
+                            if self.voice_ui.is_channel_connected(channel.channel_id) {
+                                Some("connected")
+                            } else {
+                                None
+                            };
 
                         let response = egui::Frame::none()
                             .fill(row_fill)
@@ -1184,13 +1320,22 @@ impl DesktopGuiApp {
                                         [18.0, 18.0],
                                         egui::Label::new(egui::RichText::new(icon).monospace()),
                                     );
-                                    ui.selectable_label(selected, &channel.name)
+                                    let _ = ui.selectable_label(selected, &channel.name);
+                                    if let Some(count) = occupancy {
+                                        ui.label(format!("({count})"));
+                                        if let Some(hint) = connection_hint {
+                                            ui.small(hint);
+                                        }
+                                    }
                                 })
-                                .inner
+                                .response
                             })
                             .inner;
                         if response.clicked() {
                             self.selected_channel = Some(channel.channel_id);
+                            if channel.kind == ChannelKind::Voice {
+                                self.voice_ui.selected_voice_channel = Some(channel.channel_id);
+                            }
                             queue_command(
                                 &self.cmd_tx,
                                 BackendCommand::SelectChannel {
@@ -1200,6 +1345,39 @@ impl DesktopGuiApp {
                             );
                         }
                         ui.add_space(4.0);
+                    }
+
+                    if let Some(channel) = self.selected_voice_channel().cloned() {
+                        ui.separator();
+                        let connected_here = self.voice_ui.is_channel_connected(channel.channel_id);
+                        let cta_label = if connected_here {
+                            "Leave voice"
+                        } else {
+                            "Join voice"
+                        };
+                        if ui.button(cta_label).clicked() {
+                            if connected_here {
+                                self.voice_ui.connection_status =
+                                    VoiceSessionConnectionStatus::Disconnecting;
+                                queue_command(
+                                    &self.cmd_tx,
+                                    BackendCommand::DisconnectVoice,
+                                    &mut self.status,
+                                );
+                            } else {
+                                self.voice_ui.connection_status =
+                                    VoiceSessionConnectionStatus::Connecting;
+                                self.voice_ui.last_error = None;
+                                queue_command(
+                                    &self.cmd_tx,
+                                    BackendCommand::ConnectVoice {
+                                        guild_id: channel.guild_id,
+                                        channel_id: channel.channel_id,
+                                    },
+                                    &mut self.status,
+                                );
+                            }
+                        }
                     }
                 });
 
@@ -1252,7 +1430,41 @@ impl DesktopGuiApp {
 
                 ui.separator();
                 ui.heading("Voice");
-                ui.label("No participants");
+                let (badge_text, badge_color) = self.voice_status_badge();
+                ui.colored_label(badge_color, format!("Status: {badge_text}"));
+
+                if let Some(channel) = self.selected_voice_channel() {
+                    ui.label(format!("Selected: {}", channel.name));
+                    ui.small(format!(
+                        "Occupancy: {} participant(s)",
+                        self.voice_ui.occupancy_for_channel(channel.channel_id)
+                    ));
+                }
+
+                if let Some(active) = &self.voice_ui.active_session {
+                    let active_name = self
+                        .channels
+                        .iter()
+                        .find(|channel| channel.channel_id == active.channel_id)
+                        .map(|channel| channel.name.as_str())
+                        .unwrap_or("Unknown voice channel");
+                    ui.label(format!("Connected channel: {active_name}"));
+                    ui.label(format!(
+                        "Participants: {}",
+                        self.voice_ui.active_participant_count()
+                    ));
+                    ui.horizontal_wrapped(|ui| {
+                        ui.toggle_value(&mut self.voice_ui.muted, "Mute");
+                        ui.toggle_value(&mut self.voice_ui.deafened, "Deafen");
+                        ui.toggle_value(&mut self.voice_ui.screen_share_enabled, "Screen share");
+                    });
+                } else {
+                    ui.label("Not connected to voice.");
+                }
+
+                if let Some(err) = &self.voice_ui.last_error {
+                    ui.colored_label(egui::Color32::RED, format!("Last voice error: {err}"));
+                }
             });
 
         egui::TopBottomPanel::bottom("composer_panel")
@@ -1861,16 +2073,18 @@ fn spawn_backend_thread(cmd_rx: Receiver<BackendCommand>, ui_tx: Sender<UiEvent>
                                                 } => {
                                                     UiEvent::MessageDecrypted { message, plaintext }
                                                 }
-                                                ClientEvent::VoiceSessionStateChanged(_) => {
-                                                    UiEvent::Info(
-                                                        "Voice session state changed".to_string(),
-                                                    )
+                                                ClientEvent::VoiceSessionStateChanged(snapshot) => {
+                                                    UiEvent::VoiceSessionStateChanged(snapshot)
                                                 }
                                                 ClientEvent::VoiceParticipantsUpdated {
-                                                    ..
-                                                } => UiEvent::Info(
-                                                    "Voice participants updated".to_string(),
-                                                ),
+                                                    guild_id,
+                                                    channel_id,
+                                                    participants,
+                                                } => UiEvent::VoiceParticipantsUpdated {
+                                                    guild_id,
+                                                    channel_id,
+                                                    participants,
+                                                },
                                                 ClientEvent::Error(err) => UiEvent::Error(err),
                                             };
                                             let _ = ui_tx_clone.try_send(evt);
@@ -2022,6 +2236,27 @@ fn spawn_backend_thread(cmd_rx: Receiver<BackendCommand>, ui_tx: Sender<UiEvent>
                             Err(err) => {
                                 let _ = ui_tx.try_send(UiEvent::Error(err.to_string()));
                             }
+                        }
+                    }
+                    BackendCommand::ConnectVoice {
+                        guild_id,
+                        channel_id,
+                    } => {
+                        if let Err(err) = client
+                            .connect_voice_session(VoiceConnectOptions {
+                                guild_id,
+                                channel_id,
+                                can_publish_mic: true,
+                                can_publish_screen: true,
+                            })
+                            .await
+                        {
+                            let _ = ui_tx.try_send(UiEvent::VoiceOperationFailed(err.to_string()));
+                        }
+                    }
+                    BackendCommand::DisconnectVoice => {
+                        if let Err(err) = client.disconnect_voice_session().await {
+                            let _ = ui_tx.try_send(UiEvent::VoiceOperationFailed(err.to_string()));
                         }
                     }
                 }
