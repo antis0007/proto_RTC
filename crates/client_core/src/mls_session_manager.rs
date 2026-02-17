@@ -46,9 +46,7 @@ impl DurableMlsSessionManager {
     async fn load_or_create_identity(&self) -> Result<MlsIdentity> {
         // Identity persistence is delegated to OpenMLS' internal storage snapshot.
         // We keep a stable credential label for fresh group creation.
-        MlsIdentity::new_with_name(
-            format!("user:{}:{}", self.user_id, self.device_id).into_bytes(),
-        )
+        MlsIdentity::new_with_name(format!("user:{}:{}", self.user_id, self.device_id).into_bytes())
     }
 
     async fn key_for_channel(&self, channel_id: ChannelId) -> Result<SessionKey> {
