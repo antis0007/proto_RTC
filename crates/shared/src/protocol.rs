@@ -97,6 +97,15 @@ pub struct MemberSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemberSummary {
+    pub guild_id: GuildId,
+    pub user_id: UserId,
+    pub username: String,
+    pub role: Role,
+    pub muted: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum ServerEvent {
     GuildUpdated {

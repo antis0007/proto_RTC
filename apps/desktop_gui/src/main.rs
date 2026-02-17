@@ -113,6 +113,21 @@ impl AuthAction {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthAction {
+    SignIn,
+    CreateAccount,
+}
+
+impl AuthAction {
+    fn label(self) -> &'static str {
+        match self {
+            AuthAction::SignIn => "Sign in",
+            AuthAction::CreateAccount => "Create account",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ThemePreset {
     DiscordDark,
     AtomOneDark,
