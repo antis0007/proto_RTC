@@ -47,6 +47,81 @@ Implement end-to-end encryption for text messages per `(guild_id, channel_id)` u
 ## Task 3 — Server endpoint for pending Welcome retrieval
 **Files:** `crates/server/src/main.rs`, `crates/server_api/src/lib.rs`
 
+### MVP contract (normative)
+
+#### Endpoint shape
+- **Method/Path:** `GET /mls/welcome`
+- **Required query params:**
+  - `user_id` (u64)
+  - `guild_id` (u64)
+  - `channel_id` (u64)
+
+#### Authorization and access checks
+- Request is **membership-gated**:
+  - requester must be the same principal as `user_id` (or equivalent authenticated identity binding).
+  - requester must be an active (non-banned) member of `guild_id`.
+  - requester must be authorized for `channel_id` within that guild.
+- If any authorization check fails, return `403 Forbidden`.
+
+#### Success response schema (`200 OK`)
+- JSON object:
+  - `guild_id: u64`
+  - `channel_id: u64`
+  - `user_id: u64`
+  - `welcome_b64: string` (base64-encoded MLS Welcome bytes)
+  - `consumed_at: string (RFC3339 UTC timestamp)`
+- `consumed_at` represents the server-side timestamp from the same transactional read that consumed the pending record.
+- For MVP, prefer `consumed_at` over a boolean `consumed`; it is unambiguous and auditable.
+
+#### Not-found behavior (`404 Not Found`)
+- Return `404` when no unconsumed pending Welcome exists for the exact tuple `(guild_id, channel_id, user_id)`.
+- This includes first-time miss and already-consumed cases (idempotent from client perspective: “no pending welcome now”).
+
+#### One-time consumption rule
+- Retrieval must be **load + mark consumed in one transaction**.
+- Exactly one successful `GET` may return a given pending Welcome.
+- Concurrent reads for the same tuple must not produce duplicate successful consumptions.
+
+#### Realtime hint event scope
+- `ServerEvent::MlsWelcomeAvailable { guild_id, channel_id }` is **out of MVP required scope**.
+- It may be added as an optimization later; polling `GET /mls/welcome` is the MVP bootstrap mechanism.
+
+#### Response examples
+
+Success (`200 OK`):
+
+```json
+{
+  "guild_id": 42,
+  "channel_id": 9001,
+  "user_id": 1007,
+  "welcome_b64": "AAECAwQF...",
+  "consumed_at": "2026-01-10T14:52:11Z"
+}
+```
+
+No pending welcome (`404 Not Found`):
+
+```json
+{
+  "error": {
+    "code": "not_found",
+    "message": "no pending welcome"
+  }
+}
+```
+
+Authorization failure (`403 Forbidden`):
+
+```json
+{
+  "error": {
+    "code": "forbidden",
+    "message": "user is not authorized for requested guild/channel"
+  }
+}
+```
+
 1. Add endpoint:
    - `GET /mls/welcome?user_id=...&guild_id=...&channel_id=...`
 2. Authorization:
