@@ -13,7 +13,9 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use shared::{
     domain::{ChannelId, GuildId, MessageId},
-    protocol::{ChannelSummary, ClientRequest, GuildSummary, MessagePayload, ServerEvent},
+    protocol::{
+        ChannelSummary, ClientRequest, GuildSummary, MemberSummary, MessagePayload, ServerEvent,
+    },
 };
 use tokio::sync::{broadcast, Mutex};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
@@ -144,6 +146,7 @@ pub trait ClientHandle: Send + Sync {
         -> Result<()>;
     async fn list_guilds(&self) -> Result<()>;
     async fn list_channels(&self, guild_id: GuildId) -> Result<()>;
+    async fn list_members(&self, guild_id: GuildId) -> Result<Vec<MemberSummary>>;
     async fn select_channel(&self, channel_id: ChannelId) -> Result<()>;
     async fn fetch_messages(
         &self,
@@ -411,7 +414,32 @@ impl<C: CryptoProvider + 'static> ClientHandle for Arc<RealtimeClient<C>> {
                 .events
                 .send(ClientEvent::Server(ServerEvent::ChannelUpdated { channel }));
         }
+
+        self.list_members(guild_id).await?;
         Ok(())
+    }
+
+    async fn list_members(&self, guild_id: GuildId) -> Result<Vec<MemberSummary>> {
+        let (server_url, user_id) = self.session().await?;
+
+        let members: Vec<MemberSummary> = self
+            .http
+            .get(format!("{server_url}/guilds/{}/members", guild_id.0))
+            .query(&[("user_id", user_id)])
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+
+        let _ = self
+            .events
+            .send(ClientEvent::Server(ServerEvent::GuildMembersUpdated {
+                guild_id,
+                members: members.clone(),
+            }));
+
+        Ok(members)
     }
 
     async fn select_channel(&self, channel_id: ChannelId) -> Result<()> {

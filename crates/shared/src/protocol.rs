@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    domain::{ChannelId, ChannelKind, FileId, GuildId, MessageId, UserId},
+    domain::{ChannelId, ChannelKind, FileId, GuildId, MessageId, Role, UserId},
     error::ApiError,
 };
 
@@ -70,6 +70,15 @@ pub struct MessagePayload {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemberSummary {
+    pub guild_id: GuildId,
+    pub user_id: UserId,
+    pub username: String,
+    pub role: Role,
+    pub muted: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum ServerEvent {
     GuildUpdated {
@@ -77,6 +86,10 @@ pub enum ServerEvent {
     },
     ChannelUpdated {
         channel: ChannelSummary,
+    },
+    GuildMembersUpdated {
+        guild_id: GuildId,
+        members: Vec<MemberSummary>,
     },
     MessageReceived {
         message: MessagePayload,
