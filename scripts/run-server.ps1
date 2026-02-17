@@ -1,4 +1,6 @@
 param(
+  [string]$BindIp,
+  [int]$Port,
   [Parameter(ValueFromRemainingArguments = $true)]
   [string[]]$ExtraArgs
 )
@@ -17,10 +19,18 @@ if (Test-Path '.env') {
     if ($_ -notmatch '^\s*#' -and $_ -notmatch '^\s*$') {
       $parts = $_ -split '=', 2
       if ($parts.Count -eq 2) {
-        [System.Environment]::SetEnvironmentVariable($parts[0].Trim(), $parts[1].Trim().Trim('"'), 'Process')
+        $name  = $parts[0].Trim()
+        $value = $parts[1].Trim().Trim('"')
+        Set-Item -Path "Env:$name" -Value $value
       }
     }
   }
+}
+
+if ($PSBoundParameters.ContainsKey('BindIp') -or $PSBoundParameters.ContainsKey('Port')) {
+  $resolvedBindIp = if ($PSBoundParameters.ContainsKey('BindIp')) { $BindIp } else { '127.0.0.1' }
+  $resolvedPort = if ($PSBoundParameters.ContainsKey('Port')) { $Port } else { 8443 }
+  $env:SERVER_BIND = "$resolvedBindIp`:$resolvedPort"
 }
 
 if (-not $env:SERVER_BIND) { $env:SERVER_BIND = '127.0.0.1:8443' }
