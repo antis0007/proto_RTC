@@ -122,7 +122,9 @@ impl<S: MlsStore> MlsGroupHandle<S> {
         &mut self,
         key_package_bytes: &[u8],
     ) -> Result<(Vec<u8>, Option<Vec<u8>>)> {
-        let key_package = KeyPackage::tls_deserialize_exact_bytes(key_package_bytes)?;
+        let key_package = <KeyPackage as TlsDeserializeBytesTrait>::tls_deserialize_exact_bytes(
+            key_package_bytes,
+        )?;
         let provider = &self.provider;
         let signer = &self.identity.signer;
         let group = self
