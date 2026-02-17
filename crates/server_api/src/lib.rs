@@ -4,7 +4,7 @@ use livekit_integration::{mint_token, room_name_for_voice_channel, LiveKitConfig
 use shared::{
     domain::{ChannelId, ChannelKind, GuildId, Role, UserId},
     error::{ApiError, ErrorCode},
-    protocol::{ChannelSummary, GuildSummary, MessagePayload, ServerEvent},
+    protocol::{ChannelSummary, GuildSummary, MemberSummary, MessagePayload, ServerEvent},
 };
 use storage::Storage;
 
@@ -64,6 +64,30 @@ pub async fn list_channels(
         .collect())
 }
 
+pub async fn list_members(
+    ctx: &ApiContext,
+    user_id: UserId,
+    guild_id: GuildId,
+) -> Result<Vec<MemberSummary>, ApiError> {
+    ensure_active_membership(ctx, guild_id, user_id).await?;
+    let members = ctx
+        .storage
+        .list_members_for_guild(guild_id)
+        .await
+        .map_err(internal)?;
+
+    Ok(members
+        .into_iter()
+        .map(|member| MemberSummary {
+            guild_id,
+            user_id: member.user_id,
+            username: member.username,
+            role: member.role,
+            muted: member.muted,
+        })
+        .collect())
+}
+
 pub async fn send_message(
     ctx: &ApiContext,
     user_id: UserId,
@@ -84,11 +108,17 @@ pub async fn send_message(
         .insert_message_ciphertext(channel_id, user_id, &ciphertext)
         .await
         .map_err(internal)?;
+    let sender_username = ctx
+        .storage
+        .username_for_user(user_id)
+        .await
+        .map_err(internal)?;
     Ok(ServerEvent::MessageReceived {
         message: MessagePayload {
             message_id,
             channel_id,
             sender_id: user_id,
+            sender_username,
             ciphertext_b64: ciphertext_b64.to_string(),
             sent_at: Utc::now(),
         },
@@ -116,16 +146,33 @@ pub async fn list_messages(
         .await
         .map_err(internal)?;
 
-    Ok(messages
-        .into_iter()
-        .map(|message| MessagePayload {
+    let mut username_cache: std::collections::HashMap<UserId, Option<String>> =
+        std::collections::HashMap::new();
+    let mut payloads = Vec::with_capacity(messages.len());
+    for message in messages {
+        let sender_username = if let Some(cached) = username_cache.get(&message.sender_id) {
+            cached.clone()
+        } else {
+            let resolved = ctx
+                .storage
+                .username_for_user(message.sender_id)
+                .await
+                .map_err(internal)?;
+            username_cache.insert(message.sender_id, resolved.clone());
+            resolved
+        };
+
+        payloads.push(MessagePayload {
             message_id: message.message_id,
             channel_id: message.channel_id,
             sender_id: message.sender_id,
+            sender_username,
             ciphertext_b64: STANDARD.encode(message.ciphertext),
             sent_at: message.created_at,
-        })
-        .collect())
+        });
+    }
+
+    Ok(payloads)
 }
 
 pub async fn request_livekit_token(
@@ -246,5 +293,18 @@ mod tests {
             .await
             .expect_err("should fail");
         assert!(matches!(err.code, ErrorCode::Forbidden));
+    }
+
+    #[tokio::test]
+    async fn list_members_includes_muted_flag() {
+        let (ctx, user, guild, _) = setup().await;
+        let bob = ctx.storage.create_user("bob").await.expect("user");
+        ctx.storage
+            .add_membership(guild, bob, Role::Member, false, true)
+            .await
+            .expect("membership");
+
+        let members = list_members(&ctx, user, guild).await.expect("members");
+        assert!(members.iter().any(|m| m.user_id == bob && m.muted));
     }
 }
