@@ -467,125 +467,6 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use axum::{extract::State, routing::post, Json, Router};
-    use tokio::{net::TcpListener, sync::oneshot};
-
-    #[derive(Clone)]
-    struct ServerState {
-        tx: Arc<Mutex<Option<oneshot::Sender<SendMessageHttpRequest>>>>,
-    }
-
-    struct TestMlsSessionManager {
-        ciphertext: Vec<u8>,
-        fail_with: Option<String>,
-    }
-
-    #[async_trait]
-    impl MlsSessionManager for TestMlsSessionManager {
-        async fn encrypt_application(
-            &self,
-            _channel_id: ChannelId,
-            plaintext: &[u8],
-        ) -> Result<Vec<u8>> {
-            if let Some(err) = &self.fail_with {
-                return Err(anyhow!(err.clone()));
-            }
-            if plaintext.is_empty() {
-                return Err(anyhow!("plaintext must not be empty"));
-            }
-            Ok(self.ciphertext.clone())
-        }
-    }
-
-    async fn handle_send_message(
-        State(state): State<ServerState>,
-        Json(payload): Json<SendMessageHttpRequest>,
-    ) {
-        if let Some(tx) = state.tx.lock().await.take() {
-            let _ = tx.send(payload);
-        }
-    }
-
-    async fn spawn_message_server() -> Result<(String, oneshot::Receiver<SendMessageHttpRequest>)> {
-        std::env::set_var("NO_PROXY", "127.0.0.1,localhost");
-        let listener = TcpListener::bind("127.0.0.1:0").await?;
-        let addr = listener.local_addr()?;
-        let (tx, rx) = oneshot::channel();
-        let state = ServerState {
-            tx: Arc::new(Mutex::new(Some(tx))),
-        };
-        let app = Router::new()
-            .route("/messages", post(handle_send_message))
-            .with_state(state);
-        tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
-        });
-        Ok((format!("http://{addr}"), rx))
-    }
-
-    #[tokio::test]
-    async fn send_message_uses_mls_ciphertext_payload() {
-        let (server_url, payload_rx) = spawn_message_server().await.expect("spawn server");
-        let client = RealtimeClient::new_with_mls_session_manager(
-            PassthroughCrypto,
-            Arc::new(TestMlsSessionManager {
-                ciphertext: b"mls-ciphertext".to_vec(),
-                fail_with: None,
-            }),
-        );
-
-        {
-            let mut inner = client.inner.lock().await;
-            inner.server_url = Some(server_url);
-            inner.user_id = Some(7);
-            inner.selected_guild = Some(GuildId(11));
-            inner.selected_channel = Some(ChannelId(13));
-        }
-
-        client
-            .send_message("plaintext-message")
-            .await
-            .expect("send");
-
-        let payload = payload_rx.await.expect("payload");
-        let plaintext_b64 = STANDARD.encode("plaintext-message".as_bytes());
-        assert_ne!(payload.ciphertext_b64, plaintext_b64);
-        assert_eq!(
-            payload.ciphertext_b64,
-            STANDARD.encode("mls-ciphertext".as_bytes())
-        );
-    }
-
-    #[tokio::test]
-    async fn send_message_requires_active_mls_state() {
-        let (server_url, _payload_rx) = spawn_message_server().await.expect("spawn server");
-        let client = RealtimeClient::new_with_mls_session_manager(
-            PassthroughCrypto,
-            Arc::new(TestMlsSessionManager {
-                ciphertext: Vec::new(),
-                fail_with: Some("group not initialized".to_string()),
-            }),
-        );
-
-        {
-            let mut inner = client.inner.lock().await;
-            inner.server_url = Some(server_url);
-            inner.user_id = Some(7);
-            inner.selected_guild = Some(GuildId(11));
-            inner.selected_channel = Some(ChannelId(13));
-        }
-
-        let err = client
-            .send_message("plaintext-message")
-            .await
-            .expect_err("must fail");
-        assert!(err.to_string().contains("group not initialized"));
-    }
-}
-
 #[async_trait]
 impl<C: CryptoProvider + 'static> ClientHandle for Arc<RealtimeClient<C>> {
     async fn login(
@@ -828,5 +709,124 @@ impl<C: CryptoProvider + 'static> ClientHandle for Arc<RealtimeClient<C>> {
 
     fn subscribe_events(&self) -> broadcast::Receiver<ClientEvent> {
         self.events.subscribe()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{extract::State, routing::post, Json, Router};
+    use tokio::{net::TcpListener, sync::oneshot};
+
+    #[derive(Clone)]
+    struct ServerState {
+        tx: Arc<Mutex<Option<oneshot::Sender<SendMessageHttpRequest>>>>,
+    }
+
+    struct TestMlsSessionManager {
+        ciphertext: Vec<u8>,
+        fail_with: Option<String>,
+    }
+
+    #[async_trait]
+    impl MlsSessionManager for TestMlsSessionManager {
+        async fn encrypt_application(
+            &self,
+            _channel_id: ChannelId,
+            plaintext: &[u8],
+        ) -> Result<Vec<u8>> {
+            if let Some(err) = &self.fail_with {
+                return Err(anyhow!(err.clone()));
+            }
+            if plaintext.is_empty() {
+                return Err(anyhow!("plaintext must not be empty"));
+            }
+            Ok(self.ciphertext.clone())
+        }
+    }
+
+    async fn handle_send_message(
+        State(state): State<ServerState>,
+        Json(payload): Json<SendMessageHttpRequest>,
+    ) {
+        if let Some(tx) = state.tx.lock().await.take() {
+            let _ = tx.send(payload);
+        }
+    }
+
+    async fn spawn_message_server() -> Result<(String, oneshot::Receiver<SendMessageHttpRequest>)> {
+        std::env::set_var("NO_PROXY", "127.0.0.1,localhost");
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let (tx, rx) = oneshot::channel();
+        let state = ServerState {
+            tx: Arc::new(Mutex::new(Some(tx))),
+        };
+        let app = Router::new()
+            .route("/messages", post(handle_send_message))
+            .with_state(state);
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        Ok((format!("http://{addr}"), rx))
+    }
+
+    #[tokio::test]
+    async fn send_message_uses_mls_ciphertext_payload() {
+        let (server_url, payload_rx) = spawn_message_server().await.expect("spawn server");
+        let client = RealtimeClient::new_with_mls_session_manager(
+            PassthroughCrypto,
+            Arc::new(TestMlsSessionManager {
+                ciphertext: b"mls-ciphertext".to_vec(),
+                fail_with: None,
+            }),
+        );
+
+        {
+            let mut inner = client.inner.lock().await;
+            inner.server_url = Some(server_url);
+            inner.user_id = Some(7);
+            inner.selected_guild = Some(GuildId(11));
+            inner.selected_channel = Some(ChannelId(13));
+        }
+
+        client
+            .send_message("plaintext-message")
+            .await
+            .expect("send");
+
+        let payload = payload_rx.await.expect("payload");
+        let plaintext_b64 = STANDARD.encode("plaintext-message".as_bytes());
+        assert_ne!(payload.ciphertext_b64, plaintext_b64);
+        assert_eq!(
+            payload.ciphertext_b64,
+            STANDARD.encode("mls-ciphertext".as_bytes())
+        );
+    }
+
+    #[tokio::test]
+    async fn send_message_requires_active_mls_state() {
+        let (server_url, _payload_rx) = spawn_message_server().await.expect("spawn server");
+        let client = RealtimeClient::new_with_mls_session_manager(
+            PassthroughCrypto,
+            Arc::new(TestMlsSessionManager {
+                ciphertext: Vec::new(),
+                fail_with: Some("group not initialized".to_string()),
+            }),
+        );
+
+        {
+            let mut inner = client.inner.lock().await;
+            inner.server_url = Some(server_url);
+            inner.user_id = Some(7);
+            inner.selected_guild = Some(GuildId(11));
+            inner.selected_channel = Some(ChannelId(13));
+        }
+
+        let err = client
+            .send_message("plaintext-message")
+            .await
+            .expect_err("must fail");
+        assert!(err.to_string().contains("group not initialized"));
     }
 }
