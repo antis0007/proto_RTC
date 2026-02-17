@@ -1,4 +1,7 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -15,7 +18,7 @@ use shared::{
     domain::{ChannelId, FileId, GuildId, MessageId},
     protocol::{
         AttachmentPayload, ChannelSummary, ClientRequest, GuildSummary, KeyPackageResponse,
-        MemberSummary, MessagePayload, ServerEvent, UploadKeyPackageResponse,
+        MemberSummary, MessagePayload, ServerEvent, UploadKeyPackageResponse, WelcomeResponse,
     },
 };
 use tokio::sync::{broadcast, Mutex};
@@ -30,6 +33,8 @@ pub trait MlsSessionManager: Send + Sync {
         channel_id: ChannelId,
         ciphertext: &[u8],
     ) -> Result<Vec<u8>>;
+    async fn add_member(&self, channel_id: ChannelId, key_package_bytes: &[u8]) -> Result<Vec<u8>>;
+    async fn join_from_welcome(&self, channel_id: ChannelId, welcome_bytes: &[u8]) -> Result<()>;
 }
 
 pub struct MissingMlsSessionManager;
@@ -52,6 +57,24 @@ impl MlsSessionManager for MissingMlsSessionManager {
         channel_id: ChannelId,
         _ciphertext: &[u8],
     ) -> Result<Vec<u8>> {
+        Err(anyhow!(
+            "no active MLS group available for channel {}",
+            channel_id.0
+        ))
+    }
+
+    async fn add_member(
+        &self,
+        channel_id: ChannelId,
+        _key_package_bytes: &[u8],
+    ) -> Result<Vec<u8>> {
+        Err(anyhow!(
+            "no active MLS group available for channel {}",
+            channel_id.0
+        ))
+    }
+
+    async fn join_from_welcome(&self, channel_id: ChannelId, _welcome_bytes: &[u8]) -> Result<()> {
         Err(anyhow!(
             "no active MLS group available for channel {}",
             channel_id.0
@@ -231,6 +254,7 @@ struct RealtimeClientState {
     ws_started: bool,
     channel_guilds: HashMap<ChannelId, GuildId>,
     sender_directory: HashMap<i64, String>,
+    attempted_channel_member_additions: HashSet<(GuildId, ChannelId, i64)>,
 }
 
 #[derive(Serialize)]
@@ -273,6 +297,7 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
                 ws_started: false,
                 channel_guilds: HashMap::new(),
                 sender_directory: HashMap::new(),
+                attempted_channel_member_additions: HashSet::new(),
             }),
             events,
         })
@@ -444,6 +469,119 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
             size_bytes: response.size_bytes as u64,
             mime_type: attachment.mime_type,
         })
+    }
+
+    async fn store_pending_welcome(
+        &self,
+        guild_id: GuildId,
+        channel_id: ChannelId,
+        target_user_id: i64,
+        welcome_bytes: &[u8],
+    ) -> Result<()> {
+        let (server_url, current_user_id) = self.session().await?;
+        self.http
+            .post(format!("{server_url}/mls/welcome"))
+            .query(&[
+                ("user_id", current_user_id),
+                ("guild_id", guild_id.0),
+                ("channel_id", channel_id.0),
+                ("target_user_id", target_user_id),
+            ])
+            .body(welcome_bytes.to_vec())
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
+    async fn maybe_join_from_pending_welcome(
+        &self,
+        guild_id: GuildId,
+        channel_id: ChannelId,
+    ) -> Result<()> {
+        let (server_url, user_id) = self.session().await?;
+        let response = self
+            .http
+            .get(format!("{server_url}/mls/welcome"))
+            .query(&[
+                ("user_id", user_id),
+                ("guild_id", guild_id.0),
+                ("channel_id", channel_id.0),
+            ])
+            .send()
+            .await?;
+
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(());
+        }
+
+        let response = response.error_for_status()?;
+        let welcome: WelcomeResponse = response.json().await?;
+        let welcome_bytes = STANDARD
+            .decode(welcome.welcome_b64)
+            .map_err(|e| anyhow!("invalid welcome payload from server: {e}"))?;
+        self.mls_session_manager
+            .join_from_welcome(channel_id, &welcome_bytes)
+            .await
+    }
+
+    async fn fetch_members_for_guild(&self, guild_id: GuildId) -> Result<Vec<MemberSummary>> {
+        let (server_url, user_id) = self.session().await?;
+        let members: Vec<MemberSummary> = self
+            .http
+            .get(format!("{server_url}/guilds/{}/members", guild_id.0))
+            .query(&[("user_id", user_id)])
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok(members)
+    }
+
+    async fn maybe_add_existing_members_to_channel_group(
+        &self,
+        guild_id: GuildId,
+        channel_id: ChannelId,
+    ) -> Result<()> {
+        let (_server_url, current_user_id) = self.session().await?;
+        let members = self.fetch_members_for_guild(guild_id).await?;
+
+        for member in members {
+            if member.user_id.0 == current_user_id {
+                continue;
+            }
+
+            let should_attempt = {
+                let mut guard = self.inner.lock().await;
+                guard.attempted_channel_member_additions.insert((
+                    guild_id,
+                    channel_id,
+                    member.user_id.0,
+                ))
+            };
+            if !should_attempt {
+                continue;
+            }
+
+            let key_package_bytes = match self.fetch_key_package(member.user_id.0, guild_id).await {
+                Ok(bytes) => bytes,
+                Err(_) => continue,
+            };
+            let welcome_bytes = match self
+                .mls_session_manager
+                .add_member(channel_id, &key_package_bytes)
+                .await
+            {
+                Ok(bytes) => bytes,
+                Err(_) => continue,
+            };
+            let _ = self
+                .store_pending_welcome(guild_id, channel_id, member.user_id.0, &welcome_bytes)
+                .await;
+        }
+
+        Ok(())
     }
 
     async fn active_context(&self) -> Result<(String, i64, GuildId, ChannelId)> {
@@ -627,17 +765,7 @@ impl<C: CryptoProvider + 'static> ClientHandle for Arc<RealtimeClient<C>> {
     }
 
     async fn list_members(&self, guild_id: GuildId) -> Result<Vec<MemberSummary>> {
-        let (server_url, user_id) = self.session().await?;
-
-        let members: Vec<MemberSummary> = self
-            .http
-            .get(format!("{server_url}/guilds/{}/members", guild_id.0))
-            .query(&[("user_id", user_id)])
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+        let members = self.fetch_members_for_guild(guild_id).await?;
 
         let _ = self
             .events
@@ -650,13 +778,22 @@ impl<C: CryptoProvider + 'static> ClientHandle for Arc<RealtimeClient<C>> {
     }
 
     async fn select_channel(&self, channel_id: ChannelId) -> Result<()> {
-        {
+        let guild_id = {
             let mut guard = self.inner.lock().await;
             guard.selected_channel = Some(channel_id);
             if let Some(guild_id) = guard.channel_guilds.get(&channel_id).copied() {
                 guard.selected_guild = Some(guild_id);
             }
+            guard.selected_guild
         }
+        .ok_or_else(|| anyhow!("no guild selected"))?;
+
+        // MVP trigger: perform add-member fanout on the first interaction with a channel after join.
+        self.maybe_join_from_pending_welcome(guild_id, channel_id)
+            .await?;
+        self.maybe_add_existing_members_to_channel_group(guild_id, channel_id)
+            .await?;
+
         self.fetch_messages(channel_id, 100, None).await?;
         Ok(())
     }
@@ -767,7 +904,12 @@ impl<C: CryptoProvider + 'static> ClientHandle for Arc<RealtimeClient<C>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{extract::State, routing::post, Json, Router};
+    use axum::{
+        extract::{Query, State},
+        http::StatusCode,
+        routing::post,
+        Json, Router,
+    };
     use tokio::{net::TcpListener, sync::oneshot};
 
     #[derive(Clone)]
@@ -778,7 +920,9 @@ mod tests {
     struct TestMlsSessionManager {
         encrypt_ciphertext: Vec<u8>,
         decrypt_plaintext: Vec<u8>,
+        add_member_welcome: Vec<u8>,
         fail_with: Option<String>,
+        joined_welcomes: Arc<Mutex<Vec<Vec<u8>>>>,
     }
 
     impl TestMlsSessionManager {
@@ -786,7 +930,9 @@ mod tests {
             Self {
                 encrypt_ciphertext,
                 decrypt_plaintext,
+                add_member_welcome: b"welcome-generated".to_vec(),
                 fail_with: None,
+                joined_welcomes: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
@@ -794,7 +940,9 @@ mod tests {
             Self {
                 encrypt_ciphertext: Vec::new(),
                 decrypt_plaintext: Vec::new(),
+                add_member_welcome: Vec::new(),
                 fail_with: Some(err.into()),
+                joined_welcomes: Arc::new(Mutex::new(Vec::new())),
             }
         }
     }
@@ -824,6 +972,32 @@ mod tests {
                 return Err(anyhow!(err.clone()));
             }
             Ok(self.decrypt_plaintext.clone())
+        }
+
+        async fn add_member(
+            &self,
+            _channel_id: ChannelId,
+            _key_package_bytes: &[u8],
+        ) -> Result<Vec<u8>> {
+            if let Some(err) = &self.fail_with {
+                return Err(anyhow!(err.clone()));
+            }
+            Ok(self.add_member_welcome.clone())
+        }
+
+        async fn join_from_welcome(
+            &self,
+            _channel_id: ChannelId,
+            welcome_bytes: &[u8],
+        ) -> Result<()> {
+            if let Some(err) = &self.fail_with {
+                return Err(anyhow!(err.clone()));
+            }
+            self.joined_welcomes
+                .lock()
+                .await
+                .push(welcome_bytes.to_vec());
+            Ok(())
         }
     }
 
@@ -955,5 +1129,171 @@ mod tests {
             .expect("decrypt should still succeed");
 
         assert!(rx.try_recv().is_err());
+    }
+
+    #[derive(Clone)]
+    struct OnboardingServerState {
+        pending_welcome_b64: Arc<Mutex<Option<String>>>,
+        add_member_posts: Arc<Mutex<Vec<(i64, i64, i64)>>>,
+    }
+
+    async fn onboarding_list_members() -> Json<Vec<MemberSummary>> {
+        Json(vec![
+            MemberSummary {
+                guild_id: GuildId(11),
+                user_id: shared::domain::UserId(7),
+                username: "adder".to_string(),
+                role: shared::domain::Role::Owner,
+                muted: false,
+            },
+            MemberSummary {
+                guild_id: GuildId(11),
+                user_id: shared::domain::UserId(42),
+                username: "target".to_string(),
+                role: shared::domain::Role::Member,
+                muted: false,
+            },
+        ])
+    }
+
+    async fn onboarding_fetch_key_package() -> Json<KeyPackageResponse> {
+        Json(KeyPackageResponse {
+            key_package_id: 1,
+            guild_id: 11,
+            user_id: 42,
+            key_package_b64: STANDARD.encode(b"target-kp"),
+        })
+    }
+
+    #[derive(Deserialize)]
+    struct StoreWelcomeQuery {
+        user_id: i64,
+        guild_id: i64,
+        channel_id: i64,
+        target_user_id: i64,
+    }
+
+    async fn onboarding_store_welcome(
+        State(state): State<OnboardingServerState>,
+        Query(q): Query<StoreWelcomeQuery>,
+        body: axum::body::Bytes,
+    ) -> StatusCode {
+        state
+            .add_member_posts
+            .lock()
+            .await
+            .push((q.guild_id, q.channel_id, q.target_user_id));
+        if q.user_id == 7 {
+            let encoded = STANDARD.encode(body);
+            *state.pending_welcome_b64.lock().await = Some(encoded);
+        }
+        StatusCode::NO_CONTENT
+    }
+
+    #[derive(Deserialize)]
+    struct WelcomeQuery {
+        user_id: i64,
+    }
+
+    async fn onboarding_fetch_welcome(
+        State(state): State<OnboardingServerState>,
+        Query(q): Query<WelcomeQuery>,
+    ) -> Result<Json<WelcomeResponse>, StatusCode> {
+        if q.user_id != 42 {
+            return Err(StatusCode::NOT_FOUND);
+        }
+        let mut guard = state.pending_welcome_b64.lock().await;
+        let Some(welcome_b64) = guard.take() else {
+            return Err(StatusCode::NOT_FOUND);
+        };
+        Ok(Json(WelcomeResponse {
+            guild_id: GuildId(11),
+            channel_id: ChannelId(13),
+            user_id: shared::domain::UserId(42),
+            welcome_b64,
+        }))
+    }
+
+    async fn onboarding_messages() -> Json<Vec<MessagePayload>> {
+        Json(vec![])
+    }
+
+    async fn spawn_onboarding_server() -> Result<(String, OnboardingServerState)> {
+        std::env::set_var("NO_PROXY", "127.0.0.1,localhost");
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let state = OnboardingServerState {
+            pending_welcome_b64: Arc::new(Mutex::new(None)),
+            add_member_posts: Arc::new(Mutex::new(Vec::new())),
+        };
+        let app = Router::new()
+            .route(
+                "/guilds/11/members",
+                axum::routing::get(onboarding_list_members),
+            )
+            .route(
+                "/mls/key_packages",
+                axum::routing::get(onboarding_fetch_key_package),
+            )
+            .route(
+                "/mls/welcome",
+                axum::routing::post(onboarding_store_welcome),
+            )
+            .route("/mls/welcome", axum::routing::get(onboarding_fetch_welcome))
+            .route(
+                "/channels/13/messages",
+                axum::routing::get(onboarding_messages),
+            )
+            .with_state(state.clone());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        Ok((format!("http://{addr}"), state))
+    }
+
+    #[tokio::test]
+    async fn added_member_retrieves_pending_welcome_and_auto_joins() {
+        let (server_url, server_state) = spawn_onboarding_server().await.expect("spawn server");
+
+        let adder_mls = TestMlsSessionManager::ok(Vec::new(), Vec::new());
+        let adder =
+            RealtimeClient::new_with_mls_session_manager(PassthroughCrypto, Arc::new(adder_mls));
+        {
+            let mut inner = adder.inner.lock().await;
+            inner.server_url = Some(server_url.clone());
+            inner.user_id = Some(7);
+            inner.selected_guild = Some(GuildId(11));
+            inner.selected_channel = Some(ChannelId(13));
+            inner.channel_guilds.insert(ChannelId(13), GuildId(11));
+        }
+
+        adder
+            .select_channel(ChannelId(13))
+            .await
+            .expect("adder select");
+
+        let posts = server_state.add_member_posts.lock().await.clone();
+        assert_eq!(posts, vec![(11, 13, 42)]);
+
+        let target_mls = TestMlsSessionManager::ok(Vec::new(), Vec::new());
+        let joined_welcomes = target_mls.joined_welcomes.clone();
+        let target =
+            RealtimeClient::new_with_mls_session_manager(PassthroughCrypto, Arc::new(target_mls));
+        {
+            let mut inner = target.inner.lock().await;
+            inner.server_url = Some(server_url);
+            inner.user_id = Some(42);
+            inner.selected_guild = Some(GuildId(11));
+            inner.selected_channel = Some(ChannelId(13));
+            inner.channel_guilds.insert(ChannelId(13), GuildId(11));
+        }
+
+        target
+            .select_channel(ChannelId(13))
+            .await
+            .expect("target select auto joins");
+
+        let welcomes = joined_welcomes.lock().await.clone();
+        assert_eq!(welcomes, vec![b"welcome-generated".to_vec()]);
     }
 }
