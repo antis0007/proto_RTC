@@ -778,15 +778,7 @@ impl DesktopGuiApp {
 
     fn attachment_size_text(path: &std::path::Path) -> String {
         let bytes = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-        const KB: u64 = 1024;
-        const MB: u64 = KB * 1024;
-        if bytes >= MB {
-            format!("{:.1} MB", bytes as f64 / MB as f64)
-        } else if bytes >= KB {
-            format!("{:.1} KB", bytes as f64 / KB as f64)
-        } else {
-            format!("{bytes} B")
-        }
+        human_readable_bytes(bytes)
     }
 
     fn copy_image_to_clipboard(&mut self, bytes: &[u8], label: &str) {
@@ -1414,8 +1406,9 @@ impl DesktopGuiApp {
                                         } else {
                                             ui.horizontal(|ui| {
                                                 ui.label(format!(
-                                                    "📎 {} ({} bytes)",
-                                                    attachment.filename, attachment.size_bytes
+                                                    "📎 {} ({})",
+                                                    attachment.filename,
+                                                    human_readable_bytes(attachment.size_bytes)
                                                 ));
                                                 if ui.button("Download").clicked() {
                                                     queue_command(
@@ -1573,8 +1566,9 @@ impl DesktopGuiApp {
                     });
 
                     ui.small(format!(
-                        "🖼 {} ({} bytes)",
-                        attachment.filename, attachment.size_bytes
+                        "🖼 {} ({})",
+                        attachment.filename,
+                        human_readable_bytes(attachment.size_bytes)
                     ));
                 }
 
@@ -1632,6 +1626,33 @@ impl DesktopGuiApp {
             self.expanded_preview = None;
         }
     }
+}
+
+fn human_readable_bytes(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+
+    if bytes < KB {
+        return format!("{bytes} B");
+    }
+
+    if bytes < MB {
+        return format_scaled_unit(bytes, KB, "KB");
+    }
+
+    if bytes < GB {
+        return format_scaled_unit(bytes, MB, "MB");
+    }
+
+    format_scaled_unit(bytes, GB, "GB")
+}
+
+fn format_scaled_unit(bytes: u64, unit_size: u64, unit_label: &str) -> String {
+    let value = bytes as f64 / unit_size as f64;
+    let value_text = format!("{value:.1}");
+    let compact_value = value_text.strip_suffix(".0").unwrap_or(&value_text);
+    format!("{compact_value} {unit_label}")
 }
 
 fn attachment_is_image(attachment: &AttachmentPayload) -> bool {
@@ -2013,4 +2034,20 @@ fn main() -> eframe::Result<()> {
             )))
         }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::human_readable_bytes;
+
+    #[test]
+    fn formats_attachment_sizes_readably() {
+        assert_eq!(human_readable_bytes(0), "0 B");
+        assert_eq!(human_readable_bytes(1023), "1023 B");
+        assert_eq!(human_readable_bytes(1024), "1 KB");
+        assert_eq!(human_readable_bytes(1536), "1.5 KB");
+        assert_eq!(human_readable_bytes(2 * 1024 * 1024), "2 MB");
+        assert_eq!(human_readable_bytes(1572864), "1.5 MB");
+        assert_eq!(human_readable_bytes(3 * 1024 * 1024 * 1024), "3 GB");
+    }
 }

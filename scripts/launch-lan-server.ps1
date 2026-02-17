@@ -10,6 +10,7 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $env:SERVER_BIND = "0.0.0.0:$Port"
+$env:APP__BIND_ADDR = $env:SERVER_BIND
 $env:SERVER_PUBLIC_URL = "http://$LanHost`:$Port"
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path

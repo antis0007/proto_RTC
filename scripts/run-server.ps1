@@ -25,7 +25,8 @@ if (Test-Path '.env') {
 
 if (-not $env:SERVER_BIND) { $env:SERVER_BIND = '127.0.0.1:8443' }
 if (-not $env:DATABASE_URL) { $env:DATABASE_URL = 'sqlite://./data/server.db' }
-if (-not $env:APP__BIND_ADDR) { $env:APP__BIND_ADDR = $env:SERVER_BIND }
+if ($env:SERVER_BIND) { $env:APP__BIND_ADDR = $env:SERVER_BIND }
+elseif (-not $env:APP__BIND_ADDR) { $env:APP__BIND_ADDR = '127.0.0.1:8443' }
 if (-not $env:APP__DATABASE_URL) { $env:APP__DATABASE_URL = $env:DATABASE_URL }
 if (-not $env:APP__LIVEKIT_API_KEY) { $env:APP__LIVEKIT_API_KEY = $(if ($env:LIVEKIT_API_KEY) { $env:LIVEKIT_API_KEY } else { 'devkey' }) }
 if (-not $env:APP__LIVEKIT_API_SECRET) { $env:APP__LIVEKIT_API_SECRET = $(if ($env:LIVEKIT_API_SECRET) { $env:LIVEKIT_API_SECRET } else { 'devsecret' }) }
