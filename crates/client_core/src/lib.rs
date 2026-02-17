@@ -25,6 +25,11 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 pub trait MlsSessionManager: Send + Sync {
     async fn encrypt_application(&self, channel_id: ChannelId, plaintext: &[u8])
         -> Result<Vec<u8>>;
+    async fn decrypt_application(
+        &self,
+        channel_id: ChannelId,
+        ciphertext: &[u8],
+    ) -> Result<Vec<u8>>;
 }
 
 pub struct MissingMlsSessionManager;
@@ -35,6 +40,17 @@ impl MlsSessionManager for MissingMlsSessionManager {
         &self,
         channel_id: ChannelId,
         _plaintext: &[u8],
+    ) -> Result<Vec<u8>> {
+        Err(anyhow!(
+            "no active MLS group available for channel {}",
+            channel_id.0
+        ))
+    }
+
+    async fn decrypt_application(
+        &self,
+        channel_id: ChannelId,
+        _ciphertext: &[u8],
     ) -> Result<Vec<u8>> {
         Err(anyhow!(
             "no active MLS group available for channel {}",
@@ -148,7 +164,14 @@ impl<C: CryptoProvider> CommunityClient<C> {
 #[derive(Debug, Clone)]
 pub enum ClientEvent {
     Server(ServerEvent),
-    UserDirectoryUpdated { user_id: i64, username: String },
+    MessageDecrypted {
+        message: MessagePayload,
+        plaintext: String,
+    },
+    UserDirectoryUpdated {
+        user_id: i64,
+        username: String,
+    },
     Error(String),
 }
 
@@ -301,8 +324,12 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
                         Ok(event) => {
                             if let ServerEvent::MessageReceived { message } = &event {
                                 client.record_sender_username(message).await;
+                                if let Err(err) = client.emit_decrypted_message(message).await {
+                                    let _ = client.events.send(ClientEvent::Error(err.to_string()));
+                                }
+                            } else {
+                                let _ = client.events.send(ClientEvent::Server(event));
                             }
-                            let _ = client.events.send(ClientEvent::Server(event));
                         }
                         Err(err) => {
                             let _ = client
@@ -436,6 +463,33 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
             .or_else(|| guard.channel_guilds.get(&channel_id).copied())
             .ok_or_else(|| anyhow!("no guild selected"))?;
         Ok((server_url, user_id, guild_id, channel_id))
+    }
+
+    async fn emit_decrypted_message(&self, message: &MessagePayload) -> Result<()> {
+        let ciphertext = STANDARD
+            .decode(message.ciphertext_b64.as_bytes())
+            .with_context(|| {
+                format!(
+                    "invalid base64 ciphertext for message {}",
+                    message.message_id.0
+                )
+            })?;
+
+        let plaintext_bytes = self
+            .mls_session_manager
+            .decrypt_application(message.channel_id, &ciphertext)
+            .await?;
+
+        if plaintext_bytes.is_empty() {
+            return Ok(());
+        }
+
+        let plaintext = String::from_utf8_lossy(&plaintext_bytes).to_string();
+        let _ = self.events.send(ClientEvent::MessageDecrypted {
+            message: message.clone(),
+            plaintext,
+        });
+        Ok(())
     }
 
     async fn send_message_with_attachment_impl(
@@ -631,11 +685,9 @@ impl<C: CryptoProvider + 'static> ClientHandle for Arc<RealtimeClient<C>> {
 
         for message in &messages {
             self.record_sender_username(message).await;
-            let _ = self
-                .events
-                .send(ClientEvent::Server(ServerEvent::MessageReceived {
-                    message: message.clone(),
-                }));
+            if let Err(err) = self.emit_decrypted_message(message).await {
+                let _ = self.events.send(ClientEvent::Error(err.to_string()));
+            }
         }
 
         Ok(messages)
@@ -724,8 +776,27 @@ mod tests {
     }
 
     struct TestMlsSessionManager {
-        ciphertext: Vec<u8>,
+        encrypt_ciphertext: Vec<u8>,
+        decrypt_plaintext: Vec<u8>,
         fail_with: Option<String>,
+    }
+
+    impl TestMlsSessionManager {
+        fn ok(encrypt_ciphertext: Vec<u8>, decrypt_plaintext: Vec<u8>) -> Self {
+            Self {
+                encrypt_ciphertext,
+                decrypt_plaintext,
+                fail_with: None,
+            }
+        }
+
+        fn failing(err: impl Into<String>) -> Self {
+            Self {
+                encrypt_ciphertext: Vec::new(),
+                decrypt_plaintext: Vec::new(),
+                fail_with: Some(err.into()),
+            }
+        }
     }
 
     #[async_trait]
@@ -741,7 +812,18 @@ mod tests {
             if plaintext.is_empty() {
                 return Err(anyhow!("plaintext must not be empty"));
             }
-            Ok(self.ciphertext.clone())
+            Ok(self.encrypt_ciphertext.clone())
+        }
+
+        async fn decrypt_application(
+            &self,
+            _channel_id: ChannelId,
+            _ciphertext: &[u8],
+        ) -> Result<Vec<u8>> {
+            if let Some(err) = &self.fail_with {
+                return Err(anyhow!(err.clone()));
+            }
+            Ok(self.decrypt_plaintext.clone())
         }
     }
 
@@ -776,10 +858,10 @@ mod tests {
         let (server_url, payload_rx) = spawn_message_server().await.expect("spawn server");
         let client = RealtimeClient::new_with_mls_session_manager(
             PassthroughCrypto,
-            Arc::new(TestMlsSessionManager {
-                ciphertext: b"mls-ciphertext".to_vec(),
-                fail_with: None,
-            }),
+            Arc::new(TestMlsSessionManager::ok(
+                b"mls-ciphertext".to_vec(),
+                Vec::new(),
+            )),
         );
 
         {
@@ -809,10 +891,7 @@ mod tests {
         let (server_url, _payload_rx) = spawn_message_server().await.expect("spawn server");
         let client = RealtimeClient::new_with_mls_session_manager(
             PassthroughCrypto,
-            Arc::new(TestMlsSessionManager {
-                ciphertext: Vec::new(),
-                fail_with: Some("group not initialized".to_string()),
-            }),
+            Arc::new(TestMlsSessionManager::failing("group not initialized")),
         );
 
         {
@@ -828,5 +907,53 @@ mod tests {
             .await
             .expect_err("must fail");
         assert!(err.to_string().contains("group not initialized"));
+    }
+
+    fn sample_message() -> MessagePayload {
+        MessagePayload {
+            message_id: MessageId(7),
+            channel_id: ChannelId(3),
+            sender_id: shared::domain::UserId(5),
+            sender_username: Some("alice".to_string()),
+            ciphertext_b64: STANDARD.encode(b"cipher"),
+            attachment: None,
+            sent_at: "2024-01-01T00:00:00Z".parse().expect("timestamp"),
+        }
+    }
+
+    #[tokio::test]
+    async fn emits_decrypted_message_event_for_application_data() {
+        let client = RealtimeClient::new_with_mls_session_manager(
+            PassthroughCrypto,
+            Arc::new(TestMlsSessionManager::ok(Vec::new(), b"hello".to_vec())),
+        );
+        let mut rx = client.subscribe_events();
+
+        client
+            .emit_decrypted_message(&sample_message())
+            .await
+            .expect("decrypt should succeed");
+
+        let event = rx.recv().await.expect("event");
+        match event {
+            ClientEvent::MessageDecrypted { plaintext, .. } => assert_eq!(plaintext, "hello"),
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn suppresses_non_application_messages_after_decrypt() {
+        let client = RealtimeClient::new_with_mls_session_manager(
+            PassthroughCrypto,
+            Arc::new(TestMlsSessionManager::ok(Vec::new(), Vec::new())),
+        );
+        let mut rx = client.subscribe_events();
+
+        client
+            .emit_decrypted_message(&sample_message())
+            .await
+            .expect("decrypt should still succeed");
+
+        assert!(rx.try_recv().is_err());
     }
 }
