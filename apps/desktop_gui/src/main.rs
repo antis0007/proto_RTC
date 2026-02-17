@@ -9,8 +9,8 @@ use std::{
 
 use arboard::{Clipboard, ImageData};
 use client_core::{
-    AttachmentUpload, ClientEvent, ClientHandle, PassthroughCrypto, RealtimeClient,
-    VoiceConnectOptions, VoiceParticipantState, VoiceSessionSnapshot,
+    AttachmentUpload, ClientEvent, ClientHandle, DurableMlsSessionManager, PassthroughCrypto,
+    RealtimeClient, VoiceConnectOptions, VoiceParticipantState, VoiceSessionSnapshot,
 };
 use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 use eframe::egui;
@@ -2290,7 +2290,30 @@ fn spawn_backend_thread(cmd_rx: Receiver<BackendCommand>, ui_tx: Sender<UiEvent>
             .expect("failed to build tokio runtime");
 
         runtime.block_on(async move {
-            let client = RealtimeClient::new(PassthroughCrypto);
+            let mls_db_url = match std::env::var("HOME") {
+                Ok(home) => {
+                    let base = PathBuf::from(home).join(".proto_rtc");
+                    if let Err(err) = std::fs::create_dir_all(&base) {
+                        panic!(
+                            "failed to create MLS state directory '{}': {err}",
+                            base.display()
+                        );
+                    }
+                    DurableMlsSessionManager::sqlite_url_for_gui_data_dir(&base)
+                }
+                Err(err) => {
+                    panic!("HOME environment variable is required to initialize MLS backend: {err}")
+                }
+            };
+
+            let mls_manager = DurableMlsSessionManager::initialize(&mls_db_url, 0, "desktop-gui")
+                .await
+                .unwrap_or_else(|err| {
+                    panic!("failed to initialize persistent MLS backend ({mls_db_url}): {err:#}")
+                });
+
+            let client =
+                RealtimeClient::new_with_mls_session_manager(PassthroughCrypto, mls_manager);
 
             let mut subscribed = false;
             while let Ok(cmd) = cmd_rx.recv() {

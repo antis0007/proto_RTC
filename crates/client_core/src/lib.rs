@@ -34,6 +34,9 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{error, info, warn};
 use zeroize::Zeroize;
 
+mod mls_session_manager;
+pub use mls_session_manager::DurableMlsSessionManager;
+
 const LIVEKIT_E2EE_EXPORT_LABEL: &str = "livekit-e2ee";
 const LIVEKIT_E2EE_KEY_LEN: usize = 32;
 const LIVEKIT_E2EE_CACHE_TTL: Duration = Duration::from_secs(90);
@@ -77,6 +80,7 @@ pub enum LiveKitE2eeKeyError {
 
 #[async_trait]
 pub trait MlsSessionManager: Send + Sync {
+    async fn open_or_create_group(&self, guild_id: GuildId, channel_id: ChannelId) -> Result<()>;
     async fn encrypt_application(&self, channel_id: ChannelId, plaintext: &[u8])
         -> Result<Vec<u8>>;
     async fn decrypt_application(
@@ -98,6 +102,14 @@ pub struct MissingMlsSessionManager;
 
 #[async_trait]
 impl MlsSessionManager for MissingMlsSessionManager {
+    async fn open_or_create_group(&self, guild_id: GuildId, channel_id: ChannelId) -> Result<()> {
+        Err(anyhow!(
+            "MLS backend unavailable for guild {} channel {}",
+            guild_id.0,
+            channel_id.0
+        ))
+    }
+
     async fn encrypt_application(
         &self,
         channel_id: ChannelId,
@@ -239,7 +251,6 @@ pub trait CryptoProvider: Send + Sync {
     fn decrypt_message(&self, ciphertext: &[u8]) -> Vec<u8>;
 }
 
-/// TODO: replace with real E2EE provider implementation.
 pub struct PassthroughCrypto;
 
 impl CryptoProvider for PassthroughCrypto {
@@ -965,6 +976,9 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
             .decode(welcome.welcome_b64)
             .map_err(|e| anyhow!("invalid welcome payload from server: {e}"))?;
         self.mls_session_manager
+            .open_or_create_group(guild_id, channel_id)
+            .await?;
+        self.mls_session_manager
             .join_from_welcome(channel_id, &welcome_bytes)
             .await
     }
@@ -989,6 +1003,9 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
         channel_id: ChannelId,
     ) -> Result<()> {
         let (_server_url, current_user_id) = self.session().await?;
+        self.mls_session_manager
+            .open_or_create_group(guild_id, channel_id)
+            .await?;
         let members = self.fetch_members_for_guild(guild_id).await?;
 
         for member in members {
@@ -1048,6 +1065,17 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
     }
 
     async fn emit_decrypted_message(&self, message: &MessagePayload) -> Result<()> {
+        let guild_id = self
+            .inner
+            .lock()
+            .await
+            .channel_guilds
+            .get(&message.channel_id)
+            .copied()
+            .ok_or_else(|| anyhow!("missing guild mapping for channel {}", message.channel_id.0))?;
+        self.mls_session_manager
+            .open_or_create_group(guild_id, message.channel_id)
+            .await?;
         let ciphertext = STANDARD
             .decode(message.ciphertext_b64.as_bytes())
             .with_context(|| {
@@ -1080,6 +1108,9 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
         attachment: Option<AttachmentPayload>,
     ) -> Result<()> {
         let (server_url, user_id, guild_id, channel_id) = self.active_context().await?;
+        self.mls_session_manager
+            .open_or_create_group(guild_id, channel_id)
+            .await?;
         let plaintext_bytes = text.as_bytes();
         let ciphertext = self
             .mls_session_manager
@@ -1450,6 +1481,14 @@ mod tests {
 
     #[async_trait]
     impl MlsSessionManager for TestMlsSessionManager {
+        async fn open_or_create_group(
+            &self,
+            _guild_id: GuildId,
+            _channel_id: ChannelId,
+        ) -> Result<()> {
+            Ok(())
+        }
+
         async fn encrypt_application(
             &self,
             _channel_id: ChannelId,
@@ -1618,6 +1657,10 @@ mod tests {
             PassthroughCrypto,
             Arc::new(TestMlsSessionManager::ok(Vec::new(), b"hello".to_vec())),
         );
+        {
+            let mut inner = client.inner.lock().await;
+            inner.channel_guilds.insert(ChannelId(3), GuildId(11));
+        }
         let mut rx = client.subscribe_events();
 
         client
@@ -1638,6 +1681,10 @@ mod tests {
             PassthroughCrypto,
             Arc::new(TestMlsSessionManager::ok(Vec::new(), Vec::new())),
         );
+        {
+            let mut inner = client.inner.lock().await;
+            inner.channel_guilds.insert(ChannelId(3), GuildId(11));
+        }
         let mut rx = client.subscribe_events();
 
         client

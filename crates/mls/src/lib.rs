@@ -2,9 +2,11 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
-use openmls_rust_crypto::OpenMlsRustCrypto;
+use openmls_rust_crypto::{MemoryStorage, RustCrypto};
+use openmls_traits::OpenMlsProvider;
 use serde::{Deserialize, Serialize};
 use shared::domain::{ChannelId, GuildId};
+
 use tls_codec::{Deserialize as TlsDeserializeTrait, Serialize as TlsSerializeTrait};
 
 const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
@@ -58,7 +60,7 @@ impl MlsIdentity {
         })
     }
 
-    pub fn key_package(&self, provider: &OpenMlsRustCrypto) -> Result<KeyPackage> {
+    pub fn key_package<P: OpenMlsProvider>(&self, provider: &P) -> Result<KeyPackage> {
         let bundle = KeyPackage::builder().build(
             CIPHERSUITE,
             provider,
@@ -68,7 +70,7 @@ impl MlsIdentity {
         Ok(bundle.key_package().clone())
     }
 
-    pub fn key_package_bytes(&self, provider: &OpenMlsRustCrypto) -> Result<Vec<u8>> {
+    pub fn key_package_bytes<P: OpenMlsProvider>(&self, provider: &P) -> Result<Vec<u8>> {
         Ok(self.key_package(provider)?.tls_serialize_detached()?)
     }
 }
@@ -95,11 +97,35 @@ pub trait MlsStore: Send + Sync {
     ) -> Result<Option<PersistedGroupSnapshot>>;
 }
 
+#[derive(Default, Debug)]
+pub struct PersistentOpenMlsProvider {
+    crypto: RustCrypto,
+    storage: MemoryStorage,
+}
+
+impl OpenMlsProvider for PersistentOpenMlsProvider {
+    type CryptoProvider = RustCrypto;
+    type RandProvider = RustCrypto;
+    type StorageProvider = MemoryStorage;
+
+    fn storage(&self) -> &Self::StorageProvider {
+        &self.storage
+    }
+
+    fn crypto(&self) -> &Self::CryptoProvider {
+        &self.crypto
+    }
+
+    fn rand(&self) -> &Self::RandProvider {
+        &self.crypto
+    }
+}
+
 pub struct MlsGroupHandle<S: MlsStore> {
     store: S,
     guild_id: GuildId,
     channel_id: ChannelId,
-    provider: OpenMlsRustCrypto,
+    provider: PersistentOpenMlsProvider,
     identity: MlsIdentity,
     group: Option<MlsGroup>,
 }
@@ -115,12 +141,19 @@ impl<S: MlsStore> MlsGroupHandle<S> {
             store,
             guild_id,
             channel_id,
-            provider: OpenMlsRustCrypto::default(),
+            provider: PersistentOpenMlsProvider::default(),
             identity,
             group: None,
         };
         handle.load_group_if_exists().await?;
         Ok(handle)
+    }
+
+    pub async fn load_or_create_group(&mut self) -> Result<()> {
+        if self.group.is_none() {
+            self.create_group(self.channel_id).await?;
+        }
+        Ok(())
     }
 
     pub fn key_package_bytes(&self) -> Result<Vec<u8>> {
@@ -186,20 +219,6 @@ impl<S: MlsStore> MlsGroupHandle<S> {
         Ok((commit_bytes, welcome_bytes))
     }
 
-    pub async fn remove_member(&mut self, member: LeafNodeIndex) -> Result<Vec<u8>> {
-        let provider = &self.provider;
-        let signer = &self.identity.signer;
-        let group = self
-            .group
-            .as_mut()
-            .ok_or_else(|| anyhow!("group not initialized"))?;
-        let (commit, _welcome, _group_info) = group.remove_members(provider, signer, &[member])?;
-        let bytes = commit.tls_serialize_detached()?;
-        group.merge_pending_commit(provider)?;
-        self.persist_group().await?;
-        Ok(bytes)
-    }
-
     pub fn encrypt_application(&mut self, plaintext_bytes: &[u8]) -> Result<Vec<u8>> {
         let provider = &self.provider;
         let signer = &self.identity.signer;
@@ -211,7 +230,7 @@ impl<S: MlsStore> MlsGroupHandle<S> {
         Ok(msg.tls_serialize_detached()?)
     }
 
-    pub fn decrypt_application(&mut self, ciphertext_bytes: &[u8]) -> Result<Vec<u8>> {
+    pub async fn decrypt_application(&mut self, ciphertext_bytes: &[u8]) -> Result<Vec<u8>> {
         let mut ciphertext_bytes = ciphertext_bytes;
         let message_in = MlsMessageIn::tls_deserialize(&mut ciphertext_bytes)?;
         let protocol_message: ProtocolMessage = message_in
@@ -228,6 +247,7 @@ impl<S: MlsStore> MlsGroupHandle<S> {
             ProcessedMessageContent::ApplicationMessage(app_msg) => Ok(app_msg.into_bytes()),
             ProcessedMessageContent::StagedCommitMessage(staged_commit) => {
                 group.merge_staged_commit(provider, *staged_commit)?;
+                self.persist_group().await?;
                 Ok(Vec::new())
             }
             _ => Err(anyhow!("message was not an application message")),
