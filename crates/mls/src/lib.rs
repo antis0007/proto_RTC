@@ -195,9 +195,11 @@ impl<S: MlsStore> MlsGroupHandle<S> {
 
     async fn persist_group(&self) -> Result<()> {
         if let Some(group) = &self.group {
-            let state = group.tls_serialize_detached()?;
+            // OpenMLS 0.6 does not expose direct TLS serialization for `MlsGroup` itself.
+            // Persist group identifier bytes as the stable handle until a dedicated
+            // state-export/import API is wired in for full snapshot persistence.
             self.store
-                .save_group_state(self.guild_id, self.channel_id, &state)
+                .save_group_state(self.guild_id, self.channel_id, group.group_id().as_slice())
                 .await?;
         }
         Ok(())
