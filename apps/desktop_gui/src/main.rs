@@ -353,20 +353,48 @@ impl DesktopGuiApp {
                         ui.text_edit_singleline(&mut self.username);
                         ui.end_row();
 
-                        ui.label("Password:");
+                        ui.label("Invite/legacy password:");
                         ui.text_edit_singleline(&mut self.password_or_invite);
+                        ui.end_row();
+
+                        ui.label("Password:");
+                        ui.add(egui::TextEdit::singleline(&mut self.password).password(true));
+                        ui.end_row();
+
+                        ui.label("Token:");
+                        ui.text_edit_singleline(&mut self.auth_token);
                         ui.end_row();
                     });
 
+                ui.horizontal(|ui| {
+                    ui.selectable_value(
+                        &mut self.auth_action,
+                        AuthAction::SignIn,
+                        AuthAction::SignIn.label(),
+                    );
+                    ui.selectable_value(
+                        &mut self.auth_action,
+                        AuthAction::CreateAccount,
+                        AuthAction::CreateAccount.label(),
+                    );
+                    ui.checkbox(&mut self.remember_me, "Remember me");
+                });
+
                 ui.add_space(12.0);
-                if ui.button("Login").clicked() {
-                    self.view_state = AppViewState::Login;
+                if ui.button(self.auth_action.label()).clicked() {
+                    self.auth_session_established = false;
                     queue_command(
                         &self.cmd_tx,
                         BackendCommand::Login {
                             server_url: self.server_url.clone(),
                             username: self.username.clone(),
                             password_or_invite: self.password_or_invite.clone(),
+                            password: (!self.password.trim().is_empty())
+                                .then(|| self.password.clone()),
+                            token: (!self.auth_token.trim().is_empty())
+                                .then(|| self.auth_token.clone()),
+                            remember_me: self.remember_me.then_some(true),
+                            auth_action: self.auth_action,
                         },
                         &mut self.status,
                     );
@@ -420,7 +448,7 @@ impl DesktopGuiApp {
                 ui.text_edit_singleline(&mut self.password_or_invite);
             });
 
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.selectable_value(
                     &mut self.auth_action,
                     AuthAction::SignIn,
@@ -438,16 +466,8 @@ impl DesktopGuiApp {
                 ui.add(egui::TextEdit::singleline(&mut self.auth_token));
                 ui.checkbox(&mut self.remember_me, "Remember me");
 
-                let action_label = self.auth_action.label();
-                if ui.button(action_label).clicked() {
+                if ui.button(self.auth_action.label()).clicked() {
                     self.auth_session_established = false;
-            });
-
-            ui.horizontal_wrapped(|ui| {
-                ui.label("Invite/Password:");
-                ui.text_edit_singleline(&mut self.password_or_invite);
-
-                if ui.button("Login").clicked() {
                     queue_command(
                         &self.cmd_tx,
                         BackendCommand::Login {
@@ -465,40 +485,11 @@ impl DesktopGuiApp {
                     );
                 }
 
-                if ui.button("Refresh Guilds").clicked() {
-                    queue_command(&self.cmd_tx, BackendCommand::ListGuilds, &mut self.status);
-                }
-                if ui.button("Join Invite").clicked() {
-                    let invite_code = self.password_or_invite.trim().to_string();
-                    if invite_code.is_empty() {
-                        self.status = "Enter an invite code first".to_string();
-                    } else {
-                        queue_command(
-                            &self.cmd_tx,
-                            BackendCommand::JoinWithInvite { invite_code },
-                            &mut self.status,
-                        );
-                    }
-                }
-            });
-
-            if self.password.trim().is_empty() && self.auth_token.trim().is_empty() {
-                ui.colored_label(
-                    egui::Color32::YELLOW,
-                    "Legacy username-only mode active. Password/token auth is reserved for upcoming secure auth backend work.",
-                );
-            }
-
-            ui.label(&self.status);
                 let constrained = ui.available_width() < 220.0;
                 if constrained {
                     ui.menu_button("⋯ More", |ui| {
                         if ui.button("Refresh Guilds").clicked() {
-                            queue_command(
-                                &self.cmd_tx,
-                                BackendCommand::ListGuilds,
-                                &mut self.status,
-                            );
+                            queue_command(&self.cmd_tx, BackendCommand::ListGuilds, &mut self.status);
                             ui.close_menu();
                         }
 
@@ -536,9 +527,13 @@ impl DesktopGuiApp {
                 }
             });
 
-            ui.horizontal_wrapped(|ui| {
-                ui.label(&self.status);
-            });
+            if self.password.trim().is_empty() && self.auth_token.trim().is_empty() {
+                ui.colored_label(
+                    egui::Color32::YELLOW,
+                    "Legacy username-only mode active. Password/token auth is reserved for upcoming secure auth backend work.",
+                );
+            }
+            ui.label(&self.status);
         });
 
         self.show_settings_window(ctx);
@@ -546,8 +541,8 @@ impl DesktopGuiApp {
         egui::SidePanel::left("guilds_panel")
             .default_width(140.0)
             .show(ctx, |ui| {
+                ui.heading("Guilds");
                 ui.add_enabled_ui(self.auth_session_established, |ui| {
-                    ui.heading("Guilds");
                     if let Some(guild_id) = self.selected_guild {
                         if ui.button("Create Invite").clicked() {
                             queue_command(
@@ -557,12 +552,48 @@ impl DesktopGuiApp {
                             );
                         }
                     }
+
                     for guild in &self.guilds {
                         let selected = self.selected_guild == Some(guild.guild_id);
-                        if ui.selectable_label(selected, &guild.name).clicked() {
+                        let base_bg = if self.theme.list_row_shading {
+                            ui.visuals().faint_bg_color
+                        } else {
+                            egui::Color32::TRANSPARENT
+                        };
+                        let selected_bg = ui.visuals().selection.bg_fill.gamma_multiply(
+                            if self.theme.list_row_shading {
+                                0.35
+                            } else {
+                                0.22
+                            },
+                        );
+                        let row_fill = if selected { selected_bg } else { base_bg };
+                        let row_stroke = if selected {
+                            egui::Stroke::new(
+                                1.0,
+                                ui.visuals().selection.bg_fill.gamma_multiply(0.9),
+                            )
+                        } else if self.theme.list_row_shading {
+                            egui::Stroke::new(
+                                1.0,
+                                ui.visuals().widgets.noninteractive.bg_stroke.color,
+                            )
+                        } else {
+                            egui::Stroke::NONE
+                        };
+
+                        let response = egui::Frame::none()
+                            .fill(row_fill)
+                            .stroke(row_stroke)
+                            .rounding(egui::Rounding::same(6.0))
+                            .inner_margin(egui::Margin::symmetric(8.0, 6.0))
+                            .show(ui, |ui| ui.selectable_label(selected, &guild.name))
+                            .inner;
+                        if response.clicked() {
                             self.selected_guild = Some(guild.guild_id);
                             self.selected_channel = None;
                             self.channels.clear();
+                            self.members.remove(&guild.guild_id);
                             queue_command(
                                 &self.cmd_tx,
                                 BackendCommand::ListChannels {
@@ -570,104 +601,36 @@ impl DesktopGuiApp {
                                 },
                                 &mut self.status,
                             );
+                            queue_command(
+                                &self.cmd_tx,
+                                BackendCommand::ListMembers {
+                                    guild_id: guild.guild_id,
+                                },
+                                &mut self.status,
+                            );
                         }
+                        ui.add_space(4.0);
                     }
                 });
+
                 if !self.auth_session_established {
                     ui.separator();
                     ui.label("Sign in or create an account to access guilds.");
-                }
-                for guild in &self.guilds {
-                    let selected = self.selected_guild == Some(guild.guild_id);
-                    let base_bg = if self.theme.list_row_shading {
-                        ui.visuals().faint_bg_color
-                    } else {
-                        egui::Color32::TRANSPARENT
-                    };
-                    let selected_bg = ui.visuals().selection.bg_fill.gamma_multiply(
-                        if self.theme.list_row_shading {
-                            0.35
-                        } else {
-                            0.22
-                        },
-                    );
-                    let row_fill = if selected { selected_bg } else { base_bg };
-                    let row_stroke = if selected {
-                        egui::Stroke::new(1.0, ui.visuals().selection.bg_fill.gamma_multiply(0.9))
-                    } else if self.theme.list_row_shading {
-                        egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color)
-                    } else {
-                        egui::Stroke::NONE
-                    };
-
-                    let response = egui::Frame::none()
-                        .fill(row_fill)
-                        .stroke(row_stroke)
-                        .rounding(egui::Rounding::same(6.0))
-                        .inner_margin(egui::Margin::symmetric(8.0, 6.0))
-                        .show(ui, |ui| ui.selectable_label(selected, &guild.name))
-                        .inner;
-                    if response.clicked() {
-                        self.selected_guild = Some(guild.guild_id);
-                        self.selected_channel = None;
-                        self.channels.clear();
-                        self.members.remove(&guild.guild_id);
-                        queue_command(
-                            &self.cmd_tx,
-                            BackendCommand::ListChannels {
-                                guild_id: guild.guild_id,
-                            },
-                            &mut self.status,
-                        );
-                        queue_command(
-                            &self.cmd_tx,
-                            BackendCommand::ListMembers {
-                                guild_id: guild.guild_id,
-                            },
-                            &mut self.status,
-                        );
-                    }
-                    ui.add_space(4.0);
                 }
             });
 
         egui::SidePanel::left("channels_panel")
             .default_width(220.0)
             .show(ctx, |ui| {
-                ui.add_enabled_ui(self.auth_session_established, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.heading("Channels");
-                        if ui.button("Refresh").clicked() {
-                            if let Some(guild_id) = self.selected_guild {
-                                queue_command(
-                                    &self.cmd_tx,
-                                    BackendCommand::ListChannels { guild_id },
-                                    &mut self.status,
-                                );
-                            } else {
-                                self.status = "Select a guild first".to_string();
-                            }
-                        }
-                    });
-                    for channel in &self.channels {
-                        let icon = match channel.kind {
-                            ChannelKind::Text => "#",
-                            ChannelKind::Voice => "🔊",
-                        };
-                        let label = format!("{icon} {}", channel.name);
-                        let selected = self.selected_channel == Some(channel.channel_id);
-                        if ui.selectable_label(selected, label).clicked() {
-                            self.selected_channel = Some(channel.channel_id);
+                ui.horizontal(|ui| {
+                    ui.heading("Channels");
+                    if ui.button("Refresh").clicked() {
+                        if let Some(guild_id) = self.selected_guild {
                             queue_command(
                                 &self.cmd_tx,
-                                BackendCommand::SelectChannel {
-                                    channel_id: channel.channel_id,
-                                },
+                                BackendCommand::ListChannels { guild_id },
                                 &mut self.status,
                             );
-                        }
-                    }
-                });
                             queue_command(
                                 &self.cmd_tx,
                                 BackendCommand::ListMembers { guild_id },
@@ -678,60 +641,74 @@ impl DesktopGuiApp {
                         }
                     }
                 });
-                for channel in &self.channels {
-                    let icon = match channel.kind {
-                        ChannelKind::Text => "#",
-                        ChannelKind::Voice => "🔊",
-                    };
-                    let selected = self.selected_channel == Some(channel.channel_id);
-                    let base_bg = if self.theme.list_row_shading {
-                        ui.visuals().faint_bg_color
-                    } else {
-                        egui::Color32::TRANSPARENT
-                    };
-                    let selected_bg = ui.visuals().selection.bg_fill.gamma_multiply(
-                        if self.theme.list_row_shading {
-                            0.35
-                        } else {
-                            0.22
-                        },
-                    );
-                    let row_fill = if selected { selected_bg } else { base_bg };
-                    let row_stroke = if selected {
-                        egui::Stroke::new(1.0, ui.visuals().selection.bg_fill.gamma_multiply(0.9))
-                    } else if self.theme.list_row_shading {
-                        egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color)
-                    } else {
-                        egui::Stroke::NONE
-                    };
 
-                    let response = egui::Frame::none()
-                        .fill(row_fill)
-                        .stroke(row_stroke)
-                        .rounding(egui::Rounding::same(6.0))
-                        .inner_margin(egui::Margin::symmetric(8.0, 6.0))
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.add_sized(
-                                    [18.0, 18.0],
-                                    egui::Label::new(egui::RichText::new(icon).monospace()),
-                                );
-                                ui.selectable_label(selected, &channel.name)
-                            })
-                            .inner
-                        })
-                        .inner;
-                    if response.clicked() {
-                        self.selected_channel = Some(channel.channel_id);
-                        queue_command(
-                            &self.cmd_tx,
-                            BackendCommand::SelectChannel {
-                                channel_id: channel.channel_id,
+                ui.add_enabled_ui(self.auth_session_established, |ui| {
+                    for channel in &self.channels {
+                        let icon = match channel.kind {
+                            ChannelKind::Text => "#",
+                            ChannelKind::Voice => "🔊",
+                        };
+                        let selected = self.selected_channel == Some(channel.channel_id);
+                        let base_bg = if self.theme.list_row_shading {
+                            ui.visuals().faint_bg_color
+                        } else {
+                            egui::Color32::TRANSPARENT
+                        };
+                        let selected_bg = ui.visuals().selection.bg_fill.gamma_multiply(
+                            if self.theme.list_row_shading {
+                                0.35
+                            } else {
+                                0.22
                             },
-                            &mut self.status,
                         );
+                        let row_fill = if selected { selected_bg } else { base_bg };
+                        let row_stroke = if selected {
+                            egui::Stroke::new(
+                                1.0,
+                                ui.visuals().selection.bg_fill.gamma_multiply(0.9),
+                            )
+                        } else if self.theme.list_row_shading {
+                            egui::Stroke::new(
+                                1.0,
+                                ui.visuals().widgets.noninteractive.bg_stroke.color,
+                            )
+                        } else {
+                            egui::Stroke::NONE
+                        };
+
+                        let response = egui::Frame::none()
+                            .fill(row_fill)
+                            .stroke(row_stroke)
+                            .rounding(egui::Rounding::same(6.0))
+                            .inner_margin(egui::Margin::symmetric(8.0, 6.0))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.add_sized(
+                                        [18.0, 18.0],
+                                        egui::Label::new(egui::RichText::new(icon).monospace()),
+                                    );
+                                    ui.selectable_label(selected, &channel.name)
+                                })
+                                .inner
+                            })
+                            .inner;
+                        if response.clicked() {
+                            self.selected_channel = Some(channel.channel_id);
+                            queue_command(
+                                &self.cmd_tx,
+                                BackendCommand::SelectChannel {
+                                    channel_id: channel.channel_id,
+                                },
+                                &mut self.status,
+                            );
+                        }
+                        ui.add_space(4.0);
                     }
-                    ui.add_space(4.0);
+                });
+
+                if !self.auth_session_established {
+                    ui.separator();
+                    ui.label("Sign in to browse channels.");
                 }
             });
 
@@ -786,7 +763,7 @@ impl DesktopGuiApp {
             .show(ctx, |ui| {
                 ui.add_space(6.0);
                 let can_send = self.selected_channel.is_some();
-                ui.add_enabled_ui(can_send, |ui| {
+                ui.add_enabled_ui(can_send && self.auth_session_established, |ui| {
                     ui.horizontal(|ui| {
                         let response = ui.add_sized(
                             [ui.available_width() - 90.0, 72.0],
@@ -821,63 +798,18 @@ impl DesktopGuiApp {
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.add_enabled_ui(self.auth_session_established, |ui| {
-                ui.horizontal(|ui| {
-                    ui.heading("Messages");
-                    if let Some(channel_id) = self.selected_channel {
-                        if ui.button("Load older").clicked() {
-                            if let Some(before) = self.oldest_message_id(channel_id) {
-                                queue_command(
-                                    &self.cmd_tx,
-                                    BackendCommand::LoadMoreMessages { channel_id, before },
-                                    &mut self.status,
-                                );
-                            }
+            ui.horizontal(|ui| {
+                ui.heading("Messages");
+                if let Some(channel_id) = self.selected_channel {
+                    if ui.button("Load older").clicked() {
+                        if let Some(before) = self.oldest_message_id(channel_id) {
+                            queue_command(
+                                &self.cmd_tx,
+                                BackendCommand::LoadMoreMessages { channel_id, before },
+                                &mut self.status,
+                            );
                         }
                     }
-                });
-                ui.separator();
-
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    if let Some(channel_id) = self.selected_channel {
-                        if let Some(messages) = self.messages.get(&channel_id) {
-                            for msg in messages {
-                                let decoded = STANDARD
-                                    .decode(msg.ciphertext_b64.as_bytes())
-                                    .ok()
-                                    .and_then(|bytes| String::from_utf8(bytes).ok())
-                                    .unwrap_or_else(|| "<binary message>".to_string());
-                                ui.label(format!("{}: {}", msg.sender_id.0, decoded));
-                            }
-                        } else {
-                            ui.label("No messages yet");
-                        }
-                    } else {
-                        ui.label("Select a channel");
-                    }
-                });
-
-                ui.separator();
-                ui.horizontal(|ui| {
-                    let response = ui.add(
-                        egui::TextEdit::singleline(&mut self.composer)
-                            .hint_text("Type a message and press Enter"),
-                    );
-                    let pressed_enter =
-                        response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    let clicked_send = ui.button("Send").clicked();
-                    let should_send =
-                        (pressed_enter || clicked_send) && !self.composer.trim().is_empty();
-                    if should_send {
-                        let text = std::mem::take(&mut self.composer);
-                        queue_command(
-                            &self.cmd_tx,
-                            BackendCommand::SendMessage { text },
-                            &mut self.status,
-                        );
-                        response.request_focus();
-                    }
-                });
                 }
             });
             ui.separator();
