@@ -6,6 +6,7 @@ members = [
   "crates/server_api",
   "crates/server",
   "crates/client_core",
+  "crates/mls",
   "apps/desktop",
   "apps/desktop_gui",
   "apps/tools",
