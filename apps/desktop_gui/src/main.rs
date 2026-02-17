@@ -8,7 +8,6 @@ use std::{
 };
 
 use arboard::{Clipboard, ImageData};
-use base64::{engine::general_purpose::STANDARD, Engine as _};
 use client_core::{AttachmentUpload, ClientEvent, ClientHandle, PassthroughCrypto, RealtimeClient};
 use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 use eframe::egui;
@@ -84,6 +83,16 @@ enum UiEvent {
         reason: String,
     },
     Server(ServerEvent),
+    MessageDecrypted {
+        message: MessagePayload,
+        plaintext: String,
+    },
+}
+
+#[derive(Clone)]
+struct DisplayMessage {
+    wire: MessagePayload,
+    plaintext: String,
 }
 
 #[derive(Clone)]
@@ -296,7 +305,7 @@ struct DesktopGuiApp {
     channels: Vec<ChannelSummary>,
     selected_guild: Option<GuildId>,
     selected_channel: Option<ChannelId>,
-    messages: HashMap<ChannelId, Vec<MessagePayload>>,
+    messages: HashMap<ChannelId, Vec<DisplayMessage>>,
     members: HashMap<GuildId, Vec<MemberSummary>>,
     message_ids: HashMap<ChannelId, HashSet<MessageId>>,
     status: String,
@@ -441,6 +450,22 @@ impl DesktopGuiApp {
                     self.attachment_previews
                         .insert(file_id, AttachmentPreviewState::Error(reason));
                 }
+                UiEvent::MessageDecrypted { message, plaintext } => {
+                    if let Some(username) = &message.sender_username {
+                        self.sender_directory
+                            .insert(message.sender_id.0, username.clone());
+                    }
+
+                    let ids = self.message_ids.entry(message.channel_id).or_default();
+                    if ids.insert(message.message_id) {
+                        let messages = self.messages.entry(message.channel_id).or_default();
+                        messages.push(DisplayMessage {
+                            wire: message,
+                            plaintext,
+                        });
+                        messages.sort_by_key(|m| m.wire.message_id.0);
+                    }
+                }
                 UiEvent::Server(server_event) => match server_event {
                     ServerEvent::GuildUpdated { guild } => {
                         let guild_id = guild.guild_id;
@@ -485,19 +510,6 @@ impl DesktopGuiApp {
                             self.members.insert(guild_id, members);
                         }
                     }
-                    ServerEvent::MessageReceived { message } => {
-                        if let Some(username) = &message.sender_username {
-                            self.sender_directory
-                                .insert(message.sender_id.0, username.clone());
-                        }
-
-                        let ids = self.message_ids.entry(message.channel_id).or_default();
-                        if ids.insert(message.message_id) {
-                            let messages = self.messages.entry(message.channel_id).or_default();
-                            messages.push(message);
-                            messages.sort_by_key(|m| m.message_id.0);
-                        }
-                    }
                     ServerEvent::Error(err) => {
                         self.status = format!("Server error: {}", err.message);
                     }
@@ -511,7 +523,7 @@ impl DesktopGuiApp {
         self.messages
             .get(&channel_id)
             .and_then(|messages| messages.first())
-            .map(|message| message.message_id)
+            .map(|message| message.wire.message_id)
     }
 
     fn apply_theme_if_needed(&mut self, ctx: &egui::Context) {
@@ -1367,17 +1379,16 @@ impl DesktopGuiApp {
                 if let Some(channel_id) = self.selected_channel {
                     if let Some(messages) = self.messages.get(&channel_id).cloned() {
                         for msg in &messages {
-                            let decoded = STANDARD
-                                .decode(msg.ciphertext_b64.as_bytes())
-                                .ok()
-                                .and_then(|bytes| String::from_utf8(bytes).ok())
-                                .unwrap_or_else(|| "<binary message>".to_string());
                             let sender_display = msg
+                                .wire
                                 .sender_username
                                 .clone()
-                                .or_else(|| self.sender_directory.get(&msg.sender_id.0).cloned())
-                                .unwrap_or_else(|| msg.sender_id.0.to_string());
-                            let sent_at = msg.sent_at.format("%Y-%m-%d %H:%M:%S UTC").to_string();
+                                .or_else(|| {
+                                    self.sender_directory.get(&msg.wire.sender_id.0).cloned()
+                                })
+                                .unwrap_or_else(|| msg.wire.sender_id.0.to_string());
+                            let sent_at =
+                                msg.wire.sent_at.format("%Y-%m-%d %H:%M:%S UTC").to_string();
 
                             let message_margin = if self.readability.compact_density {
                                 egui::Margin::symmetric(6.0, 4.0)
@@ -1402,8 +1413,8 @@ impl DesktopGuiApp {
                                             ui.label(egui::RichText::new(sent_at).small().weak());
                                         }
                                     });
-                                    ui.label(decoded);
-                                    if let Some(attachment) = &msg.attachment {
+                                    ui.label(&msg.plaintext);
+                                    if let Some(attachment) = &msg.wire.attachment {
                                         if attachment_is_image(attachment) {
                                             self.render_image_attachment_preview(ui, attachment);
                                         } else {
@@ -1844,6 +1855,12 @@ fn spawn_backend_thread(cmd_rx: Receiver<BackendCommand>, ui_tx: Sender<UiEvent>
                                                     user_id,
                                                     username,
                                                 },
+                                                ClientEvent::MessageDecrypted {
+                                                    message,
+                                                    plaintext,
+                                                } => {
+                                                    UiEvent::MessageDecrypted { message, plaintext }
+                                                }
                                                 ClientEvent::Error(err) => UiEvent::Error(err),
                                             };
                                             let _ = ui_tx_clone.try_send(evt);
@@ -2037,7 +2054,10 @@ fn main() -> eframe::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::human_readable_bytes;
+    use super::{human_readable_bytes, DisplayMessage};
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use shared::domain::{ChannelId, MessageId, UserId};
+    use shared::protocol::MessagePayload;
 
     #[test]
     fn formats_attachment_sizes_readably() {
@@ -2048,5 +2068,23 @@ mod tests {
         assert_eq!(human_readable_bytes(2 * 1024 * 1024), "2 MB");
         assert_eq!(human_readable_bytes(1572864), "1.5 MB");
         assert_eq!(human_readable_bytes(3 * 1024 * 1024 * 1024), "3 GB");
+    }
+
+    #[test]
+    fn display_message_uses_decrypted_plaintext_for_rendering() {
+        let message = DisplayMessage {
+            wire: MessagePayload {
+                message_id: MessageId(1),
+                channel_id: ChannelId(9),
+                sender_id: UserId(42),
+                sender_username: Some("alice".to_string()),
+                ciphertext_b64: STANDARD.encode(b"ciphertext"),
+                attachment: None,
+                sent_at: "2024-01-01T00:00:00Z".parse().expect("timestamp"),
+            },
+            plaintext: "hello from mls".to_string(),
+        };
+
+        assert_eq!(message.plaintext, "hello from mls");
     }
 }

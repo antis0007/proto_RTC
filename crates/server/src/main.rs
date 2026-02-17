@@ -22,7 +22,7 @@ use server_api::{
 use shared::{
     domain::{ChannelId, ChannelKind, FileId, GuildId, UserId},
     error::{ApiError, ErrorCode},
-    protocol::{AttachmentPayload, KeyPackageResponse, ServerEvent, UploadKeyPackageResponse},
+    protocol::{AttachmentPayload, ServerEvent},
 };
 use storage::Storage;
 use tokio::sync::broadcast;
@@ -69,18 +69,6 @@ struct UserQuery {
 
 #[derive(Debug, Deserialize)]
 struct FileDownloadQuery {
-    user_id: i64,
-}
-
-#[derive(Debug, Deserialize)]
-struct UploadKeyPackageQuery {
-    user_id: i64,
-    guild_id: i64,
-}
-
-#[derive(Debug, Deserialize)]
-struct FetchKeyPackageQuery {
-    guild_id: i64,
     user_id: i64,
 }
 
