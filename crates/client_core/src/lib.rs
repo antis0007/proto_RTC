@@ -436,6 +436,7 @@ struct RealtimeClientState {
     channel_guilds: HashMap<ChannelId, GuildId>,
     sender_directory: HashMap<i64, String>,
     attempted_channel_member_additions: HashSet<(GuildId, ChannelId, i64)>,
+    initialized_mls_channels: HashSet<(GuildId, ChannelId)>,
     voice_session_keys: HashMap<VoiceConnectionKey, CachedVoiceSessionKey>,
 }
 
@@ -501,6 +502,7 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
                 channel_guilds: HashMap::new(),
                 sender_directory: HashMap::new(),
                 attempted_channel_member_additions: HashSet::new(),
+                initialized_mls_channels: HashSet::new(),
                 voice_session_keys: HashMap::new(),
             }),
             voice_connection: Mutex::new(None),
@@ -953,7 +955,7 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
         &self,
         guild_id: GuildId,
         channel_id: ChannelId,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let (server_url, user_id) = self.session().await?;
         let response = self
             .http
@@ -967,7 +969,7 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
             .await?;
 
         if response.status() == reqwest::StatusCode::NOT_FOUND {
-            return Ok(());
+            return Ok(false);
         }
 
         let response = response.error_for_status()?;
@@ -980,7 +982,13 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
             .await?;
         self.mls_session_manager
             .join_from_welcome(channel_id, &welcome_bytes)
+            .await?;
+        self.inner
+            .lock()
             .await
+            .initialized_mls_channels
+            .insert((guild_id, channel_id));
+        Ok(true)
     }
 
     async fn fetch_members_for_guild(&self, guild_id: GuildId) -> Result<Vec<MemberSummary>> {
@@ -1006,6 +1014,11 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
         self.mls_session_manager
             .open_or_create_group(guild_id, channel_id)
             .await?;
+        self.inner
+            .lock()
+            .await
+            .initialized_mls_channels
+            .insert((guild_id, channel_id));
         let members = self.fetch_members_for_guild(guild_id).await?;
 
         for member in members {
@@ -1089,6 +1102,11 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
         self.mls_session_manager
             .open_or_create_group(guild_id, message.channel_id)
             .await?;
+        self.inner
+            .lock()
+            .await
+            .initialized_mls_channels
+            .insert((guild_id, message.channel_id));
         let ciphertext = STANDARD
             .decode(message.ciphertext_b64.as_bytes())
             .with_context(|| {
@@ -1215,13 +1233,33 @@ impl<C: CryptoProvider + 'static> ClientHandle for Arc<RealtimeClient<C>> {
             guard.user_id = Some(body.user_id);
             guard.selected_guild = None;
             guard.selected_channel = None;
-            guard.ws_started = true;
+            guard.ws_started = false;
             guard.channel_guilds.clear();
             guard.sender_directory.clear();
+            guard.initialized_mls_channels.clear();
+            guard.attempted_channel_member_additions.clear();
             zeroize_voice_session_cache(&mut guard);
         }
 
-        self.spawn_ws_events(server_url, body.user_id).await?;
+        if let Err(err) = self.spawn_ws_events(server_url, body.user_id).await {
+            let mut guard = self.inner.lock().await;
+            guard.server_url = None;
+            guard.user_id = None;
+            guard.ws_started = false;
+            guard.selected_guild = None;
+            guard.selected_channel = None;
+            guard.channel_guilds.clear();
+            guard.sender_directory.clear();
+            guard.initialized_mls_channels.clear();
+            guard.attempted_channel_member_additions.clear();
+            zeroize_voice_session_cache(&mut guard);
+            return Err(err);
+        }
+
+        {
+            let mut guard = self.inner.lock().await;
+            guard.ws_started = true;
+        }
 
         let guilds: Vec<GuildSummary> = self
             .http
@@ -1320,11 +1358,31 @@ impl<C: CryptoProvider + 'static> ClientHandle for Arc<RealtimeClient<C>> {
         }
         .ok_or_else(|| anyhow!("no guild selected"))?;
 
-        // MVP trigger: perform add-member fanout on the first interaction with a channel after join.
-        self.maybe_join_from_pending_welcome(guild_id, channel_id)
+        let joined_from_welcome = self
+            .maybe_join_from_pending_welcome(guild_id, channel_id)
             .await?;
-        self.maybe_add_existing_members_to_channel_group(guild_id, channel_id)
-            .await?;
+        if !joined_from_welcome {
+            let members = self.fetch_members_for_guild(guild_id).await?;
+            let (_, current_user_id) = self.session().await?;
+            let current_role = members
+                .iter()
+                .find(|member| member.user_id.0 == current_user_id)
+                .map(|member| member.role);
+            if matches!(
+                current_role,
+                Some(shared::domain::Role::Owner | shared::domain::Role::Mod)
+            ) {
+                // MVP trigger: perform add-member fanout on first channel interaction for moderators.
+                self.maybe_add_existing_members_to_channel_group(guild_id, channel_id)
+                    .await?;
+            } else {
+                return Err(anyhow!(
+                    "MLS state for guild {} channel {} is uninitialized; wait for a moderator bootstrap or retry after welcome sync",
+                    guild_id.0,
+                    channel_id.0
+                ));
+            }
+        }
 
         self.fetch_messages(channel_id, 100, None).await?;
         Ok(())

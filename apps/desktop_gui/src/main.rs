@@ -110,10 +110,29 @@ enum UiErrorCategory {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UiErrorContext {
+    BackendStartup,
     Login,
     SendMessage,
     DecryptMessage,
     General,
+}
+
+fn classify_login_failure(message: &str) -> String {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("backend worker startup failure")
+        || lower.contains("failed to initialize persistent mls backend")
+        || lower.contains("failed to build backend runtime")
+    {
+        "Backend worker startup failure; verify local app environment and retry.".to_string()
+    } else if lower.contains("failed to connect")
+        || lower.contains("connection refused")
+        || lower.contains("dns")
+        || lower.contains("timed out")
+    {
+        "Server unreachable; check URL/network and retry sign-in.".to_string()
+    } else {
+        format!("Login/API error: {message}")
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -587,10 +606,17 @@ impl DesktopGuiApp {
                                     .to_string(),
                         });
                     } else {
-                        self.status = format!("{} error: {}", err_label(err.category), err.message);
+                        self.status = if err.context == UiErrorContext::Login {
+                            classify_login_failure(&err.message)
+                        } else {
+                            format!("{} error: {}", err_label(err.category), err.message)
+                        };
                         if matches!(
                             err.context,
-                            UiErrorContext::SendMessage | UiErrorContext::DecryptMessage
+                            UiErrorContext::Login
+                                | UiErrorContext::SendMessage
+                                | UiErrorContext::DecryptMessage
+                                | UiErrorContext::BackendStartup
                         ) {
                             self.status_banner = Some(StatusBanner {
                                 severity: StatusBannerSeverity::Error,
@@ -2164,17 +2190,35 @@ fn decode_preview_image(bytes: &[u8]) -> Result<PreviewImage, String> {
 }
 
 fn queue_command(cmd_tx: &Sender<BackendCommand>, cmd: BackendCommand, status: &mut String) {
+    let cmd_name = match &cmd {
+        BackendCommand::Login { .. } => "login",
+        BackendCommand::ListGuilds => "list_guilds",
+        BackendCommand::ListChannels { .. } => "list_channels",
+        BackendCommand::ListMembers { .. } => "list_members",
+        BackendCommand::SelectChannel { .. } => "select_channel",
+        BackendCommand::LoadMoreMessages { .. } => "load_more_messages",
+        BackendCommand::SendMessage { .. } => "send_message",
+        BackendCommand::DownloadAttachment { .. } => "download_attachment",
+        BackendCommand::FetchAttachmentPreview { .. } => "fetch_attachment_preview",
+        BackendCommand::CreateInvite { .. } => "create_invite",
+        BackendCommand::JoinWithInvite { .. } => "join_with_invite",
+        BackendCommand::ConnectVoice { .. } => "connect_voice",
+        BackendCommand::DisconnectVoice => "disconnect_voice",
+    };
+    tracing::debug!(command = cmd_name, "queueing ui->backend command");
     match cmd_tx.try_send(cmd) {
-        Ok(()) => {}
+        Ok(()) => {
+            tracing::debug!(command = cmd_name, "queued ui->backend command");
+        }
         Err(TrySendError::Full(_)) => {
             *status = "UI command queue is full; please retry".to_string();
-            tracing::warn!("ui->backend command queue is full");
+            tracing::warn!(command = cmd_name, "ui->backend command queue is full");
         }
         Err(TrySendError::Disconnected(_)) => {
             *status =
                 "Backend command processor disconnected (possible startup/runtime failure); retry sign-in"
                     .to_string();
-            tracing::error!("ui->backend command queue disconnected");
+            tracing::error!(command = cmd_name, "ui->backend command queue disconnected");
         }
     }
 }
@@ -2288,6 +2332,7 @@ impl eframe::App for DesktopGuiApp {
 
 fn spawn_backend_thread(cmd_rx: Receiver<BackendCommand>, ui_tx: Sender<UiEvent>) {
     thread::spawn(move || {
+        let _ = ui_tx.try_send(UiEvent::Info("Backend worker starting...".to_string()));
         let runtime = match tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -2295,8 +2340,8 @@ fn spawn_backend_thread(cmd_rx: Receiver<BackendCommand>, ui_tx: Sender<UiEvent>
             Ok(runtime) => runtime,
             Err(err) => {
                 let _ = ui_tx.try_send(UiEvent::Error(UiError::from_message(
-                    UiErrorContext::General,
-                    format!("failed to build backend runtime: {err}"),
+                    UiErrorContext::BackendStartup,
+                    format!("backend worker startup failure: failed to build runtime: {err}"),
                 )));
                 tracing::error!("failed to build backend runtime: {err}");
                 return;
@@ -2309,9 +2354,9 @@ fn spawn_backend_thread(cmd_rx: Receiver<BackendCommand>, ui_tx: Sender<UiEvent>
                     let base = PathBuf::from(home).join(".proto_rtc");
                     if let Err(err) = std::fs::create_dir_all(&base) {
                         let _ = ui_tx.try_send(UiEvent::Error(UiError::from_message(
-                            UiErrorContext::General,
+                            UiErrorContext::BackendStartup,
                             format!(
-                                "failed to create MLS state directory '{}': {err}",
+                                "backend worker startup failure: failed to create MLS state directory '{}': {err}",
                                 base.display()
                             ),
                         )));
@@ -2325,9 +2370,9 @@ fn spawn_backend_thread(cmd_rx: Receiver<BackendCommand>, ui_tx: Sender<UiEvent>
                 }
                 Err(err) => {
                     let _ = ui_tx.try_send(UiEvent::Error(UiError::from_message(
-                        UiErrorContext::General,
+                        UiErrorContext::BackendStartup,
                         format!(
-                            "HOME environment variable is required to initialize MLS backend: {err}"
+                            "backend worker startup failure: HOME environment variable is required to initialize MLS backend: {err}"
                         ),
                     )));
                     tracing::error!(
@@ -2342,9 +2387,9 @@ fn spawn_backend_thread(cmd_rx: Receiver<BackendCommand>, ui_tx: Sender<UiEvent>
                     Ok(manager) => manager,
                     Err(err) => {
                         let _ = ui_tx.try_send(UiEvent::Error(UiError::from_message(
-                            UiErrorContext::General,
+                            UiErrorContext::BackendStartup,
                             format!(
-                            "failed to initialize persistent MLS backend ({mls_db_url}): {err:#}"
+                            "backend worker startup failure: failed to initialize persistent MLS backend ({mls_db_url}): {err:#}"
                         ),
                         )));
                         tracing::error!(
@@ -2356,6 +2401,9 @@ fn spawn_backend_thread(cmd_rx: Receiver<BackendCommand>, ui_tx: Sender<UiEvent>
 
             let client =
                 RealtimeClient::new_with_mls_session_manager(PassthroughCrypto, mls_manager);
+            let _ = ui_tx.try_send(UiEvent::Info(
+                "Backend worker ready".to_string(),
+            ));
 
             let mut subscribed = false;
             while let Ok(cmd) = cmd_rx.recv() {
