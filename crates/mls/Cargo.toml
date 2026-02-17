@@ -1,18 +1,19 @@
 [package]
-name = "storage"
+name = "mls"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-async-trait.workspace = true
 anyhow.workspace = true
-chrono.workspace = true
+async-trait.workspace = true
 serde.workspace = true
-sqlx.workspace = true
 shared = { path = "../shared" }
-mls = { path = "../mls" }
-tokio.workspace = true
+thiserror.workspace = true
+openmls = "0.6"
+openmls_rust_crypto = "0.3"
+openmls_basic_credential = "0.3"
+tls_codec = "0.4"
 
 [dev-dependencies]
-tempfile = "3"
+tokio.workspace = true

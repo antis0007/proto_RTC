@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use mls::MlsStore;
 use sqlx::{
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
     Pool, Sqlite,
@@ -309,6 +311,71 @@ fn sqlite_path(database_url: &str) -> Option<PathBuf> {
 }
 
 use sqlx::Row;
+
+#[async_trait]
+impl MlsStore for Storage {
+    async fn save_identity_keys(
+        &self,
+        user_id: i64,
+        device_id: &str,
+        identity_bytes: &[u8],
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO mls_identity_keys (user_id, device_id, identity_bytes, updated_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+             ON CONFLICT(user_id, device_id) DO UPDATE SET identity_bytes = excluded.identity_bytes, updated_at = CURRENT_TIMESTAMP",
+        )
+        .bind(user_id)
+        .bind(device_id)
+        .bind(identity_bytes)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn load_identity_keys(&self, user_id: i64, device_id: &str) -> Result<Option<Vec<u8>>> {
+        let row = sqlx::query(
+            "SELECT identity_bytes FROM mls_identity_keys WHERE user_id = ? AND device_id = ?",
+        )
+        .bind(user_id)
+        .bind(device_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| r.get::<Vec<u8>, _>(0)))
+    }
+
+    async fn save_group_state(
+        &self,
+        guild_id: GuildId,
+        channel_id: ChannelId,
+        group_state_bytes: &[u8],
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO mls_group_states (guild_id, channel_id, group_state_bytes, updated_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+             ON CONFLICT(guild_id, channel_id) DO UPDATE SET group_state_bytes = excluded.group_state_bytes, updated_at = CURRENT_TIMESTAMP",
+        )
+        .bind(guild_id.0)
+        .bind(channel_id.0)
+        .bind(group_state_bytes)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn load_group_state(
+        &self,
+        guild_id: GuildId,
+        channel_id: ChannelId,
+    ) -> Result<Option<Vec<u8>>> {
+        let row = sqlx::query(
+            "SELECT group_state_bytes FROM mls_group_states WHERE guild_id = ? AND channel_id = ?",
+        )
+        .bind(guild_id.0)
+        .bind(channel_id.0)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| r.get::<Vec<u8>, _>(0)))
+    }
+}
 
 #[cfg(test)]
 mod tests {
