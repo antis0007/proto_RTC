@@ -97,8 +97,15 @@ struct DesktopGuiApp {
     message_ids: HashMap<ChannelId, HashSet<MessageId>>,
     status: String,
     settings_open: bool,
+    view_state: AppViewState,
     theme: ThemeSettings,
     applied_theme: Option<ThemeSettings>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppViewState {
+    Login,
+    Main,
 }
 
 impl DesktopGuiApp {
@@ -118,6 +125,7 @@ impl DesktopGuiApp {
             message_ids: HashMap::new(),
             status: "Not logged in".to_string(),
             settings_open: false,
+            view_state: AppViewState::Login,
             theme: ThemeSettings::discord_default(),
             applied_theme: None,
         }
@@ -127,6 +135,7 @@ impl DesktopGuiApp {
         while let Ok(event) = self.ui_rx.try_recv() {
             match event {
                 UiEvent::LoginOk => {
+                    self.view_state = AppViewState::Main;
                     self.status = "Logged in - syncing guilds".to_string();
                     self.guilds.clear();
                     self.channels.clear();
@@ -259,63 +268,73 @@ impl DesktopGuiApp {
                 }
             });
     }
-}
 
-fn queue_command(cmd_tx: &Sender<BackendCommand>, cmd: BackendCommand, status: &mut String) {
-    match cmd_tx.try_send(cmd) {
-        Ok(()) => {}
-        Err(TrySendError::Full(_)) => {
-            *status = "UI command queue is full; please retry".to_string();
-        }
-        Err(TrySendError::Disconnected(_)) => {
-            *status = "Backend is unavailable".to_string();
-        }
+    fn show_login_screen(&mut self, ctx: &egui::Context) {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.vertical_centered(|ui| {
+                ui.add_space(50.0);
+                ui.heading("Realtime Chat Login");
+                ui.add_space(16.0);
+
+                egui::Grid::new("login_form")
+                    .num_columns(2)
+                    .spacing([12.0, 10.0])
+                    .show(ui, |ui| {
+                        ui.label("Server:");
+                        ui.text_edit_singleline(&mut self.server_url);
+                        ui.end_row();
+
+                        ui.label("Username:");
+                        ui.text_edit_singleline(&mut self.username);
+                        ui.end_row();
+
+                        ui.label("Password:");
+                        ui.text_edit_singleline(&mut self.password_or_invite);
+                        ui.end_row();
+                    });
+
+                ui.add_space(12.0);
+                if ui.button("Login").clicked() {
+                    self.view_state = AppViewState::Login;
+                    queue_command(
+                        &self.cmd_tx,
+                        BackendCommand::Login {
+                            server_url: self.server_url.clone(),
+                            username: self.username.clone(),
+                            password_or_invite: self.password_or_invite.clone(),
+                        },
+                        &mut self.status,
+                    );
+                }
+
+                ui.add_space(8.0);
+                ui.separator();
+                ui.label("Have an invite code? Join a guild after you sign in.");
+
+                ui.horizontal(|ui| {
+                    ui.label("Invite code:");
+                    ui.text_edit_singleline(&mut self.password_or_invite);
+                    if ui.button("Join Invite").clicked() {
+                        let invite_code = self.password_or_invite.trim().to_string();
+                        if invite_code.is_empty() {
+                            self.status = "Enter an invite code first".to_string();
+                        } else {
+                            queue_command(
+                                &self.cmd_tx,
+                                BackendCommand::JoinWithInvite { invite_code },
+                                &mut self.status,
+                            );
+                        }
+                    }
+                });
+
+                ui.add_space(10.0);
+                ui.label(&self.status);
+            });
+        });
     }
-}
 
-fn visuals_for_theme(theme: ThemeSettings) -> egui::Visuals {
-    let mut visuals = match theme.preset {
-        ThemePreset::DiscordDark => {
-            let mut v = egui::Visuals::dark();
-            v.override_text_color = Some(egui::Color32::from_rgb(220, 221, 222));
-            v.window_fill = egui::Color32::from_rgb(54, 57, 63);
-            v.panel_fill = egui::Color32::from_rgb(47, 49, 54);
-            v.extreme_bg_color = egui::Color32::from_rgb(32, 34, 37);
-            v.faint_bg_color = egui::Color32::from_rgb(64, 68, 75);
-            v
-        }
-        ThemePreset::AtomOneDark => {
-            let mut v = egui::Visuals::dark();
-            v.override_text_color = Some(egui::Color32::from_rgb(171, 178, 191));
-            v.window_fill = egui::Color32::from_rgb(40, 44, 52);
-            v.panel_fill = egui::Color32::from_rgb(33, 37, 43);
-            v.extreme_bg_color = egui::Color32::from_rgb(24, 26, 31);
-            v.faint_bg_color = egui::Color32::from_rgb(52, 57, 66);
-            v
-        }
-        ThemePreset::EguiLight => egui::Visuals::light(),
-    };
-
-    visuals.hyperlink_color = theme.accent_color;
-    visuals.selection.bg_fill = theme.accent_color;
-    visuals.widgets.active.bg_fill = theme.accent_color;
-    visuals.widgets.hovered.bg_fill = theme.accent_color.gamma_multiply(0.85);
-
-    let radius = f32::from(theme.panel_rounding);
-    visuals.widgets.noninteractive.rounding = egui::Rounding::same(radius);
-    visuals.widgets.inactive.rounding = egui::Rounding::same(radius);
-    visuals.widgets.hovered.rounding = egui::Rounding::same(radius);
-    visuals.widgets.active.rounding = egui::Rounding::same(radius);
-    visuals.widgets.open.rounding = egui::Rounding::same(radius);
-
-    visuals
-}
-
-impl eframe::App for DesktopGuiApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.process_ui_events();
-        self.apply_theme_if_needed(ctx);
-
+    fn show_main_workspace(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {
                 if ui.button("⚙ Settings").clicked() {
@@ -538,6 +557,68 @@ impl eframe::App for DesktopGuiApp {
                 }
             });
         });
+    }
+}
+
+fn queue_command(cmd_tx: &Sender<BackendCommand>, cmd: BackendCommand, status: &mut String) {
+    match cmd_tx.try_send(cmd) {
+        Ok(()) => {}
+        Err(TrySendError::Full(_)) => {
+            *status = "UI command queue is full; please retry".to_string();
+        }
+        Err(TrySendError::Disconnected(_)) => {
+            *status = "Backend is unavailable".to_string();
+        }
+    }
+}
+
+fn visuals_for_theme(theme: ThemeSettings) -> egui::Visuals {
+    let mut visuals = match theme.preset {
+        ThemePreset::DiscordDark => {
+            let mut v = egui::Visuals::dark();
+            v.override_text_color = Some(egui::Color32::from_rgb(220, 221, 222));
+            v.window_fill = egui::Color32::from_rgb(54, 57, 63);
+            v.panel_fill = egui::Color32::from_rgb(47, 49, 54);
+            v.extreme_bg_color = egui::Color32::from_rgb(32, 34, 37);
+            v.faint_bg_color = egui::Color32::from_rgb(64, 68, 75);
+            v
+        }
+        ThemePreset::AtomOneDark => {
+            let mut v = egui::Visuals::dark();
+            v.override_text_color = Some(egui::Color32::from_rgb(171, 178, 191));
+            v.window_fill = egui::Color32::from_rgb(40, 44, 52);
+            v.panel_fill = egui::Color32::from_rgb(33, 37, 43);
+            v.extreme_bg_color = egui::Color32::from_rgb(24, 26, 31);
+            v.faint_bg_color = egui::Color32::from_rgb(52, 57, 66);
+            v
+        }
+        ThemePreset::EguiLight => egui::Visuals::light(),
+    };
+
+    visuals.hyperlink_color = theme.accent_color;
+    visuals.selection.bg_fill = theme.accent_color;
+    visuals.widgets.active.bg_fill = theme.accent_color;
+    visuals.widgets.hovered.bg_fill = theme.accent_color.gamma_multiply(0.85);
+
+    let radius = f32::from(theme.panel_rounding);
+    visuals.widgets.noninteractive.rounding = egui::Rounding::same(radius);
+    visuals.widgets.inactive.rounding = egui::Rounding::same(radius);
+    visuals.widgets.hovered.rounding = egui::Rounding::same(radius);
+    visuals.widgets.active.rounding = egui::Rounding::same(radius);
+    visuals.widgets.open.rounding = egui::Rounding::same(radius);
+
+    visuals
+}
+
+impl eframe::App for DesktopGuiApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.process_ui_events();
+        self.apply_theme_if_needed(ctx);
+
+        match self.view_state {
+            AppViewState::Login => self.show_login_screen(ctx),
+            AppViewState::Main => self.show_main_workspace(ctx),
+        }
 
         ctx.request_repaint();
     }
@@ -579,12 +660,6 @@ fn spawn_backend_thread(cmd_rx: Receiver<BackendCommand>, ui_tx: Sender<UiEvent>
                                             let _ = ui_tx_clone.try_send(evt);
                                         }
                                     });
-                                }
-                                let invite_code = password_or_invite.trim().to_string();
-                                if !invite_code.is_empty() {
-                                    if let Err(err) = client.join_with_invite(&invite_code).await {
-                                        let _ = ui_tx.try_send(UiEvent::Error(err.to_string()));
-                                    }
                                 }
                                 let _ = ui_tx.try_send(UiEvent::LoginOk);
                             }
