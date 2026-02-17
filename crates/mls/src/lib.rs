@@ -210,7 +210,7 @@ impl<S: MlsStore> MlsGroupHandle<S> {
         let group = self
             .group
             .as_mut()
-            .ok_or_else(|| anyhow!("group not initialized"))?;
+            .ok_or_else(|| anyhow!("MLS group not initialized"))?;
         let (commit, welcome, _group_info) = group.add_members(provider, signer, &[key_package])?;
         let commit_bytes = commit.tls_serialize_detached()?;
         let welcome_bytes = Some(welcome.tls_serialize_detached()?);
@@ -225,7 +225,7 @@ impl<S: MlsStore> MlsGroupHandle<S> {
         let group = self
             .group
             .as_mut()
-            .ok_or_else(|| anyhow!("group not initialized"))?;
+            .ok_or_else(|| anyhow!("MLS group not initialized"))?;
         let msg = group.create_message(provider, signer, plaintext_bytes)?;
         Ok(msg.tls_serialize_detached()?)
     }
@@ -240,7 +240,7 @@ impl<S: MlsStore> MlsGroupHandle<S> {
         let group = self
             .group
             .as_mut()
-            .ok_or_else(|| anyhow!("group not initialized"))?;
+            .ok_or_else(|| anyhow!("MLS group not initialized"))?;
         let processed = group.process_message(provider, protocol_message)?;
 
         match processed.into_content() {
@@ -258,7 +258,7 @@ impl<S: MlsStore> MlsGroupHandle<S> {
         let group = self
             .group
             .as_ref()
-            .ok_or_else(|| anyhow!("group not initialized"))?;
+            .ok_or_else(|| anyhow!("MLS group not initialized"))?;
         Ok(group.export_secret(&self.provider, label, &[], len)?)
     }
 
