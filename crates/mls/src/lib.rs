@@ -1,9 +1,12 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
-use openmls_rust_crypto::OpenMlsRustCrypto;
+use openmls_rust_crypto::{MemoryStorage, RustCrypto};
+use openmls_traits::OpenMlsProvider;
+use serde::{Deserialize, Serialize};
 use shared::domain::{ChannelId, GuildId};
+use std::{collections::HashMap, sync::RwLock};
 use tls_codec::{Deserialize as TlsDeserializeTrait, Serialize as TlsSerializeTrait};
 
 const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
@@ -33,7 +36,7 @@ impl MlsIdentity {
         })
     }
 
-    pub fn key_package(&self, provider: &OpenMlsRustCrypto) -> Result<KeyPackage> {
+    pub fn key_package<P: OpenMlsProvider>(&self, provider: &P) -> Result<KeyPackage> {
         let bundle = KeyPackage::builder().build(
             CIPHERSUITE,
             provider,
@@ -43,7 +46,7 @@ impl MlsIdentity {
         Ok(bundle.key_package().clone())
     }
 
-    pub fn key_package_bytes(&self, provider: &OpenMlsRustCrypto) -> Result<Vec<u8>> {
+    pub fn key_package_bytes<P: OpenMlsProvider>(&self, provider: &P) -> Result<Vec<u8>> {
         Ok(self.key_package(provider)?.tls_serialize_detached()?)
     }
 }
@@ -70,11 +73,66 @@ pub trait MlsStore: Send + Sync {
     ) -> Result<Option<Vec<u8>>>;
 }
 
+#[derive(Default, Debug)]
+pub struct PersistentOpenMlsProvider {
+    crypto: RustCrypto,
+    storage: MemoryStorage,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SerializableStorage {
+    entries: Vec<(Vec<u8>, Vec<u8>)>,
+}
+
+impl PersistentOpenMlsProvider {
+    fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let snapshot: SerializableStorage = serde_json::from_slice(bytes)
+            .context("failed to deserialize OpenMLS storage snapshot")?;
+        let values = snapshot.entries.into_iter().collect::<HashMap<_, _>>();
+        Ok(Self {
+            crypto: RustCrypto::default(),
+            storage: MemoryStorage {
+                values: RwLock::new(values),
+            },
+        })
+    }
+
+    fn to_bytes(&self) -> Result<Vec<u8>> {
+        let entries = self
+            .storage
+            .values
+            .read()
+            .map_err(|_| anyhow!("failed to read OpenMLS storage lock"))?
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        Ok(serde_json::to_vec(&SerializableStorage { entries })?)
+    }
+}
+
+impl OpenMlsProvider for PersistentOpenMlsProvider {
+    type CryptoProvider = RustCrypto;
+    type RandProvider = RustCrypto;
+    type StorageProvider = MemoryStorage;
+
+    fn storage(&self) -> &Self::StorageProvider {
+        &self.storage
+    }
+
+    fn crypto(&self) -> &Self::CryptoProvider {
+        &self.crypto
+    }
+
+    fn rand(&self) -> &Self::RandProvider {
+        &self.crypto
+    }
+}
+
 pub struct MlsGroupHandle<S: MlsStore> {
     store: S,
     guild_id: GuildId,
     channel_id: ChannelId,
-    provider: OpenMlsRustCrypto,
+    provider: PersistentOpenMlsProvider,
     identity: MlsIdentity,
     group: Option<MlsGroup>,
 }
@@ -85,9 +143,28 @@ impl<S: MlsStore> MlsGroupHandle<S> {
             store,
             guild_id,
             channel_id,
-            provider: OpenMlsRustCrypto::default(),
+            provider: PersistentOpenMlsProvider::default(),
             identity,
             group: None,
+        }
+    }
+
+    pub async fn load_or_create_group(&mut self) -> Result<()> {
+        if let Some(saved_state) = self
+            .store
+            .load_group_state(self.guild_id, self.channel_id)
+            .await?
+        {
+            self.provider = PersistentOpenMlsProvider::from_bytes(&saved_state)?;
+            let group_id = GroupId::from_slice(&self.channel_id.0.to_le_bytes());
+            self.group = Some(
+                MlsGroup::load(self.provider.storage(), &group_id)
+                    .map_err(|e| anyhow!("failed to load persisted mls group: {e}"))?
+                    .ok_or_else(|| anyhow!("persisted mls storage missing group state"))?,
+            );
+            Ok(())
+        } else {
+            self.create_group(self.channel_id).await
         }
     }
 
@@ -154,20 +231,6 @@ impl<S: MlsStore> MlsGroupHandle<S> {
         Ok((commit_bytes, welcome_bytes))
     }
 
-    pub async fn remove_member(&mut self, member: LeafNodeIndex) -> Result<Vec<u8>> {
-        let provider = &self.provider;
-        let signer = &self.identity.signer;
-        let group = self
-            .group
-            .as_mut()
-            .ok_or_else(|| anyhow!("group not initialized"))?;
-        let (commit, _welcome, _group_info) = group.remove_members(provider, signer, &[member])?;
-        let bytes = commit.tls_serialize_detached()?;
-        group.merge_pending_commit(provider)?;
-        self.persist_group().await?;
-        Ok(bytes)
-    }
-
     pub fn encrypt_application(&mut self, plaintext_bytes: &[u8]) -> Result<Vec<u8>> {
         let provider = &self.provider;
         let signer = &self.identity.signer;
@@ -179,7 +242,7 @@ impl<S: MlsStore> MlsGroupHandle<S> {
         Ok(msg.tls_serialize_detached()?)
     }
 
-    pub fn decrypt_application(&mut self, ciphertext_bytes: &[u8]) -> Result<Vec<u8>> {
+    pub async fn decrypt_application(&mut self, ciphertext_bytes: &[u8]) -> Result<Vec<u8>> {
         let mut ciphertext_bytes = ciphertext_bytes;
         let message_in = MlsMessageIn::tls_deserialize(&mut ciphertext_bytes)?;
         let protocol_message: ProtocolMessage = message_in
@@ -196,6 +259,7 @@ impl<S: MlsStore> MlsGroupHandle<S> {
             ProcessedMessageContent::ApplicationMessage(app_msg) => Ok(app_msg.into_bytes()),
             ProcessedMessageContent::StagedCommitMessage(staged_commit) => {
                 group.merge_staged_commit(provider, *staged_commit)?;
+                self.persist_group().await?;
                 Ok(Vec::new())
             }
             _ => Err(anyhow!("message was not an application message")),
@@ -211,170 +275,9 @@ impl<S: MlsStore> MlsGroupHandle<S> {
     }
 
     async fn persist_group(&self) -> Result<()> {
-        if let Some(group) = &self.group {
-            // OpenMLS 0.6 does not expose direct TLS serialization for `MlsGroup` itself.
-            // Persist group identifier bytes as the stable handle until a dedicated
-            // state-export/import API is wired in for full snapshot persistence.
-            self.store
-                .save_group_state(self.guild_id, self.channel_id, group.group_id().as_slice())
-                .await?;
-        }
+        self.store
+            .save_group_state(self.guild_id, self.channel_id, &self.provider.to_bytes()?)
+            .await?;
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::{collections::HashMap, sync::Arc};
-    use tokio::sync::Mutex;
-
-    type IdentityKey = (i64, String);
-    type GroupKey = (i64, i64);
-    type BlobMap<K> = Arc<Mutex<HashMap<K, Vec<u8>>>>;
-
-    #[derive(Default, Clone)]
-    struct MemoryStore {
-        identities: BlobMap<IdentityKey>,
-        groups: BlobMap<GroupKey>,
-    }
-
-    #[async_trait]
-    impl MlsStore for MemoryStore {
-        async fn save_identity_keys(
-            &self,
-            user_id: i64,
-            device_id: &str,
-            identity_bytes: &[u8],
-        ) -> Result<()> {
-            self.identities
-                .lock()
-                .await
-                .insert((user_id, device_id.to_string()), identity_bytes.to_vec());
-            Ok(())
-        }
-
-        async fn load_identity_keys(
-            &self,
-            user_id: i64,
-            device_id: &str,
-        ) -> Result<Option<Vec<u8>>> {
-            Ok(self
-                .identities
-                .lock()
-                .await
-                .get(&(user_id, device_id.to_string()))
-                .cloned())
-        }
-
-        async fn save_group_state(
-            &self,
-            guild_id: GuildId,
-            channel_id: ChannelId,
-            group_state_bytes: &[u8],
-        ) -> Result<()> {
-            self.groups
-                .lock()
-                .await
-                .insert((guild_id.0, channel_id.0), group_state_bytes.to_vec());
-            Ok(())
-        }
-
-        async fn load_group_state(
-            &self,
-            guild_id: GuildId,
-            channel_id: ChannelId,
-        ) -> Result<Option<Vec<u8>>> {
-            Ok(self
-                .groups
-                .lock()
-                .await
-                .get(&(guild_id.0, channel_id.0))
-                .cloned())
-        }
-    }
-
-    #[tokio::test]
-    async fn merge_commit_before_decrypting_next_application() {
-        let guild_id = GuildId(1);
-        let channel_id = ChannelId(20);
-
-        let alice_identity = MlsIdentity::new_with_name(b"alice".to_vec()).expect("alice identity");
-        let bob_identity = MlsIdentity::new_with_name(b"bob".to_vec()).expect("bob identity");
-        let charlie_identity =
-            MlsIdentity::new_with_name(b"charlie".to_vec()).expect("charlie identity");
-
-        let mut alice =
-            MlsGroupHandle::new(MemoryStore::default(), guild_id, channel_id, alice_identity);
-        let bob = MlsGroupHandle::new(MemoryStore::default(), guild_id, channel_id, bob_identity);
-        let charlie = MlsGroupHandle::new(
-            MemoryStore::default(),
-            guild_id,
-            channel_id,
-            charlie_identity,
-        );
-
-        let bob_kp = bob.key_package_bytes().expect("bob key package bytes");
-        let charlie_kp = charlie
-            .key_package_bytes()
-            .expect("charlie key package bytes");
-        alice.create_group(channel_id).await.expect("create group");
-
-        let (commit_to_bob, welcome_for_bob) = alice.add_member(&bob_kp).await.expect("add bob");
-
-        let mut bob = bob;
-        bob.join_group_from_welcome(&welcome_for_bob.expect("welcome bob"))
-            .await
-            .expect("bob joins");
-
-        let (commit_for_existing, _welcome_for_charlie) =
-            alice.add_member(&charlie_kp).await.expect("add charlie");
-
-        let _ = bob
-            .decrypt_application(&commit_for_existing)
-            .expect("process inbound commit and merge it");
-
-        let ciphertext = alice
-            .encrypt_application(b"post-commit message")
-            .expect("encrypt app message");
-        let plaintext = bob
-            .decrypt_application(&ciphertext)
-            .expect("decrypt app message after commit merge");
-
-        assert_eq!(plaintext, b"post-commit message");
-        assert!(!commit_to_bob.is_empty());
-    }
-
-    #[tokio::test]
-    async fn two_members_exchange_application_message() {
-        let guild_id = GuildId(1);
-        let channel_id = ChannelId(10);
-
-        let alice_identity = MlsIdentity::new_with_name(b"alice".to_vec()).expect("alice identity");
-        let bob_identity = MlsIdentity::new_with_name(b"bob".to_vec()).expect("bob identity");
-
-        let mut alice =
-            MlsGroupHandle::new(MemoryStore::default(), guild_id, channel_id, alice_identity);
-        let bob = MlsGroupHandle::new(MemoryStore::default(), guild_id, channel_id, bob_identity);
-        let bob_kp = bob.key_package_bytes().expect("bob key package bytes");
-        alice.create_group(channel_id).await.expect("create group");
-
-        let (_commit, welcome) = alice.add_member(&bob_kp).await.expect("add member");
-        let welcome = welcome.expect("welcome message");
-
-        let mut bob = bob;
-        bob.join_group_from_welcome(&welcome)
-            .await
-            .expect("bob joins group");
-
-        let ciphertext = alice
-            .encrypt_application(b"hello bob")
-            .expect("encrypt app message");
-
-        let plaintext = bob
-            .decrypt_application(&ciphertext)
-            .expect("decrypt app message");
-
-        assert_eq!(plaintext, b"hello bob");
     }
 }

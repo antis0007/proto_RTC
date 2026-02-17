@@ -23,6 +23,7 @@ url.workspace = true
 thiserror.workspace = true
 hkdf = "0.12"
 livekit_integration = { path = "../livekit_integration" }
+storage = { path = "../storage" }
 sha2 = "0.10"
 zeroize = "1"
 
