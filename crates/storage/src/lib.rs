@@ -28,6 +28,14 @@ pub struct StoredMessage {
     pub created_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone)]
+pub struct StoredMember {
+    pub user_id: UserId,
+    pub username: String,
+    pub role: Role,
+    pub muted: bool,
+}
+
 impl Storage {
     pub async fn new(database_url: &str) -> Result<Self> {
         ensure_sqlite_parent_dir_exists(database_url)?;
@@ -55,6 +63,14 @@ impl Storage {
         .fetch_one(&self.pool)
         .await?;
         Ok(UserId(rec.get::<i64, _>(0)))
+    }
+
+    pub async fn username_for_user(&self, user_id: UserId) -> Result<Option<String>> {
+        let row = sqlx::query("SELECT username FROM users WHERE id = ?")
+            .bind(user_id.0)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|r| r.get::<String, _>(0)))
     }
 
     pub async fn create_guild(&self, name: &str, owner_user_id: UserId) -> Result<GuildId> {
@@ -169,6 +185,36 @@ impl Storage {
             };
             (role, r.get::<bool, _>(1), r.get::<bool, _>(2))
         }))
+    }
+
+    pub async fn list_members_for_guild(&self, guild_id: GuildId) -> Result<Vec<StoredMember>> {
+        let rows = sqlx::query(
+            "SELECT u.id, u.username, m.role, m.muted
+             FROM memberships m
+             INNER JOIN users u ON u.id = m.user_id
+             WHERE m.guild_id = ? AND m.banned = 0
+             ORDER BY lower(u.username) ASC",
+        )
+        .bind(guild_id.0)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                let role = match r.get::<String, _>(2).as_str() {
+                    "owner" => Role::Owner,
+                    "mod" => Role::Mod,
+                    _ => Role::Member,
+                };
+                StoredMember {
+                    user_id: UserId(r.get::<i64, _>(0)),
+                    username: r.get::<String, _>(1),
+                    role,
+                    muted: r.get::<bool, _>(3),
+                }
+            })
+            .collect())
     }
 
     pub async fn insert_message_ciphertext(
