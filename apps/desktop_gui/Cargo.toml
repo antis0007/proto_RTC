@@ -14,3 +14,5 @@ crossbeam-channel = "0.5"
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+serde.workspace = true
+serde_json.workspace = true

@@ -1,5 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
+    fs,
+    path::PathBuf,
     thread,
 };
 
@@ -7,6 +9,7 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use client_core::{ClientEvent, ClientHandle, PassthroughCrypto, RealtimeClient};
 use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 use eframe::egui;
+use serde::{Deserialize, Serialize};
 use shared::{
     domain::{ChannelId, ChannelKind, GuildId, MessageId},
     protocol::{ChannelSummary, GuildSummary, MessagePayload, ServerEvent},
@@ -48,7 +51,7 @@ enum UiEvent {
     Server(ServerEvent),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum ThemePreset {
     DiscordDark,
     AtomOneDark,
@@ -70,6 +73,160 @@ struct ThemeSettings {
     preset: ThemePreset,
     accent_color: egui::Color32,
     panel_rounding: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+enum DensityPreset {
+    Compact,
+    Comfortable,
+}
+
+impl DensityPreset {
+    fn label(self) -> &'static str {
+        match self {
+            DensityPreset::Compact => "Compact",
+            DensityPreset::Comfortable => "Comfortable",
+        }
+    }
+
+    fn spacing_multiplier(self) -> f32 {
+        match self {
+            DensityPreset::Compact => 0.85,
+            DensityPreset::Comfortable => 1.15,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+struct UiScaleSetting {
+    enabled: bool,
+    pixels_per_point: f32,
+}
+
+impl Default for UiScaleSetting {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            pixels_per_point: 1.0,
+        }
+    }
+}
+
+impl UiScaleSetting {
+    fn sanitized(self) -> Self {
+        Self {
+            enabled: self.enabled,
+            pixels_per_point: self.pixels_per_point.clamp(0.75, 2.5),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+struct PersistedThemeSettings {
+    preset: ThemePreset,
+    accent_color: [u8; 4],
+    panel_rounding: u8,
+}
+
+impl From<ThemeSettings> for PersistedThemeSettings {
+    fn from(theme: ThemeSettings) -> Self {
+        Self {
+            preset: theme.preset,
+            accent_color: theme.accent_color.to_array(),
+            panel_rounding: theme.panel_rounding,
+        }
+    }
+}
+
+impl From<PersistedThemeSettings> for ThemeSettings {
+    fn from(theme: PersistedThemeSettings) -> Self {
+        Self {
+            preset: theme.preset,
+            accent_color: egui::Color32::from_rgba_unmultiplied(
+                theme.accent_color[0],
+                theme.accent_color[1],
+                theme.accent_color[2],
+                theme.accent_color[3],
+            ),
+            panel_rounding: theme.panel_rounding,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+struct PersistedUiSettings {
+    theme: PersistedThemeSettings,
+    density: DensityPreset,
+    ui_scale: UiScaleSetting,
+}
+
+impl Default for PersistedUiSettings {
+    fn default() -> Self {
+        Self {
+            theme: PersistedThemeSettings::from(ThemeSettings::discord_default()),
+            density: DensityPreset::Comfortable,
+            ui_scale: UiScaleSetting::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct UiSettings {
+    theme: ThemeSettings,
+    density: DensityPreset,
+    ui_scale: UiScaleSetting,
+}
+
+impl Default for UiSettings {
+    fn default() -> Self {
+        let persisted = PersistedUiSettings::default();
+        Self::from(persisted)
+    }
+}
+
+impl From<PersistedUiSettings> for UiSettings {
+    fn from(settings: PersistedUiSettings) -> Self {
+        Self {
+            theme: ThemeSettings::from(settings.theme),
+            density: settings.density,
+            ui_scale: settings.ui_scale.sanitized(),
+        }
+    }
+}
+
+impl From<UiSettings> for PersistedUiSettings {
+    fn from(settings: UiSettings) -> Self {
+        Self {
+            theme: PersistedThemeSettings::from(settings.theme),
+            density: settings.density,
+            ui_scale: settings.ui_scale,
+        }
+    }
+}
+
+fn ui_settings_path() -> PathBuf {
+    std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join("desktop_gui_settings.json")
+}
+
+fn load_ui_settings() -> UiSettings {
+    let path = ui_settings_path();
+    let Ok(raw) = fs::read_to_string(path) else {
+        return UiSettings::default();
+    };
+
+    serde_json::from_str::<PersistedUiSettings>(&raw)
+        .map(UiSettings::from)
+        .unwrap_or_else(|_| UiSettings::default())
+}
+
+fn persist_ui_settings(settings: UiSettings) {
+    let persisted = PersistedUiSettings::from(settings);
+    let Ok(raw) = serde_json::to_string_pretty(&persisted) else {
+        return;
+    };
+    let _ = fs::write(ui_settings_path(), raw);
 }
 
 impl ThemeSettings {
@@ -97,12 +254,14 @@ struct DesktopGuiApp {
     message_ids: HashMap<ChannelId, HashSet<MessageId>>,
     status: String,
     settings_open: bool,
-    theme: ThemeSettings,
-    applied_theme: Option<ThemeSettings>,
+    settings: UiSettings,
+    applied_settings: Option<UiSettings>,
+    persisted_settings: Option<UiSettings>,
 }
 
 impl DesktopGuiApp {
     fn new(cmd_tx: Sender<BackendCommand>, ui_rx: Receiver<UiEvent>) -> Self {
+        let initial_settings = load_ui_settings();
         Self {
             cmd_tx,
             ui_rx,
@@ -118,8 +277,9 @@ impl DesktopGuiApp {
             message_ids: HashMap::new(),
             status: "Not logged in".to_string(),
             settings_open: false,
-            theme: ThemeSettings::discord_default(),
-            applied_theme: None,
+            settings: initial_settings,
+            applied_settings: None,
+            persisted_settings: Some(initial_settings),
         }
     }
 
@@ -205,15 +365,35 @@ impl DesktopGuiApp {
             .map(|message| message.message_id)
     }
 
-    fn apply_theme_if_needed(&mut self, ctx: &egui::Context) {
-        if self.applied_theme == Some(self.theme) {
+    fn apply_ui_settings_if_needed(&mut self, ctx: &egui::Context) {
+        if self.applied_settings == Some(self.settings) {
             return;
         }
 
         let mut style = (*ctx.style()).clone();
-        style.visuals = visuals_for_theme(self.theme);
+        style.visuals = visuals_for_theme(self.settings.theme);
+
+        let spacing_scale = self.settings.density.spacing_multiplier();
+        style.spacing.item_spacing = egui::vec2(8.0 * spacing_scale, 6.0 * spacing_scale);
+        style.spacing.button_padding = egui::vec2(8.0 * spacing_scale, 4.0 * spacing_scale);
+        style.spacing.interact_size = egui::vec2(40.0 * spacing_scale, 22.0 * spacing_scale);
+
         ctx.set_style(style);
-        self.applied_theme = Some(self.theme);
+
+        if self.settings.ui_scale.enabled {
+            ctx.set_pixels_per_point(self.settings.ui_scale.pixels_per_point);
+        } else if let Some(native_scale) = ctx.native_pixels_per_point() {
+            ctx.set_pixels_per_point(native_scale);
+        }
+
+        self.applied_settings = Some(self.settings);
+    }
+
+    fn persist_settings_if_needed(&mut self) {
+        if self.persisted_settings != Some(self.settings) {
+            persist_ui_settings(self.settings);
+            self.persisted_settings = Some(self.settings);
+        }
     }
 
     fn show_settings_window(&mut self, ctx: &egui::Context) {
@@ -227,20 +407,20 @@ impl DesktopGuiApp {
             .show(ctx, |ui| {
                 ui.label("Theme preset");
                 egui::ComboBox::from_id_source("theme_preset")
-                    .selected_text(self.theme.preset.label())
+                    .selected_text(self.settings.theme.preset.label())
                     .show_ui(ui, |ui| {
                         ui.selectable_value(
-                            &mut self.theme.preset,
+                            &mut self.settings.theme.preset,
                             ThemePreset::DiscordDark,
                             ThemePreset::DiscordDark.label(),
                         );
                         ui.selectable_value(
-                            &mut self.theme.preset,
+                            &mut self.settings.theme.preset,
                             ThemePreset::AtomOneDark,
                             ThemePreset::AtomOneDark.label(),
                         );
                         ui.selectable_value(
-                            &mut self.theme.preset,
+                            &mut self.settings.theme.preset,
                             ThemePreset::EguiLight,
                             ThemePreset::EguiLight.label(),
                         );
@@ -248,16 +428,58 @@ impl DesktopGuiApp {
 
                 ui.separator();
                 ui.label("Accent color");
-                ui.color_edit_button_srgba(&mut self.theme.accent_color);
+                ui.color_edit_button_srgba(&mut self.settings.theme.accent_color);
                 ui.add(
-                    egui::Slider::new(&mut self.theme.panel_rounding, 0..=16)
+                    egui::Slider::new(&mut self.settings.theme.panel_rounding, 0..=16)
                         .text("Panel rounding"),
                 );
 
+                ui.separator();
+                ui.label("Density");
+                egui::ComboBox::from_id_source("density_preset")
+                    .selected_text(self.settings.density.label())
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.settings.density,
+                            DensityPreset::Compact,
+                            DensityPreset::Compact.label(),
+                        );
+                        ui.selectable_value(
+                            &mut self.settings.density,
+                            DensityPreset::Comfortable,
+                            DensityPreset::Comfortable.label(),
+                        );
+                    });
+
+                ui.separator();
+                ui.checkbox(&mut self.settings.ui_scale.enabled, "Override UI scale");
+                ui.add_enabled_ui(self.settings.ui_scale.enabled, |ui| {
+                    ui.add(
+                        egui::Slider::new(&mut self.settings.ui_scale.pixels_per_point, 0.75..=2.5)
+                            .text("Pixels per point")
+                            .step_by(0.05),
+                    );
+                });
+
                 if ui.button("Reset to Discord default").clicked() {
-                    self.theme = ThemeSettings::discord_default();
+                    self.settings = UiSettings::default();
                 }
             });
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LayoutBreakpoints {
+    hide_members_width: f32,
+    hide_channels_width: f32,
+}
+
+impl LayoutBreakpoints {
+    const fn default() -> Self {
+        Self {
+            hide_members_width: 1100.0,
+            hide_channels_width: 760.0,
+        }
     }
 }
 
@@ -314,7 +536,13 @@ fn visuals_for_theme(theme: ThemeSettings) -> egui::Visuals {
 impl eframe::App for DesktopGuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.process_ui_events();
-        self.apply_theme_if_needed(ctx);
+        self.apply_ui_settings_if_needed(ctx);
+        self.persist_settings_if_needed();
+
+        let window_width = ctx.screen_rect().width();
+        let breakpoints = LayoutBreakpoints::default();
+        let show_channels_panel = window_width >= breakpoints.hide_channels_width;
+        let show_members_panel = window_width >= breakpoints.hide_members_width;
 
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {
@@ -392,52 +620,56 @@ impl eframe::App for DesktopGuiApp {
                 }
             });
 
-        egui::SidePanel::left("channels_panel")
-            .default_width(220.0)
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.heading("Channels");
-                    if ui.button("Refresh").clicked() {
-                        if let Some(guild_id) = self.selected_guild {
+        if show_channels_panel {
+            egui::SidePanel::left("channels_panel")
+                .default_width(220.0)
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.heading("Channels");
+                        if ui.button("Refresh").clicked() {
+                            if let Some(guild_id) = self.selected_guild {
+                                queue_command(
+                                    &self.cmd_tx,
+                                    BackendCommand::ListChannels { guild_id },
+                                    &mut self.status,
+                                );
+                            } else {
+                                self.status = "Select a guild first".to_string();
+                            }
+                        }
+                    });
+                    for channel in &self.channels {
+                        let icon = match channel.kind {
+                            ChannelKind::Text => "#",
+                            ChannelKind::Voice => "🔊",
+                        };
+                        let label = format!("{icon} {}", channel.name);
+                        let selected = self.selected_channel == Some(channel.channel_id);
+                        if ui.selectable_label(selected, label).clicked() {
+                            self.selected_channel = Some(channel.channel_id);
                             queue_command(
                                 &self.cmd_tx,
-                                BackendCommand::ListChannels { guild_id },
+                                BackendCommand::SelectChannel {
+                                    channel_id: channel.channel_id,
+                                },
                                 &mut self.status,
                             );
-                        } else {
-                            self.status = "Select a guild first".to_string();
                         }
                     }
                 });
-                for channel in &self.channels {
-                    let icon = match channel.kind {
-                        ChannelKind::Text => "#",
-                        ChannelKind::Voice => "🔊",
-                    };
-                    let label = format!("{icon} {}", channel.name);
-                    let selected = self.selected_channel == Some(channel.channel_id);
-                    if ui.selectable_label(selected, label).clicked() {
-                        self.selected_channel = Some(channel.channel_id);
-                        queue_command(
-                            &self.cmd_tx,
-                            BackendCommand::SelectChannel {
-                                channel_id: channel.channel_id,
-                            },
-                            &mut self.status,
-                        );
-                    }
-                }
-            });
+        }
 
-        egui::SidePanel::right("members_panel")
-            .default_width(160.0)
-            .show(ctx, |ui| {
-                ui.heading("Members");
-                ui.label("(placeholder)");
-                ui.separator();
-                ui.heading("Voice");
-                ui.label("No participants");
-            });
+        if show_members_panel {
+            egui::SidePanel::right("members_panel")
+                .default_width(160.0)
+                .show(ctx, |ui| {
+                    ui.heading("Members");
+                    ui.label("(placeholder)");
+                    ui.separator();
+                    ui.heading("Voice");
+                    ui.label("No participants");
+                });
+        }
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -487,13 +719,17 @@ impl eframe::App for DesktopGuiApp {
                 let should_send =
                     (pressed_enter || clicked_send) && !self.composer.trim().is_empty();
                 if should_send {
-                    let text = std::mem::take(&mut self.composer);
-                    queue_command(
-                        &self.cmd_tx,
-                        BackendCommand::SendMessage { text },
-                        &mut self.status,
-                    );
-                    response.request_focus();
+                    if self.selected_channel.is_none() {
+                        self.status = "Select a channel before sending a message".to_string();
+                    } else {
+                        let text = std::mem::take(&mut self.composer);
+                        queue_command(
+                            &self.cmd_tx,
+                            BackendCommand::SendMessage { text },
+                            &mut self.status,
+                        );
+                        response.request_focus();
+                    }
                 }
             });
         });
