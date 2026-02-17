@@ -4,10 +4,7 @@ use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::OpenMlsRustCrypto;
 use shared::domain::{ChannelId, GuildId};
-use tls_codec::{
-    Deserialize as TlsDeserializeTrait, DeserializeBytes as TlsDeserializeBytesTrait,
-    Serialize as TlsSerializeTrait,
-};
+use tls_codec::{Deserialize as TlsDeserializeTrait, Serialize as TlsSerializeTrait};
 
 const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
 
@@ -122,9 +119,11 @@ impl<S: MlsStore> MlsGroupHandle<S> {
         &mut self,
         key_package_bytes: &[u8],
     ) -> Result<(Vec<u8>, Option<Vec<u8>>)> {
-        let key_package = <KeyPackage as TlsDeserializeBytesTrait>::tls_deserialize_exact_bytes(
-            key_package_bytes,
-        )?;
+        let mut bytes = key_package_bytes;
+        let key_package = <KeyPackage as TlsDeserializeTrait>::tls_deserialize(&mut bytes)?;
+        if !bytes.is_empty() {
+            return Err(anyhow!("key package bytes had trailing data"));
+        }
         let provider = &self.provider;
         let signer = &self.identity.signer;
         let group = self
