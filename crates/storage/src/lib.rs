@@ -1,6 +1,14 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use sqlx::{sqlite::SqlitePoolOptions, Pool, Sqlite};
+use sqlx::{
+    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
+    Pool, Sqlite,
+};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    str::FromStr,
+};
 
 use shared::domain::{ChannelId, ChannelKind, FileId, GuildId, MessageId, Role, UserId};
 
@@ -20,9 +28,12 @@ pub struct StoredMessage {
 
 impl Storage {
     pub async fn new(database_url: &str) -> Result<Self> {
+        ensure_sqlite_parent_dir_exists(database_url)?;
+
+        let connect_options = SqliteConnectOptions::from_str(database_url)?.create_if_missing(true);
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
-            .connect(database_url)
+            .connect_with(connect_options)
             .await?;
         sqlx::migrate!("./migrations").run(&pool).await?;
         Ok(Self { pool })
@@ -205,6 +216,44 @@ impl Storage {
     }
 }
 
+fn ensure_sqlite_parent_dir_exists(database_url: &str) -> Result<()> {
+    let Some(path) = sqlite_path(database_url) else {
+        return Ok(());
+    };
+
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+
+    fs::create_dir_all(parent).with_context(|| {
+        format!(
+            "failed to create parent directory '{}' for database url '{database_url}'",
+            parent.display()
+        )
+    })?;
+
+    Ok(())
+}
+
+fn sqlite_path(database_url: &str) -> Option<PathBuf> {
+    if database_url == "sqlite::memory:" || !database_url.starts_with("sqlite:") {
+        return None;
+    }
+
+    let path = database_url
+        .trim_start_matches("sqlite://")
+        .trim_start_matches("sqlite:")
+        .split('?')
+        .next()
+        .unwrap_or_default();
+
+    if path.is_empty() {
+        return None;
+    }
+
+    Some(Path::new(path).to_path_buf())
+}
+
 use sqlx::Row;
 
 #[cfg(test)]
@@ -222,6 +271,28 @@ mod tests {
             .expect("guild list");
         assert_eq!(guilds.len(), 1);
         assert_eq!(guilds[0].0, guild);
+    }
+
+    #[tokio::test]
+    async fn creates_database_file_when_missing() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let temp_root = std::env::temp_dir().join(format!("proto_rtc_storage_test_{suffix}"));
+        let db_path = temp_root.join("nested").join("storage.db");
+        let database_url = format!("sqlite://{}", db_path.to_string_lossy().replace('\\', "/"));
+
+        let storage = Storage::new(&database_url).await.expect("db");
+        drop(storage);
+
+        assert!(
+            db_path.exists(),
+            "database file should exist: {}",
+            db_path.display()
+        );
+
+        std::fs::remove_dir_all(temp_root).expect("cleanup");
     }
 
     #[tokio::test]
