@@ -205,15 +205,11 @@ mod tests {
             .as_nanos();
 
         let temp_root = env::temp_dir().join(format!("proto_rtc_server_test_{suffix}"));
-        fs::create_dir_all(&temp_root).expect("temp root");
+        let db_path = temp_root.join("data").join("test.db");
 
-        let original_dir = env::current_dir().expect("cwd");
-        env::set_current_dir(&temp_root).expect("set cwd");
-
-        prepare_database_url("./data/test.db").expect("prepare db url");
+        prepare_database_url(db_path.to_string_lossy().as_ref()).expect("prepare db url");
         assert!(temp_root.join("data").exists());
 
-        env::set_current_dir(original_dir).expect("restore cwd");
         fs::remove_dir_all(temp_root).expect("cleanup");
     }
 
