@@ -80,7 +80,7 @@ enum UiEvent {
         user_id: i64,
         username: String,
     },
-    Error(String),
+    Error(UiError),
     AttachmentPreviewLoaded {
         file_id: FileId,
         image: PreviewImage,
@@ -102,6 +102,100 @@ enum UiEvent {
         participants: Vec<VoiceParticipantState>,
     },
     VoiceOperationFailed(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UiErrorCategory {
+    Auth,
+    Transport,
+    Crypto,
+    Validation,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UiErrorContext {
+    Login,
+    SendMessage,
+    DecryptMessage,
+    General,
+}
+
+#[derive(Debug, Clone)]
+struct UiError {
+    category: UiErrorCategory,
+    context: UiErrorContext,
+    message: String,
+}
+
+impl UiError {
+    fn from_message(context: UiErrorContext, message: impl Into<String>) -> Self {
+        let message = message.into();
+        let message_lower = message.to_ascii_lowercase();
+        let category = if message_lower.contains("401")
+            || message_lower.contains("403")
+            || message_lower.contains("unauthorized")
+            || message_lower.contains("forbidden")
+            || message_lower.contains("session expired")
+            || message_lower.contains("invalid token")
+            || message_lower.contains("invalid credential")
+        {
+            UiErrorCategory::Auth
+        } else if message_lower.contains("decrypt")
+            || message_lower.contains("encrypt")
+            || message_lower.contains("mls")
+            || message_lower.contains("cipher")
+            || message_lower.contains("crypto")
+        {
+            UiErrorCategory::Crypto
+        } else if message_lower.contains("invalid")
+            || message_lower.contains("missing")
+            || message_lower.contains("malformed")
+        {
+            UiErrorCategory::Validation
+        } else if message_lower.contains("timeout")
+            || message_lower.contains("connection")
+            || message_lower.contains("network")
+            || message_lower.contains("transport")
+            || message_lower.contains("unavailable")
+            || message_lower.contains("disconnect")
+        {
+            UiErrorCategory::Transport
+        } else {
+            UiErrorCategory::Unknown
+        };
+
+        Self {
+            category,
+            context,
+            message,
+        }
+    }
+
+    fn requires_reauth(&self) -> bool {
+        self.category == UiErrorCategory::Auth
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatusBannerSeverity {
+    Error,
+}
+
+#[derive(Debug, Clone)]
+struct StatusBanner {
+    severity: StatusBannerSeverity,
+    message: String,
+}
+
+fn err_label(category: UiErrorCategory) -> &'static str {
+    match category {
+        UiErrorCategory::Auth => "Authentication",
+        UiErrorCategory::Transport => "Transport",
+        UiErrorCategory::Crypto => "Crypto",
+        UiErrorCategory::Validation => "Validation",
+        UiErrorCategory::Unknown => "Unexpected",
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -386,6 +480,7 @@ struct DesktopGuiApp {
     members: HashMap<GuildId, Vec<MemberSummary>>,
     message_ids: HashMap<ChannelId, HashSet<MessageId>>,
     status: String,
+    status_banner: Option<StatusBanner>,
     sender_directory: HashMap<i64, String>,
     attachment_previews: HashMap<FileId, AttachmentPreviewState>,
     expanded_preview: Option<FileId>,
@@ -462,6 +557,7 @@ impl DesktopGuiApp {
             members: HashMap::new(),
             message_ids: HashMap::new(),
             status: "Not logged in".to_string(),
+            status_banner: None,
             sender_directory: HashMap::new(),
             attachment_previews: HashMap::new(),
             expanded_preview: None,
@@ -482,6 +578,7 @@ impl DesktopGuiApp {
                     self.auth_session_established = true;
                     self.view_state = AppViewState::Main;
                     self.status = "Logged in - syncing guilds".to_string();
+                    self.status_banner = None;
                     self.guilds.clear();
                     self.channels.clear();
                     self.messages.clear();
@@ -507,8 +604,28 @@ impl DesktopGuiApp {
                     self.sender_directory.insert(user_id, username);
                 }
                 UiEvent::Error(err) => {
-                    self.auth_session_established = false;
-                    self.status = format!("Error: {err}");
+                    if err.requires_reauth() {
+                        self.auth_session_established = false;
+                        self.view_state = AppViewState::Login;
+                        self.status = format!("Authentication error: {}", err.message);
+                        self.status_banner = Some(StatusBanner {
+                            severity: StatusBannerSeverity::Error,
+                            message:
+                                "Session expired or invalid credentials. Please sign in again."
+                                    .to_string(),
+                        });
+                    } else {
+                        self.status = format!("{} error: {}", err_label(err.category), err.message);
+                        if matches!(
+                            err.context,
+                            UiErrorContext::SendMessage | UiErrorContext::DecryptMessage
+                        ) {
+                            self.status_banner = Some(StatusBanner {
+                                severity: StatusBannerSeverity::Error,
+                                message: self.status.clone(),
+                            });
+                        }
+                    }
                 }
                 UiEvent::VoiceOperationFailed(err) => {
                     self.voice_ui.connection_status = VoiceSessionConnectionStatus::Error;
@@ -750,6 +867,31 @@ impl DesktopGuiApp {
             });
     }
 
+    fn show_status_banner(&mut self, ui: &mut egui::Ui) {
+        if let Some(banner) = self.status_banner.clone() {
+            let (fill, stroke) = match banner.severity {
+                StatusBannerSeverity::Error => (
+                    egui::Color32::from_rgb(111, 53, 53),
+                    egui::Stroke::new(1.0, egui::Color32::from_rgb(175, 96, 96)),
+                ),
+            };
+
+            egui::Frame::none()
+                .fill(fill)
+                .stroke(stroke)
+                .rounding(4.0)
+                .inner_margin(egui::Margin::symmetric(8.0, 6.0))
+                .show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(egui::RichText::new(&banner.message).color(egui::Color32::WHITE));
+                        if ui.button("Dismiss").clicked() {
+                            self.status_banner = None;
+                        }
+                    });
+                });
+        }
+    }
+
     fn show_login_screen(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.vertical_centered(|ui| {
@@ -839,6 +981,7 @@ impl DesktopGuiApp {
 
                 ui.add_space(10.0);
                 ui.label(&self.status);
+                self.show_status_banner(ui);
             });
         });
     }
@@ -2273,7 +2416,12 @@ fn spawn_backend_thread(cmd_rx: Receiver<BackendCommand>, ui_tx: Sender<UiEvent>
                                                     channel_id,
                                                     participants,
                                                 },
-                                                ClientEvent::Error(err) => UiEvent::Error(err),
+                                                ClientEvent::Error(err) => {
+                                                    UiEvent::Error(UiError::from_message(
+                                                        UiErrorContext::DecryptMessage,
+                                                        err,
+                                                    ))
+                                                }
                                             };
                                             let _ = ui_tx_clone.try_send(evt);
                                         }
@@ -2282,34 +2430,52 @@ fn spawn_backend_thread(cmd_rx: Receiver<BackendCommand>, ui_tx: Sender<UiEvent>
                                 let _ = ui_tx.try_send(UiEvent::LoginOk);
                             }
                             Err(err) => {
-                                let _ = ui_tx.try_send(UiEvent::Error(err.to_string()));
+                                let _ = ui_tx.try_send(UiEvent::Error(UiError::from_message(
+                                    UiErrorContext::Login,
+                                    err.to_string(),
+                                )));
                             }
                         }
                     }
                     BackendCommand::ListGuilds => {
                         if let Err(err) = client.list_guilds().await {
-                            let _ = ui_tx.try_send(UiEvent::Error(err.to_string()));
+                            let _ = ui_tx.try_send(UiEvent::Error(UiError::from_message(
+                                UiErrorContext::General,
+                                err.to_string(),
+                            )));
                         }
                     }
                     BackendCommand::ListChannels { guild_id } => {
                         if let Err(err) = client.list_channels(guild_id).await {
-                            let _ = ui_tx.try_send(UiEvent::Error(err.to_string()));
+                            let _ = ui_tx.try_send(UiEvent::Error(UiError::from_message(
+                                UiErrorContext::General,
+                                err.to_string(),
+                            )));
                         }
                     }
                     BackendCommand::ListMembers { guild_id } => {
                         if let Err(err) = client.list_members(guild_id).await {
-                            let _ = ui_tx.try_send(UiEvent::Error(err.to_string()));
+                            let _ = ui_tx.try_send(UiEvent::Error(UiError::from_message(
+                                UiErrorContext::General,
+                                err.to_string(),
+                            )));
                         }
                     }
                     BackendCommand::SelectChannel { channel_id } => {
                         if let Err(err) = client.select_channel(channel_id).await {
-                            let _ = ui_tx.try_send(UiEvent::Error(err.to_string()));
+                            let _ = ui_tx.try_send(UiEvent::Error(UiError::from_message(
+                                UiErrorContext::General,
+                                err.to_string(),
+                            )));
                         }
                     }
                     BackendCommand::LoadMoreMessages { channel_id, before } => {
                         if let Err(err) = client.fetch_messages(channel_id, 100, Some(before)).await
                         {
-                            let _ = ui_tx.try_send(UiEvent::Error(err.to_string()));
+                            let _ = ui_tx.try_send(UiEvent::Error(UiError::from_message(
+                                UiErrorContext::General,
+                                err.to_string(),
+                            )));
                         }
                     }
                     BackendCommand::SendMessage {
@@ -2345,7 +2511,10 @@ fn spawn_backend_thread(cmd_rx: Receiver<BackendCommand>, ui_tx: Sender<UiEvent>
                         };
 
                         if let Err(err) = result {
-                            let _ = ui_tx.try_send(UiEvent::Error(err.to_string()));
+                            let _ = ui_tx.try_send(UiEvent::Error(UiError::from_message(
+                                UiErrorContext::SendMessage,
+                                err.to_string(),
+                            )));
                         }
                     }
                     BackendCommand::FetchAttachmentPreview { file_id } => {
@@ -2387,16 +2556,20 @@ fn spawn_backend_thread(cmd_rx: Receiver<BackendCommand>, ui_tx: Sender<UiEvent>
                                             )));
                                         }
                                         Err(err) => {
-                                            let _ = ui_tx.try_send(UiEvent::Error(format!(
-                                                "Failed to save attachment: {err}"
-                                            )));
+                                            let _ = ui_tx.try_send(UiEvent::Error(
+                                                UiError::from_message(
+                                                    UiErrorContext::General,
+                                                    format!("Failed to save attachment: {err}"),
+                                                ),
+                                            ));
                                         }
                                     }
                                 }
                             }
                             Err(err) => {
-                                let _ = ui_tx.try_send(UiEvent::Error(format!(
-                                    "Failed to download attachment: {err}"
+                                let _ = ui_tx.try_send(UiEvent::Error(UiError::from_message(
+                                    UiErrorContext::General,
+                                    format!("Failed to download attachment: {err}"),
                                 )));
                             }
                         }
@@ -2407,7 +2580,10 @@ fn spawn_backend_thread(cmd_rx: Receiver<BackendCommand>, ui_tx: Sender<UiEvent>
                                 let _ = ui_tx.try_send(UiEvent::InviteCreated(invite_code));
                             }
                             Err(err) => {
-                                let _ = ui_tx.try_send(UiEvent::Error(err.to_string()));
+                                let _ = ui_tx.try_send(UiEvent::Error(UiError::from_message(
+                                    UiErrorContext::General,
+                                    err.to_string(),
+                                )));
                             }
                         }
                     }
@@ -2418,11 +2594,17 @@ fn spawn_backend_thread(cmd_rx: Receiver<BackendCommand>, ui_tx: Sender<UiEvent>
                                     "Joined guild from invite".to_string(),
                                 ));
                                 if let Err(err) = client.list_guilds().await {
-                                    let _ = ui_tx.try_send(UiEvent::Error(err.to_string()));
+                                    let _ = ui_tx.try_send(UiEvent::Error(UiError::from_message(
+                                        UiErrorContext::General,
+                                        err.to_string(),
+                                    )));
                                 }
                             }
                             Err(err) => {
-                                let _ = ui_tx.try_send(UiEvent::Error(err.to_string()));
+                                let _ = ui_tx.try_send(UiEvent::Error(UiError::from_message(
+                                    UiErrorContext::General,
+                                    err.to_string(),
+                                )));
                             }
                         }
                     }
