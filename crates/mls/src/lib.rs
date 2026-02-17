@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use openmls::prelude::*;
+use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::OpenMlsRustCrypto;
 use shared::domain::{ChannelId, GuildId};
 use tls_codec::{Deserialize as TlsDeserializeTrait, Serialize as TlsSerializeTrait};
@@ -14,7 +15,11 @@ pub struct MlsIdentity {
 }
 
 impl MlsIdentity {
-    pub fn new(name: impl Into<Vec<u8>>) -> Result<Self> {
+    pub fn new() -> Result<Self> {
+        Self::new_with_name(b"device".to_vec())
+    }
+
+    pub fn new_with_name(name: impl Into<Vec<u8>>) -> Result<Self> {
         let credential = BasicCredential::new(name.into());
         let signer = SignatureKeyPair::new(SignatureScheme::ED25519)?;
         let credential_with_key = CredentialWithKey {
@@ -29,12 +34,13 @@ impl MlsIdentity {
     }
 
     pub fn key_package(&self, provider: &OpenMlsRustCrypto) -> Result<KeyPackage> {
-        Ok(KeyPackage::builder().build(
+        let bundle = KeyPackage::builder().build(
             CIPHERSUITE,
             provider,
             &self.signer,
             self.credential_with_key.clone(),
-        )?)
+        )?;
+        Ok(bundle.key_package().clone())
     }
 
     pub fn key_package_bytes(&self, provider: &OpenMlsRustCrypto) -> Result<Vec<u8>> {
@@ -102,7 +108,11 @@ impl<S: MlsStore> MlsGroupHandle<S> {
     }
 
     pub async fn join_group_from_welcome(&mut self, welcome_bytes: &[u8]) -> Result<()> {
-        let welcome = Welcome::tls_deserialize_exact(welcome_bytes)?;
+        let mut bytes = welcome_bytes;
+        let welcome_message = MlsMessageIn::tls_deserialize(&mut bytes)?;
+        let welcome = welcome_message
+            .into_welcome()
+            .map_err(|_| anyhow!("welcome bytes did not contain a welcome message"))?;
         let config = MlsGroupJoinConfig::builder().build();
         let staged = StagedWelcome::new_from_welcome(&self.provider, &config, welcome, None)?;
         self.group = Some(staged.into_group(&self.provider)?);
@@ -113,12 +123,13 @@ impl<S: MlsStore> MlsGroupHandle<S> {
         &mut self,
         key_package_bytes: &[u8],
     ) -> Result<(Vec<u8>, Option<Vec<u8>>)> {
-        let key_package = KeyPackage::tls_deserialize_exact(key_package_bytes)?;
+        let mut key_package_bytes = key_package_bytes;
+        let key_package = KeyPackage::tls_deserialize(&mut key_package_bytes)?;
         let group = self.group_mut()?;
         let (commit, welcome, _group_info) =
             group.add_members(&self.provider, &self.identity.signer, &[key_package])?;
         let commit_bytes = commit.tls_serialize_detached()?;
-        let welcome_bytes = welcome.map(|w| w.tls_serialize_detached()).transpose()?;
+        let welcome_bytes = Some(welcome.tls_serialize_detached()?);
         group.merge_pending_commit(&self.provider)?;
         self.persist_group().await?;
         Ok((commit_bytes, welcome_bytes))
@@ -141,7 +152,11 @@ impl<S: MlsStore> MlsGroupHandle<S> {
     }
 
     pub fn decrypt_application(&mut self, ciphertext_bytes: &[u8]) -> Result<Vec<u8>> {
-        let protocol_message = ProtocolMessage::tls_deserialize_exact(ciphertext_bytes)?;
+        let mut ciphertext_bytes = ciphertext_bytes;
+        let message_in = MlsMessageIn::tls_deserialize(&mut ciphertext_bytes)?;
+        let protocol_message: ProtocolMessage = message_in
+            .try_into_protocol_message()
+            .map_err(|_| anyhow!("ciphertext did not contain a protocol message"))?;
         let group = self.group_mut()?;
         let processed = group.process_message(&self.provider, protocol_message)?;
 
@@ -167,12 +182,8 @@ impl<S: MlsStore> MlsGroupHandle<S> {
 
     async fn persist_group(&self) -> Result<()> {
         if let Some(group) = &self.group {
-            let state = group
-                .group_context()
-                .tls_serialize_detached()
-                .map_err(|e| anyhow!("serialize group context failed: {e}"))?;
             self.store
-                .save_group_state(self.guild_id, self.channel_id, &state)
+                .save_group_state(self.guild_id, self.channel_id, group.group_id().as_slice())
                 .await?;
         }
         Ok(())
@@ -251,8 +262,8 @@ mod tests {
         let guild_id = GuildId(1);
         let channel_id = ChannelId(10);
 
-        let alice_identity = MlsIdentity::new(b"alice".to_vec()).expect("alice identity");
-        let bob_identity = MlsIdentity::new(b"bob".to_vec()).expect("bob identity");
+        let alice_identity = MlsIdentity::new_with_name(b"alice".to_vec()).expect("alice identity");
+        let bob_identity = MlsIdentity::new_with_name(b"bob".to_vec()).expect("bob identity");
 
         let bob_provider = OpenMlsRustCrypto::default();
         let bob_kp = bob_identity
