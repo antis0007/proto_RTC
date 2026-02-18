@@ -2312,8 +2312,7 @@ impl DesktopGuiApp {
                                     egui::Frame::none()
                                 };
 
-                                ui
-                                    .allocate_ui_with_layout(
+                                ui.allocate_ui_with_layout(
                                         egui::vec2(ui.available_width(), 0.0),
                                         egui::Layout::top_down(egui::Align::Min),
                                         |ui| {
@@ -2371,8 +2370,7 @@ impl DesktopGuiApp {
                                                 })
                                                 .response
                                         },
-                                    )
-                                    .response;
+                                    );
 
                                 ui.add_space(if self.readability.compact_density {
                                     6.0
