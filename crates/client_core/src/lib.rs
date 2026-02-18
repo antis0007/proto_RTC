@@ -114,10 +114,7 @@ pub struct MissingMlsSessionManager;
 #[async_trait]
 impl MlsSessionManager for MissingMlsSessionManager {
     async fn key_package_bytes(&self, guild_id: GuildId) -> Result<Vec<u8>> {
-        Err(anyhow!(
-            "MLS backend unavailable for guild {}",
-            guild_id.0
-        ))
+        Err(anyhow!("MLS backend unavailable for guild {}", guild_id.0))
     }
 
     async fn open_or_create_group(&self, guild_id: GuildId, channel_id: ChannelId) -> Result<()> {
