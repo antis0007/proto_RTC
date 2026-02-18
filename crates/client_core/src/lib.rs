@@ -1063,15 +1063,15 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
                 continue;
             }
 
-            let should_attempt = {
-                let mut guard = self.inner.lock().await;
-                guard.attempted_channel_member_additions.insert((
+            let already_added = {
+                let guard = self.inner.lock().await;
+                guard.attempted_channel_member_additions.contains(&(
                     guild_id,
                     channel_id,
                     member.user_id.0,
                 ))
             };
-            if !should_attempt {
+            if already_added {
                 continue;
             }
 
@@ -1105,6 +1105,12 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
                     &add_member_outcome.welcome_bytes,
                 )
                 .await;
+
+            self.inner
+                .lock()
+                .await
+                .attempted_channel_member_additions
+                .insert((guild_id, channel_id, member.user_id.0));
         }
 
         Ok(())
@@ -1162,10 +1168,7 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
                     ));
                 }
             } else {
-                return Err(anyhow!(
-                    "missing guild mapping for channel {}",
-                    message.channel_id.0
-                ));
+                return Ok(());
             }
         };
 
@@ -1183,11 +1186,15 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
             .is_mls_channel_initialized(guild_id, message.channel_id)
             .await
         {
-            return Err(anyhow!(
-                "MLS state for guild {} channel {} is uninitialized; cannot decrypt incoming ciphertext yet",
-                guild_id.0,
-                message.channel_id.0
-            ));
+            let _ = self
+                .maybe_join_from_pending_welcome_with_retry(guild_id, message.channel_id)
+                .await;
+            if !self
+                .is_mls_channel_initialized(guild_id, message.channel_id)
+                .await
+            {
+                return Ok(());
+            }
         }
         let ciphertext = STANDARD
             .decode(message.ciphertext_b64.as_bytes())
@@ -1231,6 +1238,21 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
                 channel_id.0
             ));
         }
+
+        if let Ok(members) = self.fetch_members_for_guild(guild_id).await {
+            let current_role = members
+                .iter()
+                .find(|member| member.user_id.0 == user_id)
+                .map(|member| member.role);
+            if matches!(
+                current_role,
+                Some(shared::domain::Role::Owner | shared::domain::Role::Mod)
+            ) {
+                self.maybe_add_existing_members_to_channel_group(guild_id, channel_id)
+                    .await?;
+            }
+        }
+
         let plaintext_bytes = text.as_bytes();
         let ciphertext = self
             .mls_session_manager
@@ -2058,7 +2080,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn emit_decrypted_message_rejects_uninitialized_mls_state() {
+    async fn emit_decrypted_message_skips_when_uninitialized_and_no_welcome() {
         let manager = TestMlsSessionManager::ok(Vec::new(), b"hello".to_vec());
         let decrypt_inputs = manager.decrypted_ciphertexts.clone();
         let client =
@@ -2069,13 +2091,92 @@ mod tests {
             inner.channel_guilds.insert(ChannelId(3), GuildId(11));
         }
 
-        let err = client
+        client
             .emit_decrypted_message(&sample_message())
             .await
-            .expect_err("must reject uninitialized MLS channel");
+            .expect("should skip ciphertext until welcome exists");
 
-        assert!(err.to_string().contains("uninitialized"));
         assert!(decrypt_inputs.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn emit_decrypted_message_ignores_unmapped_channel_messages() {
+        let manager = TestMlsSessionManager::ok(Vec::new(), b"hello".to_vec());
+        let decrypt_inputs = manager.decrypted_ciphertexts.clone();
+        let client =
+            RealtimeClient::new_with_mls_session_manager(PassthroughCrypto, Arc::new(manager));
+        {
+            let mut inner = client.inner.lock().await;
+            inner.user_id = Some(99);
+            inner.selected_channel = Some(ChannelId(9));
+            inner.selected_guild = Some(GuildId(11));
+        }
+
+        client
+            .emit_decrypted_message(&sample_message())
+            .await
+            .expect("unmapped channels should be ignored");
+
+        assert!(decrypt_inputs.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn emit_decrypted_message_auto_joins_from_welcome_when_uninitialized() {
+        let (server_url, server_state) = spawn_onboarding_server().await.expect("spawn server");
+
+        let adder_mls = TestMlsSessionManager::ok(Vec::new(), Vec::new());
+        let adder =
+            RealtimeClient::new_with_mls_session_manager(PassthroughCrypto, Arc::new(adder_mls));
+        {
+            let mut inner = adder.inner.lock().await;
+            inner.server_url = Some(server_url.clone());
+            inner.user_id = Some(7);
+            inner.selected_guild = Some(GuildId(11));
+            inner.selected_channel = Some(ChannelId(13));
+            inner.channel_guilds.insert(ChannelId(13), GuildId(11));
+        }
+
+        adder
+            .select_channel(ChannelId(13))
+            .await
+            .expect("adder select");
+
+        let target_mls = TestMlsSessionManager::ok(Vec::new(), b"hello from A".to_vec());
+        let joined_welcomes = target_mls.joined_welcomes.clone();
+        let decrypt_inputs = target_mls.decrypted_ciphertexts.clone();
+        let target =
+            RealtimeClient::new_with_mls_session_manager(PassthroughCrypto, Arc::new(target_mls));
+        {
+            let mut inner = target.inner.lock().await;
+            inner.server_url = Some(server_url);
+            inner.user_id = Some(42);
+            inner.channel_guilds.insert(ChannelId(13), GuildId(11));
+        }
+
+        let message = MessagePayload {
+            message_id: MessageId(1),
+            channel_id: ChannelId(13),
+            sender_id: shared::domain::UserId(7),
+            sender_username: Some("adder".to_string()),
+            ciphertext_b64: STANDARD.encode(b"ciphertext-from-a"),
+            attachment: None,
+            sent_at: "2024-01-01T00:00:00Z".parse().expect("timestamp"),
+        };
+
+        target
+            .emit_decrypted_message(&message)
+            .await
+            .expect("decrypt path should auto-join from welcome");
+
+        assert_eq!(
+            joined_welcomes.lock().await.clone(),
+            vec![b"welcome-generated".to_vec()]
+        );
+        assert_eq!(
+            decrypt_inputs.lock().await.clone(),
+            vec![b"ciphertext-from-a".to_vec()]
+        );
+        assert_eq!(*server_state.welcome_fetches.lock().await, 1);
     }
 
     #[derive(Clone)]

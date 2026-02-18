@@ -702,7 +702,6 @@ impl DesktopGuiApp {
                             err.context,
                             UiErrorContext::Login
                                 | UiErrorContext::SendMessage
-                                | UiErrorContext::DecryptMessage
                                 | UiErrorContext::BackendStartup
                         ) {
                             self.status_banner = Some(StatusBanner {
