@@ -72,6 +72,23 @@ impl DurableMlsSessionManager {
 
 #[async_trait]
 impl MlsSessionManager for DurableMlsSessionManager {
+    async fn key_package_bytes(&self, guild_id: GuildId) -> Result<Vec<u8>> {
+        let mut sessions = self.sessions.lock().await;
+        if let Some(handle) = sessions
+            .iter_mut()
+            .find_map(|((session_guild_id, _), handle)| {
+                (*session_guild_id == guild_id).then_some(handle)
+            })
+        {
+            return handle.key_package_bytes();
+        }
+
+        let identity = self.load_or_create_identity().await?;
+        let handle =
+            MlsGroupHandle::new(self.store.clone(), guild_id, ChannelId(0), identity).await?;
+        handle.key_package_bytes()
+    }
+
     async fn open_or_create_group(&self, guild_id: GuildId, channel_id: ChannelId) -> Result<()> {
         {
             let mut index = self.channel_index.lock().await;
