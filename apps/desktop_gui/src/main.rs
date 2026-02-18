@@ -1452,9 +1452,7 @@ impl DesktopGuiApp {
                     .clamp(MIN_LEFT_USER_PANEL_HEIGHT, MAX_LEFT_USER_PANEL_HEIGHT);
                 ui.set_min_height(self.left_user_panel_height - 12.0);
                 ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new("●").color(egui::Color32::from_rgb(67, 181, 129)),
-                    );
+                    ui.label(egui::RichText::new("●").color(egui::Color32::from_rgb(67, 181, 129)));
                     ui.strong(&self.username);
                     let status_label = if self.voice_ui.active_session.is_some() {
                         "In voice"
