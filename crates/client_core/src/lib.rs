@@ -1235,6 +1235,15 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
             return Err(err);
         }
 
+        let websocket_active = { self.inner.lock().await.ws_started };
+        if !websocket_active {
+            if let Err(err) = self.fetch_messages_impl(channel_id, 1, None).await {
+                let _ = self.events.send(ClientEvent::Error(format!(
+                    "message sent but local refresh failed without websocket: {err}"
+                )));
+            }
+        }
+
         Ok(())
     }
 
@@ -1273,6 +1282,46 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
         }
 
         Ok(false)
+    }
+
+    async fn fetch_messages_impl(
+        &self,
+        channel_id: ChannelId,
+        limit: u32,
+        before: Option<MessageId>,
+    ) -> Result<Vec<MessagePayload>> {
+        let (server_url, user_id) = self.session().await?;
+        {
+            let mut guard = self.inner.lock().await;
+            if !guard.channel_guilds.contains_key(&channel_id) {
+                if let Some(guild_id) = guard.selected_guild {
+                    guard.channel_guilds.insert(channel_id, guild_id);
+                }
+            }
+        }
+        let limit = limit.clamp(1, 100);
+        let messages: Vec<MessagePayload> = self
+            .http
+            .get(format!("{server_url}/channels/{}/messages", channel_id.0))
+            .query(&ListMessagesQuery {
+                user_id,
+                limit,
+                before: before.map(|id| id.0),
+            })
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+
+        for message in &messages {
+            self.record_sender_username(message).await;
+            if let Err(err) = self.emit_decrypted_message(message).await {
+                let _ = self.events.send(ClientEvent::Error(err.to_string()));
+            }
+        }
+
+        Ok(messages)
     }
 
     async fn is_mls_channel_initialized(&self, guild_id: GuildId, channel_id: ChannelId) -> bool {
@@ -1526,38 +1575,7 @@ impl<C: CryptoProvider + 'static> ClientHandle for Arc<RealtimeClient<C>> {
         limit: u32,
         before: Option<MessageId>,
     ) -> Result<Vec<MessagePayload>> {
-        let (server_url, user_id) = self.session().await?;
-        {
-            let mut guard = self.inner.lock().await;
-            if !guard.channel_guilds.contains_key(&channel_id) {
-                if let Some(guild_id) = guard.selected_guild {
-                    guard.channel_guilds.insert(channel_id, guild_id);
-                }
-            }
-        }
-        let limit = limit.clamp(1, 100);
-        let messages: Vec<MessagePayload> = self
-            .http
-            .get(format!("{server_url}/channels/{}/messages", channel_id.0))
-            .query(&ListMessagesQuery {
-                user_id,
-                limit,
-                before: before.map(|id| id.0),
-            })
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
-
-        for message in &messages {
-            self.record_sender_username(message).await;
-            if let Err(err) = self.emit_decrypted_message(message).await {
-                let _ = self.events.send(ClientEvent::Error(err.to_string()));
-            }
-        }
-
-        Ok(messages)
+        self.fetch_messages_impl(channel_id, limit, before).await
     }
 
     async fn send_message(&self, text: &str) -> Result<()> {
@@ -2432,6 +2450,50 @@ mod tests {
             .await
             .expect("second fetch request");
         assert_eq!(second_welcome_fetch.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn send_message_refreshes_locally_when_websocket_is_unavailable() {
+        let (server_url, _server_state) = spawn_onboarding_server().await.expect("spawn server");
+
+        let client = RealtimeClient::new_with_mls_session_manager(
+            PassthroughCrypto,
+            Arc::new(TestMlsSessionManager::ok(
+                b"ciphertext-no-ws".to_vec(),
+                b"hello without ws".to_vec(),
+            )),
+        );
+        {
+            let mut inner = client.inner.lock().await;
+            inner.server_url = Some(server_url);
+            inner.user_id = Some(7);
+            inner.selected_guild = Some(GuildId(11));
+            inner.selected_channel = Some(ChannelId(13));
+            inner.channel_guilds.insert(ChannelId(13), GuildId(11));
+            inner
+                .initialized_mls_channels
+                .insert((GuildId(11), ChannelId(13)));
+            inner.ws_started = false;
+        }
+
+        let mut rx = client.subscribe_events();
+        client
+            .send_message("hello without ws")
+            .await
+            .expect("send should succeed");
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let event = rx.recv().await.expect("event");
+                if let ClientEvent::MessageDecrypted { plaintext, .. } = event {
+                    break plaintext;
+                }
+            }
+        })
+        .await
+        .expect("message event timeout");
+
+        assert_eq!(event, "hello without ws");
     }
 
     struct MockLiveKitControlPlane {
