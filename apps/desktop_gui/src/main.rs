@@ -1509,6 +1509,7 @@ impl DesktopGuiApp {
                     .map(|guild| guild.name.clone())
             })
             .unwrap_or_else(|| "No workspace selected".to_string());
+        let show_workspace_context = self.guilds.len() > 1 && self.selected_guild.is_some();
 
         egui::TopBottomPanel::top("top_bar")
             .frame(
@@ -1520,10 +1521,21 @@ impl DesktopGuiApp {
                     )),
             )
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    if ui.button("⚙ Settings").clicked() {
-                        self.settings_open = true;
-                    }
+                ui.scope(|ui| {
+                    let style = ui.style_mut();
+                    style.spacing.button_padding.y = 2.0;
+                    style.visuals.widgets.inactive.rounding = egui::Rounding::same(0.0);
+                    style.visuals.widgets.hovered.rounding = egui::Rounding::same(0.0);
+                    style.visuals.widgets.active.rounding = egui::Rounding::same(0.0);
+                    style.visuals.widgets.open.rounding = egui::Rounding::same(0.0);
+
+                    egui::menu::bar(ui, |ui| {
+                        ui.menu_button("⚙ Settings", |ui| {
+                            if ui.button("Open").clicked() {
+                                self.settings_open = true;
+                                ui.close_menu();
+                            }
+                        });
 
                     ui.menu_button("Account", |ui| {
                         let auth_ready = self.auth_session_established;
@@ -1605,8 +1617,9 @@ impl DesktopGuiApp {
                         }
                     });
 
-                    ui.separator();
-                    ui.weak(format!("Workspace: {workspace_label}"));
+                        ui.separator();
+                        ui.weak(format!("Workspace: {workspace_label}"));
+                    });
                 });
             });
 
@@ -1870,6 +1883,9 @@ impl DesktopGuiApp {
                 let discord_dark = theme_discord_dark_palette(self.theme);
                 ui.horizontal(|ui| {
                     ui.heading("Channels");
+                    if show_workspace_context {
+                        ui.weak(format!("Workspace: {workspace_label}"));
+                    }
                     let refresh_label = if let Some(palette) = discord_dark {
                         egui::RichText::new("Refresh").color(palette.side_panel_button_text)
                     } else {
