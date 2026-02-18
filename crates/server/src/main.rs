@@ -1,5 +1,12 @@
 use std::{net::SocketAddr, sync::Arc};
 
+use crate::api::{
+    ensure_active_membership_in_channel, ensure_active_membership_in_guild, list_channels,
+    list_guilds, list_members, list_messages, mls_key_packages_route, mls_welcome_route,
+    request_livekit_token, send_message, ApiContext, KeyPackageResponse, MlsKeyPackageQuery,
+    MlsWelcomeQuery, MlsWelcomeResponse, UploadKeyPackageResponse,
+};
+use crate::livekit::LiveKitConfig;
 use axum::{
     body::Bytes,
     extract::{Path, Query, State, WebSocketUpgrade},
@@ -12,14 +19,7 @@ use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
     Engine as _,
 };
-use livekit_integration::LiveKitConfig;
 use serde::{Deserialize, Serialize};
-use server_api::{
-    ensure_active_membership_in_channel, ensure_active_membership_in_guild, list_channels,
-    list_guilds, list_members, list_messages, mls_key_packages_route, mls_welcome_route,
-    send_message, ApiContext, KeyPackageResponse, MlsKeyPackageQuery, MlsWelcomeQuery,
-    MlsWelcomeResponse, UploadKeyPackageResponse,
-};
 use shared::{
     domain::{ChannelId, ChannelKind, FileId, GuildId, UserId},
     error::{ApiError, ErrorCode},
@@ -29,7 +29,9 @@ use storage::Storage;
 use tokio::sync::broadcast;
 use tracing::{error, info};
 
+mod api;
 mod config;
+mod livekit;
 
 use config::{load_settings, prepare_database_url};
 
@@ -44,7 +46,7 @@ struct LoginRequest {
     username: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct LoginResponse {
     user_id: i64,
 }
@@ -71,6 +73,17 @@ struct UserQuery {
 #[derive(Debug, Deserialize)]
 struct FileDownloadQuery {
     user_id: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct LiveKitTokenQuery {
+    user_id: i64,
+    guild_id: i64,
+    channel_id: i64,
+    #[serde(default)]
+    can_publish_mic: bool,
+    #[serde(default)]
+    can_publish_screen: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -202,6 +215,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/guilds/:guild_id/invites", post(http_create_invite))
         .route("/guilds/join", post(http_join_guild))
         .route("/messages", post(http_send_message))
+        .route("/livekit/token", post(http_request_livekit_token))
         .route("/files/upload", post(upload_file))
         .route("/files/:file_id", get(download_file))
         .route(mls_key_packages_route(), post(upload_key_package))
@@ -791,6 +805,23 @@ async fn http_join_guild(
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn http_request_livekit_token(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<LiveKitTokenQuery>,
+) -> Result<Json<ServerEvent>, (StatusCode, Json<ApiError>)> {
+    let event = request_livekit_token(
+        &state.api,
+        UserId(q.user_id),
+        GuildId(q.guild_id),
+        ChannelId(q.channel_id),
+        q.can_publish_mic,
+        q.can_publish_screen,
+    )
+    .await
+    .map_err(|error| (api_error_status(&error), Json(error)))?;
+    Ok(Json(event))
+}
+
 async fn http_send_message(
     State(state): State<Arc<AppState>>,
     Json(req): Json<SendMessageRequest>,
@@ -856,6 +887,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn login_and_guild_channel_list_routes_work() {
+        let (app, _storage, _user_id, _guild_id, _channel_id) = test_app().await;
+
+        let login_request = Request::post("/login")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({ "username": "route-user" }).to_string(),
+            ))
+            .expect("request");
+        let login_response = app.clone().oneshot(login_request).await.expect("response");
+        assert_eq!(login_response.status(), StatusCode::OK);
+        let login_body = body::to_bytes(login_response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let dto: LoginResponse = serde_json::from_slice(&login_body).expect("json");
+
+        let guilds_request = Request::get(format!("/guilds?user_id={}", dto.user_id))
+            .body(Body::empty())
+            .expect("request");
+        let guilds_response = app.clone().oneshot(guilds_request).await.expect("response");
+        assert_eq!(guilds_response.status(), StatusCode::OK);
+        let guilds_body = body::to_bytes(guilds_response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let guilds: Vec<shared::protocol::GuildSummary> =
+            serde_json::from_slice(&guilds_body).expect("json");
+        assert!(!guilds.is_empty());
+
+        let channels_request = Request::get(format!(
+            "/guilds/{}/channels?user_id={}",
+            guilds[0].guild_id.0, dto.user_id
+        ))
+        .body(Body::empty())
+        .expect("request");
+        let channels_response = app.oneshot(channels_request).await.expect("response");
+        assert_eq!(channels_response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
     async fn file_upload_and_download_requires_membership() {
         let (app, storage, user_id, guild_id, channel_id) = test_app().await;
         let upload = Request::post(format!(
@@ -898,6 +968,24 @@ mod tests {
             .await
             .expect("download response");
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn livekit_token_route_mints_token_for_voice_channel() {
+        let (app, storage, user_id, guild_id, _channel_id) = test_app().await;
+        let voice_channel = storage
+            .create_channel(GuildId(guild_id), "voice", ChannelKind::Voice)
+            .await
+            .expect("voice channel");
+
+        let request = Request::post(format!(
+            "/livekit/token?user_id={user_id}&guild_id={guild_id}&channel_id={}&can_publish_mic=true",
+            voice_channel.0
+        ))
+        .body(Body::empty())
+        .expect("request");
+        let response = app.oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]

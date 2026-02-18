@@ -34,7 +34,6 @@ rg -n 'image feature "(gif|webp|bmp|png|jpeg)"' /tmp/cargo-tree-after.txt
 - `crates/livekit_integration`: `sync`
 - `crates/server`: `macros`, `rt-multi-thread`, `net`, `sync`
 - `crates/mls` (dev only): `macros`, `rt-multi-thread`, `sync`
-- `crates/server_api` (dev only): `macros`, `rt-multi-thread`
 - `crates/storage`: no runtime tokio dependency; test-only `macros`, `rt-multi-thread`
 - `apps/desktop`: `macros`, `rt-multi-thread`
 - `apps/desktop_gui`: `rt-multi-thread`, `fs`

@@ -51,8 +51,7 @@ The split keeps our server as the **control plane** and LiveKit as the **media p
 
 - `crates/shared`: shared domain types + protocol messages
 - `crates/storage`: SQLite persistence (sqlx + migrations)
-- `crates/livekit_integration`: LiveKit room naming + JWT token minting
-- `crates/server_api`: transport-agnostic business logic
+- `crates/livekit_integration`: shared client-facing LiveKit room/session traits
 - `crates/server`: axum HTTP/WS server
 - `crates/client_core`: protocol client + crypto boundary trait
 - `apps/desktop_gui`: primary desktop GUI client (default-member release path)

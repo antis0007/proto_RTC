@@ -1,6 +1,6 @@
+use crate::livekit::{mint_token, room_name_for_voice_channel, LiveKitConfig};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use chrono::{DateTime, Utc};
-use livekit_integration::{mint_token, room_name_for_voice_channel, LiveKitConfig};
 use serde::{Deserialize, Serialize};
 use shared::{
     domain::{ChannelId, ChannelKind, GuildId, Role, UserId},
@@ -58,22 +58,6 @@ pub fn mls_key_packages_route() -> &'static str {
 
 pub fn mls_welcome_route() -> &'static str {
     "/mls/welcome"
-}
-
-#[derive(Default)]
-pub struct TokenBucket {
-    tokens: usize,
-}
-
-impl TokenBucket {
-    pub fn allow(&mut self) -> bool {
-        if self.tokens < 100 {
-            self.tokens += 1;
-            true
-        } else {
-            false
-        }
-    }
 }
 
 pub async fn list_guilds(ctx: &ApiContext, user_id: UserId) -> Result<Vec<GuildSummary>, ApiError> {
@@ -457,6 +441,29 @@ mod tests {
             listed[0].attachment.as_ref().expect("attachment").file_id,
             file_id
         );
+    }
+
+    #[tokio::test]
+    async fn request_livekit_token_returns_voice_channel_token() {
+        let (ctx, user, guild, channel) = setup().await;
+        let event = request_livekit_token(&ctx, user, guild, channel, true, false)
+            .await
+            .expect("token");
+
+        let ServerEvent::LiveKitTokenIssued {
+            guild_id,
+            channel_id,
+            room_name,
+            token,
+        } = event
+        else {
+            panic!("expected livekit token event");
+        };
+
+        assert_eq!(guild_id, guild);
+        assert_eq!(channel_id, channel);
+        assert_eq!(room_name, room_name_for_voice_channel(guild, channel));
+        assert!(!token.is_empty());
     }
 
     #[tokio::test]

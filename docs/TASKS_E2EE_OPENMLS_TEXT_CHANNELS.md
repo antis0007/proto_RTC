@@ -45,7 +45,7 @@ Implement end-to-end encryption for text messages per `(guild_id, channel_id)` u
 ---
 
 ## Task 3 — Server endpoint for pending Welcome retrieval
-**Files:** `crates/server/src/main.rs`, `crates/server_api/src/lib.rs`
+**Files:** `crates/server/src/main.rs`, `crates/server/src/api/mod.rs`
 
 ### MVP contract (normative)
 
