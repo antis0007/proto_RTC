@@ -1223,7 +1223,7 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
                 .await
                 .pending_outbound_plaintexts
                 .remove(&payload.ciphertext_b64);
-            return Err(err.into());
+            return Err(err);
         }
 
         Ok(())
