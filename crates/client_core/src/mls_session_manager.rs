@@ -84,8 +84,15 @@ impl MlsSessionManager for DurableMlsSessionManager {
         }
 
         let identity = self.load_or_create_identity().await?;
-        let handle =
-            MlsGroupHandle::new(self.store.clone(), guild_id, ChannelId(0), identity).await?;
+        let handle = MlsGroupHandle::new(
+            self.store.clone(),
+            self.user_id,
+            self.device_id.clone(),
+            guild_id,
+            ChannelId(0),
+            identity,
+        )
+        .await?;
         handle.key_package_bytes()
     }
 
@@ -109,8 +116,15 @@ impl MlsSessionManager for DurableMlsSessionManager {
         }
 
         let identity = self.load_or_create_identity().await?;
-        let mut handle =
-            MlsGroupHandle::new(self.store.clone(), guild_id, channel_id, identity).await?;
+        let mut handle = MlsGroupHandle::new(
+            self.store.clone(),
+            self.user_id,
+            self.device_id.clone(),
+            guild_id,
+            channel_id,
+            identity,
+        )
+        .await?;
         handle.load_or_create_group().await?;
         self.sessions.lock().await.insert(key, handle);
         Ok(())

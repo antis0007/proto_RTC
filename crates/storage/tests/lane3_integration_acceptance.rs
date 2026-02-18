@@ -23,6 +23,8 @@ async fn onboarding_welcome_ciphertext_and_one_time_consumption_acceptance() {
 
     let mut alice_group = MlsGroupHandle::new(
         storage.clone(),
+        alice.0,
+        "alice-device",
         guild,
         channel,
         MlsIdentity::new_with_name("alice").expect("alice identity"),
@@ -36,6 +38,8 @@ async fn onboarding_welcome_ciphertext_and_one_time_consumption_acceptance() {
 
     let mut bob_group = MlsGroupHandle::new(
         storage.clone(),
+        bob.0,
+        "bob-device",
         guild,
         channel,
         MlsIdentity::new_with_name("bob").expect("bob identity"),
