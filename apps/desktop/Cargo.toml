@@ -9,7 +9,7 @@ anyhow.workspace = true
 clap.workspace = true
 client_core = { path = "../../crates/client_core" }
 shared = { path = "../../crates/shared" }
-tokio.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

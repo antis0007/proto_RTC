@@ -18,4 +18,4 @@ openmls_basic_credential = "0.3"
 tls_codec = "0.4"
 
 [dev-dependencies]
-tokio.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }

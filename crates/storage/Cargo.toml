@@ -12,7 +12,7 @@ serde.workspace = true
 sqlx.workspace = true
 shared = { path = "../shared" }
 mls = { path = "../mls" }
-tokio.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
