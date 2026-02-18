@@ -41,6 +41,18 @@ pub struct MlsIdentity {
     signer: SignatureKeyPair,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct SerializedIdentityV1 {
+    credential_with_key: CredentialWithKey,
+    signer: SignatureKeyPair,
+}
+
+#[derive(Serialize)]
+struct SerializedIdentityV1Ref<'a> {
+    credential_with_key: &'a CredentialWithKey,
+    signer: &'a SignatureKeyPair,
+}
+
 impl MlsIdentity {
     pub fn new() -> Result<Self> {
         Self::new_with_name(b"device".to_vec())
@@ -72,6 +84,21 @@ impl MlsIdentity {
 
     pub fn key_package_bytes<P: OpenMlsProvider>(&self, provider: &P) -> Result<Vec<u8>> {
         Ok(self.key_package(provider)?.tls_serialize_detached()?)
+    }
+
+    pub fn to_bytes(&self) -> Result<Vec<u8>> {
+        Ok(serde_json::to_vec(&SerializedIdentityV1Ref {
+            credential_with_key: &self.credential_with_key,
+            signer: &self.signer,
+        })?)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let decoded: SerializedIdentityV1 = serde_json::from_slice(bytes)?;
+        Ok(Self {
+            credential_with_key: decoded.credential_with_key,
+            signer: decoded.signer,
+        })
     }
 }
 
@@ -434,6 +461,139 @@ mod tests {
                 .get(&(user_id, device_id.to_string(), guild_id.0, channel_id.0))
                 .cloned())
         }
+    }
+
+    #[test]
+    fn identity_serialization_round_trip_preserves_signing_material() {
+        let provider = PersistentOpenMlsProvider::default();
+        let identity = MlsIdentity::new_with_name(b"alice".to_vec()).expect("identity");
+        let original_key_package = identity
+            .key_package_bytes(&provider)
+            .expect("original key package");
+
+        let encoded = identity.to_bytes().expect("serialize identity");
+        let decoded = MlsIdentity::from_bytes(&encoded).expect("deserialize identity");
+
+        let decoded_key_package = decoded
+            .key_package_bytes(&provider)
+            .expect("decoded key package");
+
+        assert!(!original_key_package.is_empty());
+        assert!(!decoded_key_package.is_empty());
+        assert_eq!(identity.to_bytes().expect("serialize original"), encoded);
+        assert_eq!(decoded.to_bytes().expect("serialize decoded"), encoded);
+    }
+
+    #[tokio::test]
+    async fn persisted_identity_survives_restart_and_can_send_after_commit_merge() {
+        let guild_id = GuildId(1);
+        let channel_id = ChannelId(77);
+
+        let alice_store = MemoryStore::default();
+        let bob_store = MemoryStore::default();
+        let charlie_store = MemoryStore::default();
+
+        let alice_identity = MlsIdentity::new_with_name(b"alice".to_vec()).expect("alice identity");
+        let bob_identity = MlsIdentity::new_with_name(b"bob".to_vec()).expect("bob identity");
+
+        let bob_identity_bytes = bob_identity.to_bytes().expect("serialize bob identity");
+        bob_store
+            .save_identity_keys(2, "device-bob", &bob_identity_bytes)
+            .await
+            .expect("persist bob identity");
+
+        let mut alice = MlsGroupHandle::new(
+            alice_store,
+            1,
+            "device-alice",
+            guild_id,
+            channel_id,
+            alice_identity,
+        )
+        .await
+        .expect("alice handle");
+        alice
+            .create_group(channel_id)
+            .await
+            .expect("create alice group");
+
+        let mut bob = MlsGroupHandle::new(
+            bob_store.clone(),
+            2,
+            "device-bob",
+            guild_id,
+            channel_id,
+            MlsIdentity::from_bytes(&bob_identity_bytes).expect("decode bob identity"),
+        )
+        .await
+        .expect("bob handle session 1");
+
+        let bob_key_package = bob
+            .key_package_bytes()
+            .expect("bob key package before restart");
+
+        let (_commit_for_adder, bob_welcome) =
+            alice.add_member(&bob_key_package).await.expect("add bob");
+
+        bob.join_group_from_welcome(&bob_welcome.expect("welcome for bob"))
+            .await
+            .expect("bob joins");
+
+        drop(bob);
+
+        let mut bob = MlsGroupHandle::new(
+            bob_store.clone(),
+            2,
+            "device-bob",
+            guild_id,
+            channel_id,
+            MlsIdentity::from_bytes(
+                &bob_store
+                    .load_identity_keys(2, "device-bob")
+                    .await
+                    .expect("reload identity")
+                    .expect("identity exists"),
+            )
+            .expect("decode identity after restart"),
+        )
+        .await
+        .expect("bob handle session 2");
+
+        let charlie_identity =
+            MlsIdentity::new_with_name(b"charlie".to_vec()).expect("charlie identity");
+        let charlie = MlsGroupHandle::new(
+            charlie_store,
+            3,
+            "device-charlie",
+            guild_id,
+            channel_id,
+            charlie_identity,
+        )
+        .await
+        .expect("charlie handle");
+        let charlie_key_package = charlie
+            .key_package_bytes()
+            .expect("charlie key package bytes");
+
+        let (commit_for_existing_members, _welcome_for_charlie) = alice
+            .add_member(&charlie_key_package)
+            .await
+            .expect("alice adds charlie");
+
+        let merge_plaintext = bob
+            .decrypt_application(&commit_for_existing_members)
+            .await
+            .expect("bob processes commit from prior session state");
+        assert!(merge_plaintext.is_empty());
+
+        let bob_ciphertext = bob
+            .encrypt_application(b"bob survived restart")
+            .expect("bob encrypts with restored signer");
+        let alice_plaintext = alice
+            .decrypt_application(&bob_ciphertext)
+            .await
+            .expect("alice decrypts bob message after restart");
+        assert_eq!(alice_plaintext, b"bob survived restart");
     }
 
     #[tokio::test]
