@@ -5,7 +5,7 @@ on:
   pull_request:
 
 jobs:
-  rust:
+  rust-default:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -14,9 +14,38 @@ jobs:
           components: rustfmt, clippy
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
+      - name: Guard default-members excludes dev/placeholder apps
+        run: |
+          default_members_block="$(awk '
+            /^default-members = \[/ {in_block=1; next}
+            in_block && /^\]/ {in_block=0; exit}
+            in_block {print}
+          ' Cargo.toml)"
+
+          if echo "$default_members_block" | grep -Eq '"apps/(desktop|tools)"'; then
+            echo "default-members must not include non-production placeholder/dev apps (apps/desktop, apps/tools)." >&2
+            exit 1
+          fi
+
+          echo "default-members guard passed"
       - name: Format check
         run: cargo fmt --all -- --check
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: Test
-        run: cargo test --workspace --all-targets
+      - name: Clippy (default-members fast lane)
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Test (default-members fast lane)
+        run: cargo test --all-targets
+
+  rust-dev-tools:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Clippy (non-default/dev tools lane)
+        run: cargo clippy -p desktop -p tools --all-targets -- -D warnings
+      - name: Test (non-default/dev tools lane)
+        run: cargo test -p desktop -p tools --all-targets

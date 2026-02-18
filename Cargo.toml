@@ -11,6 +11,16 @@ members = [
   "apps/desktop_gui",
   "apps/tools",
 ]
+default-members = [
+  "crates/shared",
+  "crates/storage",
+  "crates/livekit_integration",
+  "crates/server_api",
+  "crates/server",
+  "crates/client_core",
+  "crates/mls",
+  "apps/desktop_gui",
+]
 resolver = "2"
 
 [workspace.package]

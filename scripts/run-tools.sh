@@ -6,6 +6,9 @@ REPO_ROOT="$(git -C "$SCRIPT_DIR/.." rev-parse --show-toplevel 2>/dev/null || (c
 
 cd "$REPO_ROOT"
 
+# Note: tools is intentionally a non-default workspace member.
+# Use this script or `cargo test --workspace` lanes when validating dev tooling.
+
 mkdir -p data logs
 
 if [[ -f .env ]]; then

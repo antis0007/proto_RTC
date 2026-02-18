@@ -55,8 +55,18 @@ The split keeps our server as the **control plane** and LiveKit as the **media p
 - `crates/server_api`: transport-agnostic business logic
 - `crates/server`: axum HTTP/WS server
 - `crates/client_core`: protocol client + crypto boundary trait
-- `apps/desktop`: minimal CLI/TUI entrypoint
-- `apps/tools`: local admin/dev CLI
+- `apps/desktop_gui`: primary desktop GUI client (default-member release path)
+- `apps/desktop`: minimal CLI/TUI entrypoint (non-default member for dev/manual workflows)
+- `apps/tools`: local admin/dev CLI (non-default member for dev/manual workflows)
+
+### Workspace test lanes (`default-members` vs full workspace)
+
+The workspace intentionally separates production/runtime crates from dev-only apps:
+
+- `cargo test` / `cargo clippy` from repo root runs the **fast lane** on `default-members` only (core crates + `apps/desktop_gui`).
+- `cargo test --workspace` / `cargo clippy --workspace` runs the **full lane** including non-default members such as `apps/desktop` and `apps/tools`.
+
+Use the fast lane for normal CI and local iteration. Use the full workspace lane when validating dev tooling or broad refactors.
 
 See docs in `docs/` for details.
 
@@ -122,10 +132,16 @@ Use **bash scripts (`.sh`) on Linux/macOS**, and **PowerShell scripts (`.ps1`) o
 | Start temporary test server (ephemeral DB) | `./scripts/run-temp-server.sh` | `./scripts/run-temp-server.ps1` |
 | Start client (foreground) | `./scripts/run-cli.sh` | `./scripts/run-cli.ps1` |
 | Start GUI (if available) | `./scripts/run-gui.sh` | `./scripts/run-gui.ps1` |
-| Start tools app | `./scripts/run-tools.sh` | `./scripts/run-tools.ps1` |
+| Start tools app (non-default/dev lane) | `./scripts/run-tools.sh` | `./scripts/run-tools.ps1` |
 | LAN host server helper | `./scripts/launch-lan-server.sh <LAN_IP> [PORT]` | `./scripts/launch-lan-server.ps1 <LAN_IP> [PORT]` |
 | Remote client helper | `./scripts/run-remote-client.sh <SERVER_URL> [USERNAME]` | `./scripts/run-remote-client.ps1 <SERVER_URL> [USERNAME]` |
 | One-machine smoke test (server + 2 clients) | `./scripts/test-local-stack.sh` | `./scripts/test-local-stack.ps1` |
+
+Script/CI behavior follows the same split:
+
+- Core smoke checks and root `cargo test` align with `default-members`.
+- Dev tools (`apps/tools`, `apps/desktop`) are validated in a separate non-default lane (for example via `cargo test --workspace` or explicit package selection in CI).
+
 
 ## Launch workflows
 

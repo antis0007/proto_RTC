@@ -9,6 +9,9 @@ $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $RepoRoot = (Resolve-Path (Join-Path $ScriptDir '..')).Path
 Set-Location $RepoRoot
 
+# Note: tools is intentionally a non-default workspace member.
+# Use this script or `cargo test --workspace` lanes when validating dev tooling.
+
 New-Item -ItemType Directory -Force -Path 'data' | Out-Null
 New-Item -ItemType Directory -Force -Path 'logs' | Out-Null
 
