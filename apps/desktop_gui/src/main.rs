@@ -982,7 +982,7 @@ impl DesktopGuiApp {
                         ui.scope(|ui| {
                             let cta_color = egui::Color32::from_rgb(76, 129, 255);
                             ui.visuals_mut().widgets.inactive.bg_fill = cta_color;
-                            ui.visuals_mut().widgets.hovered.bg_fill = cta_color.gamma_multiply(1.08);
+                            ui.visuals_mut().widgets.hovered.bg_fill = cta_color.gamma_multiply(1.0);
                             ui.visuals_mut().widgets.active.bg_fill = cta_color.gamma_multiply(0.9);
                             ui.visuals_mut().widgets.inactive.fg_stroke.color = egui::Color32::WHITE;
                             ui.visuals_mut().widgets.hovered.fg_stroke.color = egui::Color32::WHITE;
