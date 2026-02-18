@@ -73,6 +73,10 @@ function Invoke-ApiRequest {
     Uri = $Uri
     Method = $Method
     TimeoutSec = 10
+    UseBasicParsing = $true
+  }
+  if ($OutFile) {
+    $params.OutFile = $OutFile
   }
   if ($PSBoundParameters.ContainsKey('Body') -and $null -ne $Body) {
     $params.Body = $Body
@@ -88,13 +92,6 @@ function Invoke-ApiRequest {
     $resp = Invoke-WebRequest @params
     if ($resp.StatusCode -ne $ExpectedStatus) {
       throw "Expected status $ExpectedStatus but got $($resp.StatusCode) for $Method $Uri"
-    }
-    if ($OutFile) {
-      if ($resp.Content) {
-        Set-Content -Path $OutFile -Value $resp.Content -NoNewline
-      } else {
-        Set-Content -Path $OutFile -Value ''
-      }
     }
     return $resp
   } catch {
