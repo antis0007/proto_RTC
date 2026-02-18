@@ -77,6 +77,9 @@ function Invoke-ApiRequest {
   }
   if ($OutFile) {
     $params.OutFile = $OutFile
+    # Windows PowerShell returns no response object when OutFile is used unless PassThru is set.
+    # We need the status code for explicit smoke-gate assertions.
+    $params.PassThru = $true
   }
   if ($PSBoundParameters.ContainsKey('Body') -and $null -ne $Body) {
     $params.Body = $Body
