@@ -962,7 +962,7 @@ impl DesktopGuiApp {
         field_kind: LoginFocusField,
     ) -> egui::Response {
         ui.label(egui::RichText::new(label).strong());
-        let mut edit = egui::TextEdit::singleline(value)
+        let edit = egui::TextEdit::singleline(value)
             .id_source(id)
             .hint_text(hint)
             .desired_width(f32::INFINITY);
