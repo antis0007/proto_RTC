@@ -43,6 +43,8 @@ const LIVEKIT_E2EE_CACHE_TTL: Duration = Duration::from_secs(90);
 const LIVEKIT_E2EE_INFO_PREFIX: &[u8] = b"proto-rtc/livekit-e2ee/v1";
 /// Deterministic application salt for LiveKit E2EE key derivation.
 const LIVEKIT_E2EE_APP_SALT: &[u8] = b"proto-rtc/livekit-e2ee-app-salt";
+const WELCOME_SYNC_RETRY_ATTEMPTS: usize = 4;
+const WELCOME_SYNC_RETRY_DELAY: Duration = Duration::from_millis(300);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct VoiceConnectionKey {
@@ -1003,6 +1005,27 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
         Ok(true)
     }
 
+    async fn maybe_join_from_pending_welcome_with_retry(
+        &self,
+        guild_id: GuildId,
+        channel_id: ChannelId,
+    ) -> Result<bool> {
+        for attempt in 0..WELCOME_SYNC_RETRY_ATTEMPTS {
+            if self
+                .maybe_join_from_pending_welcome(guild_id, channel_id)
+                .await?
+            {
+                return Ok(true);
+            }
+
+            if attempt + 1 < WELCOME_SYNC_RETRY_ATTEMPTS {
+                tokio::time::sleep(WELCOME_SYNC_RETRY_DELAY).await;
+            }
+        }
+
+        Ok(false)
+    }
+
     async fn fetch_members_for_guild(&self, guild_id: GuildId) -> Result<Vec<MemberSummary>> {
         let (server_url, user_id) = self.session().await?;
         let members: Vec<MemberSummary> = self
@@ -1266,7 +1289,7 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
         }
 
         if self
-            .maybe_join_from_pending_welcome(guild_id, channel_id)
+            .maybe_join_from_pending_welcome_with_retry(guild_id, channel_id)
             .await?
         {
             return Ok(true);
@@ -1491,7 +1514,7 @@ impl<C: CryptoProvider + 'static> ClientHandle for Arc<RealtimeClient<C>> {
         .ok_or_else(|| anyhow!("no guild selected"))?;
 
         let joined_from_welcome = self
-            .maybe_join_from_pending_welcome(guild_id, channel_id)
+            .maybe_join_from_pending_welcome_with_retry(guild_id, channel_id)
             .await?;
         if !joined_from_welcome {
             let members = self.fetch_members_for_guild(guild_id).await?;
@@ -2031,6 +2054,8 @@ mod tests {
     #[derive(Clone)]
     struct OnboardingServerState {
         pending_welcome_b64: Arc<Mutex<Option<String>>>,
+        welcome_fetches: Arc<Mutex<u32>>,
+        welcome_ready_after_fetches: Arc<Mutex<u32>>,
         add_member_posts: Arc<Mutex<Vec<(i64, i64, i64)>>>,
         stored_ciphertexts: Arc<Mutex<Vec<String>>>,
     }
@@ -2100,6 +2125,14 @@ mod tests {
         if q.user_id != 42 {
             return Err(StatusCode::NOT_FOUND);
         }
+
+        let mut fetches = state.welcome_fetches.lock().await;
+        *fetches += 1;
+        let ready_after = *state.welcome_ready_after_fetches.lock().await;
+        if *fetches <= ready_after {
+            return Err(StatusCode::NOT_FOUND);
+        }
+
         let mut guard = state.pending_welcome_b64.lock().await;
         let Some(welcome_b64) = guard.take() else {
             return Err(StatusCode::NOT_FOUND);
@@ -2152,6 +2185,8 @@ mod tests {
         let addr = listener.local_addr()?;
         let state = OnboardingServerState {
             pending_welcome_b64: Arc::new(Mutex::new(None)),
+            welcome_fetches: Arc::new(Mutex::new(0)),
+            welcome_ready_after_fetches: Arc::new(Mutex::new(0)),
             add_member_posts: Arc::new(Mutex::new(Vec::new())),
             stored_ciphertexts: Arc::new(Mutex::new(Vec::new())),
         };
@@ -2225,6 +2260,57 @@ mod tests {
 
         let welcomes = joined_welcomes.lock().await.clone();
         assert_eq!(welcomes, vec![b"welcome-generated".to_vec()]);
+    }
+
+    #[tokio::test]
+    async fn added_member_retries_welcome_sync_until_payload_is_ready() {
+        let (server_url, server_state) = spawn_onboarding_server().await.expect("spawn server");
+
+        {
+            let mut ready_after = server_state.welcome_ready_after_fetches.lock().await;
+            *ready_after = 2;
+        }
+
+        let adder_mls = TestMlsSessionManager::ok(Vec::new(), Vec::new());
+        let adder =
+            RealtimeClient::new_with_mls_session_manager(PassthroughCrypto, Arc::new(adder_mls));
+        {
+            let mut inner = adder.inner.lock().await;
+            inner.server_url = Some(server_url.clone());
+            inner.user_id = Some(7);
+            inner.selected_guild = Some(GuildId(11));
+            inner.selected_channel = Some(ChannelId(13));
+            inner.channel_guilds.insert(ChannelId(13), GuildId(11));
+        }
+
+        adder
+            .select_channel(ChannelId(13))
+            .await
+            .expect("adder select");
+
+        let target_mls = TestMlsSessionManager::ok(Vec::new(), Vec::new());
+        let joined_welcomes = target_mls.joined_welcomes.clone();
+        let target =
+            RealtimeClient::new_with_mls_session_manager(PassthroughCrypto, Arc::new(target_mls));
+        {
+            let mut inner = target.inner.lock().await;
+            inner.server_url = Some(server_url);
+            inner.user_id = Some(42);
+            inner.selected_guild = Some(GuildId(11));
+            inner.selected_channel = Some(ChannelId(13));
+            inner.channel_guilds.insert(ChannelId(13), GuildId(11));
+        }
+
+        target
+            .select_channel(ChannelId(13))
+            .await
+            .expect("target select retries until welcome exists");
+
+        let welcomes = joined_welcomes.lock().await.clone();
+        assert_eq!(welcomes, vec![b"welcome-generated".to_vec()]);
+
+        let fetches = *server_state.welcome_fetches.lock().await;
+        assert!(fetches >= 3);
     }
 
     #[tokio::test]
