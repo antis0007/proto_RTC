@@ -1154,14 +1154,16 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
             return Ok(());
         }
 
-        self.mls_session_manager
-            .open_or_create_group(guild_id, message.channel_id)
-            .await?;
-        self.inner
-            .lock()
+        if !self
+            .is_mls_channel_initialized(guild_id, message.channel_id)
             .await
-            .initialized_mls_channels
-            .insert((guild_id, message.channel_id));
+        {
+            return Err(anyhow!(
+                "MLS state for guild {} channel {} is uninitialized; cannot decrypt incoming ciphertext yet",
+                guild_id.0,
+                message.channel_id.0
+            ));
+        }
         let ciphertext = STANDARD
             .decode(message.ciphertext_b64.as_bytes())
             .with_context(|| {
@@ -1194,9 +1196,16 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
         attachment: Option<AttachmentPayload>,
     ) -> Result<()> {
         let (_server_url, user_id, guild_id, channel_id) = self.active_context().await?;
-        self.mls_session_manager
-            .open_or_create_group(guild_id, channel_id)
-            .await?;
+        if !self
+            .ensure_mls_channel_initialized(guild_id, channel_id)
+            .await?
+        {
+            return Err(anyhow!(
+                "MLS state for guild {} channel {} is uninitialized; wait for welcome sync before sending",
+                guild_id.0,
+                channel_id.0
+            ));
+        }
         let plaintext_bytes = text.as_bytes();
         let ciphertext = self
             .mls_session_manager
@@ -1245,6 +1254,33 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
             attachment,
         };
         self.post_send_message_payload(payload).await
+    }
+
+    async fn ensure_mls_channel_initialized(
+        &self,
+        guild_id: GuildId,
+        channel_id: ChannelId,
+    ) -> Result<bool> {
+        if self.is_mls_channel_initialized(guild_id, channel_id).await {
+            return Ok(true);
+        }
+
+        if self
+            .maybe_join_from_pending_welcome(guild_id, channel_id)
+            .await?
+        {
+            return Ok(true);
+        }
+
+        Ok(false)
+    }
+
+    async fn is_mls_channel_initialized(&self, guild_id: GuildId, channel_id: ChannelId) -> bool {
+        self.inner
+            .lock()
+            .await
+            .initialized_mls_channels
+            .contains(&(guild_id, channel_id))
     }
 
     async fn post_send_message_payload(&self, payload: SendMessageHttpRequest) -> Result<()> {
@@ -1791,6 +1827,9 @@ mod tests {
             inner.user_id = Some(7);
             inner.selected_guild = Some(GuildId(11));
             inner.selected_channel = Some(ChannelId(13));
+            inner
+                .initialized_mls_channels
+                .insert((GuildId(11), ChannelId(13)));
         }
 
         client
@@ -1827,7 +1866,7 @@ mod tests {
             .send_message("plaintext-message")
             .await
             .expect_err("must fail");
-        assert!(err.to_string().contains("group not initialized"));
+        assert!(err.to_string().contains("uninitialized"));
     }
 
     fn sample_message() -> MessagePayload {
@@ -1868,6 +1907,9 @@ mod tests {
             inner.user_id = Some(99);
             inner.selected_guild = Some(GuildId(11));
             inner.selected_channel = Some(ChannelId(3));
+            inner
+                .initialized_mls_channels
+                .insert((GuildId(11), ChannelId(3)));
         }
 
         client
@@ -1889,6 +1931,9 @@ mod tests {
             let mut inner = client.inner.lock().await;
             inner.user_id = Some(99);
             inner.channel_guilds.insert(ChannelId(3), GuildId(11));
+            inner
+                .initialized_mls_channels
+                .insert((GuildId(11), ChannelId(3)));
         }
         let mut rx = client.subscribe_events();
 
@@ -1948,6 +1993,9 @@ mod tests {
             let mut inner = client.inner.lock().await;
             inner.user_id = Some(99);
             inner.channel_guilds.insert(ChannelId(3), GuildId(11));
+            inner
+                .initialized_mls_channels
+                .insert((GuildId(11), ChannelId(3)));
         }
         let mut rx = client.subscribe_events();
 
@@ -1957,6 +2005,27 @@ mod tests {
             .expect("decrypt should still succeed");
 
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn emit_decrypted_message_rejects_uninitialized_mls_state() {
+        let manager = TestMlsSessionManager::ok(Vec::new(), b"hello".to_vec());
+        let decrypt_inputs = manager.decrypted_ciphertexts.clone();
+        let client =
+            RealtimeClient::new_with_mls_session_manager(PassthroughCrypto, Arc::new(manager));
+        {
+            let mut inner = client.inner.lock().await;
+            inner.user_id = Some(99);
+            inner.channel_guilds.insert(ChannelId(3), GuildId(11));
+        }
+
+        let err = client
+            .emit_decrypted_message(&sample_message())
+            .await
+            .expect_err("must reject uninitialized MLS channel");
+
+        assert!(err.to_string().contains("uninitialized"));
+        assert!(decrypt_inputs.lock().await.is_empty());
     }
 
     #[derive(Clone)]
