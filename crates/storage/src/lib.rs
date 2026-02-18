@@ -348,7 +348,7 @@ impl Storage {
         let rec = sqlx::query(
             "INSERT INTO files (uploader_user_id, guild_id, channel_id, ciphertext, mime_type, filename, size_bytes) VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id",
         )
-        .bind(uploader_id.0)
+         .bind(uploader_id.0)
         .bind(guild_id.0)
         .bind(channel_id.0)
         .bind(ciphertext)
@@ -543,12 +543,16 @@ impl MlsStore for Storage {
 
     async fn save_group_state(
         &self,
+        user_id: i64,
+        device_id: &str,
         guild_id: GuildId,
         channel_id: ChannelId,
         snapshot: PersistedGroupSnapshot,
     ) -> Result<()> {
         sqlx::query(
             "INSERT INTO mls_group_states (
+                user_id,
+                device_id,
                 guild_id,
                 channel_id,
                 schema_version,
@@ -556,14 +560,16 @@ impl MlsStore for Storage {
                 key_material_blob,
                 group_state_bytes,
                 updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-             ON CONFLICT(guild_id, channel_id) DO UPDATE SET
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+             ON CONFLICT(user_id, device_id, guild_id, channel_id) DO UPDATE SET
                 schema_version = excluded.schema_version,
                 group_state_blob = excluded.group_state_blob,
                 key_material_blob = excluded.key_material_blob,
                 group_state_bytes = excluded.group_state_bytes,
                 updated_at = CURRENT_TIMESTAMP",
         )
+        .bind(user_id)
+        .bind(device_id)
         .bind(guild_id.0)
         .bind(channel_id.0)
         .bind(snapshot.schema_version)
@@ -577,14 +583,18 @@ impl MlsStore for Storage {
 
     async fn load_group_state(
         &self,
+        user_id: i64,
+        device_id: &str,
         guild_id: GuildId,
         channel_id: ChannelId,
     ) -> Result<Option<PersistedGroupSnapshot>> {
         let row = sqlx::query(
             "SELECT schema_version, group_state_blob, key_material_blob, group_state_bytes
              FROM mls_group_states
-             WHERE guild_id = ? AND channel_id = ?",
+             WHERE user_id = ? AND device_id = ? AND guild_id = ? AND channel_id = ?",
         )
+        .bind(user_id)
+        .bind(device_id)
         .bind(guild_id.0)
         .bind(channel_id.0)
         .fetch_optional(&self.pool)
@@ -920,6 +930,55 @@ mod tests {
 
         let consumed = [left, right].into_iter().flatten().count();
         assert_eq!(consumed, 1, "exactly one fetch should consume the welcome");
+    }
+
+    #[tokio::test]
+    async fn mls_group_state_is_scoped_by_user_and_device_identity() {
+        let storage = Storage::new("sqlite::memory:").await.expect("db");
+        let guild = GuildId(7);
+        let channel = ChannelId(11);
+
+        let alice_snapshot = PersistedGroupSnapshot {
+            schema_version: 1,
+            group_state_blob: b"alice-group".to_vec(),
+            key_material_blob: b"alice-keys".to_vec(),
+        };
+        let bob_snapshot = PersistedGroupSnapshot {
+            schema_version: 1,
+            group_state_blob: b"bob-group".to_vec(),
+            key_material_blob: b"bob-keys".to_vec(),
+        };
+
+        storage
+            .save_group_state(1001, "desktop", guild, channel, alice_snapshot.clone())
+            .await
+            .expect("save alice snapshot");
+        storage
+            .save_group_state(1002, "desktop", guild, channel, bob_snapshot.clone())
+            .await
+            .expect("save bob snapshot");
+
+        let loaded_alice = storage
+            .load_group_state(1001, "desktop", guild, channel)
+            .await
+            .expect("load alice")
+            .expect("alice exists");
+        let loaded_bob = storage
+            .load_group_state(1002, "desktop", guild, channel)
+            .await
+            .expect("load bob")
+            .expect("bob exists");
+
+        assert_eq!(
+            loaded_alice.group_state_blob,
+            alice_snapshot.group_state_blob
+        );
+        assert_eq!(
+            loaded_alice.key_material_blob,
+            alice_snapshot.key_material_blob
+        );
+        assert_eq!(loaded_bob.group_state_blob, bob_snapshot.group_state_blob);
+        assert_eq!(loaded_bob.key_material_blob, bob_snapshot.key_material_blob);
     }
 
     #[tokio::test]

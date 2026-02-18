@@ -86,12 +86,16 @@ pub trait MlsStore: Send + Sync {
     async fn load_identity_keys(&self, user_id: i64, device_id: &str) -> Result<Option<Vec<u8>>>;
     async fn save_group_state(
         &self,
+        user_id: i64,
+        device_id: &str,
         guild_id: GuildId,
         channel_id: ChannelId,
         snapshot: PersistedGroupSnapshot,
     ) -> Result<()>;
     async fn load_group_state(
         &self,
+        user_id: i64,
+        device_id: &str,
         guild_id: GuildId,
         channel_id: ChannelId,
     ) -> Result<Option<PersistedGroupSnapshot>>;
@@ -123,6 +127,8 @@ impl OpenMlsProvider for PersistentOpenMlsProvider {
 
 pub struct MlsGroupHandle<S: MlsStore> {
     store: S,
+    user_id: i64,
+    device_id: String,
     guild_id: GuildId,
     channel_id: ChannelId,
     provider: PersistentOpenMlsProvider,
@@ -133,12 +139,16 @@ pub struct MlsGroupHandle<S: MlsStore> {
 impl<S: MlsStore> MlsGroupHandle<S> {
     pub async fn new(
         store: S,
+        user_id: i64,
+        device_id: impl Into<String>,
         guild_id: GuildId,
         channel_id: ChannelId,
         identity: MlsIdentity,
     ) -> Result<Self> {
         let mut handle = Self {
             store,
+            user_id,
+            device_id: device_id.into(),
             guild_id,
             channel_id,
             provider: PersistentOpenMlsProvider::default(),
@@ -287,6 +297,8 @@ impl<S: MlsStore> MlsGroupHandle<S> {
 
             self.store
                 .save_group_state(
+                    self.user_id,
+                    &self.device_id,
                     self.guild_id,
                     self.channel_id,
                     PersistedGroupSnapshot {
@@ -303,7 +315,12 @@ impl<S: MlsStore> MlsGroupHandle<S> {
     async fn load_group_if_exists(&mut self) -> Result<()> {
         let Some(snapshot) = self
             .store
-            .load_group_state(self.guild_id, self.channel_id)
+            .load_group_state(
+                self.user_id,
+                &self.device_id,
+                self.guild_id,
+                self.channel_id,
+            )
             .await?
         else {
             return Ok(());
@@ -351,7 +368,7 @@ mod tests {
     use tokio::sync::Mutex;
 
     type IdentityKey = (i64, String);
-    type GroupKey = (i64, i64);
+    type GroupKey = (i64, String, i64, i64);
     type BlobMap<K, V> = Arc<Mutex<HashMap<K, V>>>;
 
     #[derive(Default, Clone)]
@@ -390,19 +407,23 @@ mod tests {
 
         async fn save_group_state(
             &self,
+            user_id: i64,
+            device_id: &str,
             guild_id: GuildId,
             channel_id: ChannelId,
             snapshot: PersistedGroupSnapshot,
         ) -> Result<()> {
-            self.groups
-                .lock()
-                .await
-                .insert((guild_id.0, channel_id.0), snapshot);
+            self.groups.lock().await.insert(
+                (user_id, device_id.to_string(), guild_id.0, channel_id.0),
+                snapshot,
+            );
             Ok(())
         }
 
         async fn load_group_state(
             &self,
+            user_id: i64,
+            device_id: &str,
             guild_id: GuildId,
             channel_id: ChannelId,
         ) -> Result<Option<PersistedGroupSnapshot>> {
@@ -410,7 +431,7 @@ mod tests {
                 .groups
                 .lock()
                 .await
-                .get(&(guild_id.0, channel_id.0))
+                .get(&(user_id, device_id.to_string(), guild_id.0, channel_id.0))
                 .cloned())
         }
     }
@@ -425,15 +446,30 @@ mod tests {
         let charlie_identity =
             MlsIdentity::new_with_name(b"charlie".to_vec()).expect("charlie identity");
 
-        let mut alice =
-            MlsGroupHandle::new(MemoryStore::default(), guild_id, channel_id, alice_identity)
-                .await
-                .expect("alice handle");
-        let bob = MlsGroupHandle::new(MemoryStore::default(), guild_id, channel_id, bob_identity)
-            .await
-            .expect("bob handle");
+        let mut alice = MlsGroupHandle::new(
+            MemoryStore::default(),
+            1,
+            "device-alice",
+            guild_id,
+            channel_id,
+            alice_identity,
+        )
+        .await
+        .expect("alice handle");
+        let bob = MlsGroupHandle::new(
+            MemoryStore::default(),
+            2,
+            "device-bob",
+            guild_id,
+            channel_id,
+            bob_identity,
+        )
+        .await
+        .expect("bob handle");
         let charlie = MlsGroupHandle::new(
             MemoryStore::default(),
+            3,
+            "device-charlie",
             guild_id,
             channel_id,
             charlie_identity,
@@ -482,13 +518,26 @@ mod tests {
         let alice_identity = MlsIdentity::new_with_name(b"alice".to_vec()).expect("alice identity");
         let bob_identity = MlsIdentity::new_with_name(b"bob".to_vec()).expect("bob identity");
 
-        let mut alice =
-            MlsGroupHandle::new(MemoryStore::default(), guild_id, channel_id, alice_identity)
-                .await
-                .expect("alice handle");
-        let bob = MlsGroupHandle::new(MemoryStore::default(), guild_id, channel_id, bob_identity)
-            .await
-            .expect("bob handle");
+        let mut alice = MlsGroupHandle::new(
+            MemoryStore::default(),
+            1,
+            "device-alice",
+            guild_id,
+            channel_id,
+            alice_identity,
+        )
+        .await
+        .expect("alice handle");
+        let bob = MlsGroupHandle::new(
+            MemoryStore::default(),
+            2,
+            "device-bob",
+            guild_id,
+            channel_id,
+            bob_identity,
+        )
+        .await
+        .expect("bob handle");
         let bob_kp = bob.key_package_bytes().expect("bob key package bytes");
         alice.create_group(channel_id).await.expect("create group");
 
@@ -522,13 +571,26 @@ mod tests {
         let alice_identity = MlsIdentity::new_with_name(b"alice".to_vec()).expect("alice identity");
         let bob_identity = MlsIdentity::new_with_name(b"bob".to_vec()).expect("bob identity");
 
-        let mut alice =
-            MlsGroupHandle::new(alice_store.clone(), guild_id, channel_id, alice_identity)
-                .await
-                .expect("alice handle");
-        let mut bob = MlsGroupHandle::new(bob_store.clone(), guild_id, channel_id, bob_identity)
-            .await
-            .expect("bob handle");
+        let mut alice = MlsGroupHandle::new(
+            alice_store.clone(),
+            1,
+            "device-alice",
+            guild_id,
+            channel_id,
+            alice_identity,
+        )
+        .await
+        .expect("alice handle");
+        let mut bob = MlsGroupHandle::new(
+            bob_store.clone(),
+            2,
+            "device-bob",
+            guild_id,
+            channel_id,
+            bob_identity,
+        )
+        .await
+        .expect("bob handle");
 
         let bob_kp = bob.key_package_bytes().expect("bob key package");
         alice.create_group(channel_id).await.expect("create group");
@@ -550,6 +612,8 @@ mod tests {
             MlsIdentity::new_with_name(b"bob".to_vec()).expect("bob identity reload");
         let mut bob = MlsGroupHandle::new(
             bob_store.clone(),
+            2,
+            "device-bob",
             guild_id,
             channel_id,
             bob_identity_reloaded,
@@ -561,6 +625,8 @@ mod tests {
             MlsIdentity::new_with_name(b"charlie".to_vec()).expect("charlie identity");
         let charlie = MlsGroupHandle::new(
             MemoryStore::default(),
+            3,
+            "device-charlie",
             guild_id,
             channel_id,
             charlie_identity,
