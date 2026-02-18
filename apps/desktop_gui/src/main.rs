@@ -586,6 +586,7 @@ struct DesktopGuiApp {
     sender_directory: HashMap<i64, String>,
     attachment_previews: HashMap<FileId, AttachmentPreviewState>,
     expanded_preview: Option<FileId>,
+    hovered_message: Option<MessageId>,
 
     voice_ui: VoiceSessionUiState,
 
@@ -670,6 +671,7 @@ impl DesktopGuiApp {
             sender_directory: HashMap::new(),
             attachment_previews: HashMap::new(),
             expanded_preview: None,
+            hovered_message: None,
             voice_ui: VoiceSessionUiState::new(),
             settings_open: false,
             view_state: AppViewState::Login,
@@ -1487,6 +1489,49 @@ impl DesktopGuiApp {
         }
     }
 
+    fn render_left_user_panel(&mut self, ui: &mut egui::Ui) {
+        let discord_dark = theme_discord_dark_palette(self.theme);
+        egui::Frame::group(ui.style())
+            .fill(
+                discord_dark
+                    .map(|p| p.message_background)
+                    .unwrap_or(ui.visuals().panel_fill),
+            )
+            .show(ui, |ui| {
+                self.left_user_panel_height = self
+                    .left_user_panel_height
+                    .clamp(MIN_LEFT_USER_PANEL_HEIGHT, MAX_LEFT_USER_PANEL_HEIGHT);
+                ui.set_min_height(self.left_user_panel_height - 12.0);
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("●").color(egui::Color32::from_rgb(67, 181, 129)));
+                    ui.strong(&self.username);
+                    let status_label = if self.voice_ui.active_session.is_some() {
+                        "In voice"
+                    } else {
+                        "Online"
+                    };
+                    ui.small(format!("· {status_label}"));
+                });
+                ui.add_space(4.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.toggle_value(&mut self.voice_ui.muted, "Mute");
+                    ui.toggle_value(&mut self.voice_ui.deafened, "Deafen");
+                });
+                ui.add_space(6.0);
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("⚙ Settings").clicked() {
+                        self.settings_open = true;
+                    }
+                    if ui.button("⎋ Sign out").clicked() {
+                        self.auth_session_established = false;
+                        self.view_state = AppViewState::Login;
+                        self.status = "Signed out".to_string();
+                        self.status_banner = None;
+                    }
+                });
+            });
+    }
+
     // ------------------- Main workspace (mostly unchanged) -------------------
 
     fn show_account_menu_contents(&mut self, ui: &mut egui::Ui) {
@@ -1587,6 +1632,7 @@ impl DesktopGuiApp {
                     .map(|guild| guild.name.clone())
             })
             .unwrap_or_else(|| "No workspace selected".to_string());
+        let show_workspace_context = self.guilds.len() > 1 && self.selected_guild.is_some();
 
         egui::TopBottomPanel::top("top_bar")
             .frame(
@@ -1598,15 +1644,27 @@ impl DesktopGuiApp {
                     )),
             )
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    if ui.button("⚙ Settings").clicked() {
-                        self.settings_open = true;
-                    }
+                ui.scope(|ui| {
+                    let style = ui.style_mut();
+                    style.spacing.button_padding.y = 2.0;
+                    style.visuals.widgets.inactive.rounding = egui::Rounding::same(0.0);
+                    style.visuals.widgets.hovered.rounding = egui::Rounding::same(0.0);
+                    style.visuals.widgets.active.rounding = egui::Rounding::same(0.0);
+                    style.visuals.widgets.open.rounding = egui::Rounding::same(0.0);
+
+                    egui::menu::bar(ui, |ui| {
+                        ui.menu_button("⚙ Settings", |ui| {
+                            if ui.button("Open").clicked() {
+                                self.settings_open = true;
+                                ui.close_menu();
+                            }
+                        });
 
                     ui.menu_button("Account", |ui| self.show_account_menu_contents(ui));
 
-                    ui.separator();
-                    ui.weak(format!("Workspace: {workspace_label}"));
+                        ui.separator();
+                        ui.weak(format!("Workspace: {workspace_label}"));
+                    });
                 });
             });
 
@@ -1870,6 +1928,9 @@ impl DesktopGuiApp {
                 let discord_dark = theme_discord_dark_palette(self.theme);
                 ui.horizontal(|ui| {
                     ui.heading("Channels");
+                    if show_workspace_context {
+                        ui.weak(format!("Workspace: {workspace_label}"));
+                    }
                     let refresh_label = if let Some(palette) = discord_dark {
                         egui::RichText::new("Refresh").color(palette.side_panel_button_text)
                     } else {
@@ -2102,8 +2163,6 @@ impl DesktopGuiApp {
                             ui.add_space(4.0);
                             ui.label("Sign in to browse channels.");
                         }
-                    });
-            });
 
         egui::TopBottomPanel::bottom("left_user_panel")
             .resizable(true)
@@ -2398,6 +2457,7 @@ impl DesktopGuiApp {
 
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     ui.add_space(TOOLBAR_H_PADDING);
+                    let mut hovered_message = None;
                     if let Some(channel_id) = self.selected_channel {
                         if let Some(messages) = self.messages.get(&channel_id).cloned() {
                             for msg in &messages {
@@ -2422,8 +2482,14 @@ impl DesktopGuiApp {
                                     discord_dark.map(|p| p.message_background).unwrap_or_else(
                                         || ui.visuals().faint_bg_color.gamma_multiply(0.45),
                                     );
+                                let hover_message_bg = lighten_color(base_message_bg, 0.12);
+                                let row_bg = if self.hovered_message == Some(msg.wire.message_id) {
+                                    hover_message_bg
+                                } else {
+                                    base_message_bg
+                                };
                                 let frame = if self.readability.message_bubble_backgrounds {
-                                    egui::Frame::none().fill(base_message_bg)
+                                    egui::Frame::none().fill(row_bg)
                                 } else {
                                     egui::Frame::none()
                                 };
@@ -2432,7 +2498,7 @@ impl DesktopGuiApp {
                                         egui::vec2(ui.available_width(), 0.0),
                                         egui::Layout::top_down(egui::Align::Min),
                                         |ui| {
-                                            frame
+                                            let message_response = frame
                                                 .rounding(egui::Rounding::same(f32::from(
                                                     self.theme.panel_rounding,
                                                 )))
@@ -2484,7 +2550,10 @@ impl DesktopGuiApp {
                                                         }
                                                     }
                                                 })
-                                                .response
+                                                .response;
+                                            if message_response.hovered() {
+                                                hovered_message = Some(msg.wire.message_id);
+                                            }
                                         },
                                     );
 
@@ -2507,6 +2576,7 @@ impl DesktopGuiApp {
                             );
                         }
                     }
+                    self.hovered_message = hovered_message;
                 });
 
                 if !self.auth_session_established {
