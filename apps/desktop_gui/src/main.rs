@@ -1469,24 +1469,36 @@ impl DesktopGuiApp {
                     )),
             )
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    if ui.button("⚙ Settings").clicked() {
-                        self.settings_open = true;
-                    }
+                ui.scope(|ui| {
+                    let style = ui.style_mut();
+                    style.spacing.button_padding.y = 2.0;
+                    style.visuals.widgets.inactive.rounding = egui::Rounding::same(0.0);
+                    style.visuals.widgets.hovered.rounding = egui::Rounding::same(0.0);
+                    style.visuals.widgets.active.rounding = egui::Rounding::same(0.0);
+                    style.visuals.widgets.open.rounding = egui::Rounding::same(0.0);
 
-                    ui.menu_button("Account", |ui| {
-                        ui.label("Signed in as current user");
-                        if ui.button("Sign out").clicked() {
-                            self.auth_session_established = false;
-                            self.view_state = AppViewState::Login;
-                            self.status = "Signed out".to_string();
-                            self.status_banner = None;
-                            ui.close_menu();
-                        }
+                    egui::menu::bar(ui, |ui| {
+                        ui.menu_button("⚙ Settings", |ui| {
+                            if ui.button("Open").clicked() {
+                                self.settings_open = true;
+                                ui.close_menu();
+                            }
+                        });
+
+                        ui.menu_button("Account", |ui| {
+                            ui.label("Signed in");
+                            if ui.button("Sign out").clicked() {
+                                self.auth_session_established = false;
+                                self.view_state = AppViewState::Login;
+                                self.status = "Signed out".to_string();
+                                self.status_banner = None;
+                                ui.close_menu();
+                            }
+                        });
+
+                        ui.separator();
+                        ui.weak(format!("Workspace: {workspace_label}"));
                     });
-
-                    ui.separator();
-                    ui.weak(format!("Workspace: {workspace_label}"));
                 });
             });
 
