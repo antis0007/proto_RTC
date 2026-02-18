@@ -88,7 +88,11 @@ pub trait MlsSessionManager: Send + Sync {
         channel_id: ChannelId,
         ciphertext: &[u8],
     ) -> Result<Vec<u8>>;
-    async fn add_member(&self, channel_id: ChannelId, key_package_bytes: &[u8]) -> Result<Vec<u8>>;
+    async fn add_member(
+        &self,
+        channel_id: ChannelId,
+        key_package_bytes: &[u8],
+    ) -> Result<MlsAddMemberOutcome>;
     async fn join_from_welcome(&self, channel_id: ChannelId, welcome_bytes: &[u8]) -> Result<()>;
     async fn export_secret(
         &self,
@@ -96,6 +100,12 @@ pub trait MlsSessionManager: Send + Sync {
         label: &str,
         len: usize,
     ) -> Result<Vec<u8>>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MlsAddMemberOutcome {
+    pub commit_bytes: Vec<u8>,
+    pub welcome_bytes: Vec<u8>,
 }
 
 pub struct MissingMlsSessionManager;
@@ -136,7 +146,7 @@ impl MlsSessionManager for MissingMlsSessionManager {
         &self,
         channel_id: ChannelId,
         _key_package_bytes: &[u8],
-    ) -> Result<Vec<u8>> {
+    ) -> Result<MlsAddMemberOutcome> {
         Err(anyhow!(
             "no active MLS group available for channel {}",
             channel_id.0
@@ -449,7 +459,7 @@ struct ListMessagesQuery {
     before: Option<i64>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct SendMessageHttpRequest {
     user_id: i64,
     guild_id: i64,
@@ -1044,16 +1054,31 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
                 Ok(bytes) => bytes,
                 Err(_) => continue,
             };
-            let welcome_bytes = match self
+            let add_member_outcome = match self
                 .mls_session_manager
                 .add_member(channel_id, &key_package_bytes)
                 .await
             {
-                Ok(bytes) => bytes,
+                Ok(outcome) => outcome,
                 Err(_) => continue,
             };
+
             let _ = self
-                .store_pending_welcome(guild_id, channel_id, member.user_id.0, &welcome_bytes)
+                .post_ciphertext_message(
+                    guild_id,
+                    channel_id,
+                    STANDARD.encode(add_member_outcome.commit_bytes),
+                    None,
+                )
+                .await;
+
+            let _ = self
+                .store_pending_welcome(
+                    guild_id,
+                    channel_id,
+                    member.user_id.0,
+                    &add_member_outcome.welcome_bytes,
+                )
                 .await;
         }
 
@@ -1129,14 +1154,16 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
             return Ok(());
         }
 
-        self.mls_session_manager
-            .open_or_create_group(guild_id, message.channel_id)
-            .await?;
-        self.inner
-            .lock()
+        if !self
+            .is_mls_channel_initialized(guild_id, message.channel_id)
             .await
-            .initialized_mls_channels
-            .insert((guild_id, message.channel_id));
+        {
+            return Err(anyhow!(
+                "MLS state for guild {} channel {} is uninitialized; cannot decrypt incoming ciphertext yet",
+                guild_id.0,
+                message.channel_id.0
+            ));
+        }
         let ciphertext = STANDARD
             .decode(message.ciphertext_b64.as_bytes())
             .with_context(|| {
@@ -1168,10 +1195,17 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
         text: &str,
         attachment: Option<AttachmentPayload>,
     ) -> Result<()> {
-        let (server_url, user_id, guild_id, channel_id) = self.active_context().await?;
-        self.mls_session_manager
-            .open_or_create_group(guild_id, channel_id)
-            .await?;
+        let (_server_url, user_id, guild_id, channel_id) = self.active_context().await?;
+        if !self
+            .ensure_mls_channel_initialized(guild_id, channel_id)
+            .await?
+        {
+            return Err(anyhow!(
+                "MLS state for guild {} channel {} is uninitialized; wait for welcome sync before sending",
+                guild_id.0,
+                channel_id.0
+            ));
+        }
         let plaintext_bytes = text.as_bytes();
         let ciphertext = self
             .mls_session_manager
@@ -1192,22 +1226,71 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
                 .insert(payload.ciphertext_b64.clone(), text.to_string());
         }
 
-        if let Err(err) = self
-            .http
-            .post(format!("{server_url}/messages"))
-            .json(&payload)
-            .send()
-            .await
-            .and_then(|response| response.error_for_status())
-        {
+        if let Err(err) = self.post_send_message_payload(payload.clone()).await {
             self.inner
                 .lock()
                 .await
                 .pending_outbound_plaintexts
                 .remove(&payload.ciphertext_b64);
-            return Err(err.into());
+            return Err(err);
         }
 
+        Ok(())
+    }
+
+    async fn post_ciphertext_message(
+        &self,
+        guild_id: GuildId,
+        channel_id: ChannelId,
+        ciphertext_b64: String,
+        attachment: Option<AttachmentPayload>,
+    ) -> Result<()> {
+        let (_server_url, user_id) = self.session().await?;
+        let payload = SendMessageHttpRequest {
+            user_id,
+            guild_id: guild_id.0,
+            channel_id: channel_id.0,
+            ciphertext_b64,
+            attachment,
+        };
+        self.post_send_message_payload(payload).await
+    }
+
+    async fn ensure_mls_channel_initialized(
+        &self,
+        guild_id: GuildId,
+        channel_id: ChannelId,
+    ) -> Result<bool> {
+        if self.is_mls_channel_initialized(guild_id, channel_id).await {
+            return Ok(true);
+        }
+
+        if self
+            .maybe_join_from_pending_welcome(guild_id, channel_id)
+            .await?
+        {
+            return Ok(true);
+        }
+
+        Ok(false)
+    }
+
+    async fn is_mls_channel_initialized(&self, guild_id: GuildId, channel_id: ChannelId) -> bool {
+        self.inner
+            .lock()
+            .await
+            .initialized_mls_channels
+            .contains(&(guild_id, channel_id))
+    }
+
+    async fn post_send_message_payload(&self, payload: SendMessageHttpRequest) -> Result<()> {
+        let (server_url, _user_id) = self.session().await?;
+        self.http
+            .post(format!("{server_url}/messages"))
+            .json(&payload)
+            .send()
+            .await?
+            .error_for_status()?;
         Ok(())
     }
 }
@@ -1575,6 +1658,7 @@ mod tests {
     struct TestMlsSessionManager {
         encrypt_ciphertext: Vec<u8>,
         decrypt_plaintext: Vec<u8>,
+        add_member_commit: Vec<u8>,
         add_member_welcome: Vec<u8>,
         fail_with: Option<String>,
         exported_secret: Vec<u8>,
@@ -1587,6 +1671,7 @@ mod tests {
             Self {
                 encrypt_ciphertext,
                 decrypt_plaintext,
+                add_member_commit: b"commit-generated".to_vec(),
                 add_member_welcome: b"welcome-generated".to_vec(),
                 fail_with: None,
                 exported_secret: b"mls-export-secret".to_vec(),
@@ -1599,6 +1684,7 @@ mod tests {
             Self {
                 encrypt_ciphertext: Vec::new(),
                 decrypt_plaintext: Vec::new(),
+                add_member_commit: Vec::new(),
                 add_member_welcome: Vec::new(),
                 fail_with: Some(err.into()),
                 exported_secret: Vec::new(),
@@ -1650,6 +1736,9 @@ mod tests {
                 .lock()
                 .await
                 .push(ciphertext.to_vec());
+            if ciphertext == self.add_member_commit.as_slice() {
+                return Ok(Vec::new());
+            }
             Ok(self.decrypt_plaintext.clone())
         }
 
@@ -1657,11 +1746,14 @@ mod tests {
             &self,
             _channel_id: ChannelId,
             _key_package_bytes: &[u8],
-        ) -> Result<Vec<u8>> {
+        ) -> Result<MlsAddMemberOutcome> {
             if let Some(err) = &self.fail_with {
                 return Err(anyhow!(err.clone()));
             }
-            Ok(self.add_member_welcome.clone())
+            Ok(MlsAddMemberOutcome {
+                commit_bytes: self.add_member_commit.clone(),
+                welcome_bytes: self.add_member_welcome.clone(),
+            })
         }
 
         async fn join_from_welcome(
@@ -1735,6 +1827,9 @@ mod tests {
             inner.user_id = Some(7);
             inner.selected_guild = Some(GuildId(11));
             inner.selected_channel = Some(ChannelId(13));
+            inner
+                .initialized_mls_channels
+                .insert((GuildId(11), ChannelId(13)));
         }
 
         client
@@ -1771,7 +1866,7 @@ mod tests {
             .send_message("plaintext-message")
             .await
             .expect_err("must fail");
-        assert!(err.to_string().contains("group not initialized"));
+        assert!(err.to_string().contains("uninitialized"));
     }
 
     fn sample_message() -> MessagePayload {
@@ -1812,6 +1907,9 @@ mod tests {
             inner.user_id = Some(99);
             inner.selected_guild = Some(GuildId(11));
             inner.selected_channel = Some(ChannelId(3));
+            inner
+                .initialized_mls_channels
+                .insert((GuildId(11), ChannelId(3)));
         }
 
         client
@@ -1833,6 +1931,9 @@ mod tests {
             let mut inner = client.inner.lock().await;
             inner.user_id = Some(99);
             inner.channel_guilds.insert(ChannelId(3), GuildId(11));
+            inner
+                .initialized_mls_channels
+                .insert((GuildId(11), ChannelId(3)));
         }
         let mut rx = client.subscribe_events();
 
@@ -1892,6 +1993,9 @@ mod tests {
             let mut inner = client.inner.lock().await;
             inner.user_id = Some(99);
             inner.channel_guilds.insert(ChannelId(3), GuildId(11));
+            inner
+                .initialized_mls_channels
+                .insert((GuildId(11), ChannelId(3)));
         }
         let mut rx = client.subscribe_events();
 
@@ -1901,6 +2005,27 @@ mod tests {
             .expect("decrypt should still succeed");
 
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn emit_decrypted_message_rejects_uninitialized_mls_state() {
+        let manager = TestMlsSessionManager::ok(Vec::new(), b"hello".to_vec());
+        let decrypt_inputs = manager.decrypted_ciphertexts.clone();
+        let client =
+            RealtimeClient::new_with_mls_session_manager(PassthroughCrypto, Arc::new(manager));
+        {
+            let mut inner = client.inner.lock().await;
+            inner.user_id = Some(99);
+            inner.channel_guilds.insert(ChannelId(3), GuildId(11));
+        }
+
+        let err = client
+            .emit_decrypted_message(&sample_message())
+            .await
+            .expect_err("must reject uninitialized MLS channel");
+
+        assert!(err.to_string().contains("uninitialized"));
+        assert!(decrypt_inputs.lock().await.is_empty());
     }
 
     #[derive(Clone)]
@@ -2007,7 +2132,7 @@ mod tests {
             .stored_ciphertexts
             .lock()
             .await
-            .first()
+            .last()
             .cloned()
             .unwrap_or_default();
         Json(vec![MessagePayload {
@@ -2255,9 +2380,13 @@ mod tests {
         adder.send_message("hello from A").await.expect("send text");
 
         let stored_ciphertexts = server_state.stored_ciphertexts.lock().await.clone();
-        assert_eq!(stored_ciphertexts.len(), 1);
+        assert_eq!(stored_ciphertexts.len(), 2);
         assert_ne!(
             stored_ciphertexts[0],
+            STANDARD.encode("hello from A".as_bytes())
+        );
+        assert_ne!(
+            stored_ciphertexts[1],
             STANDARD.encode("hello from A".as_bytes())
         );
 
