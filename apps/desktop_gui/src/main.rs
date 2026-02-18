@@ -223,6 +223,21 @@ fn lighten_color(c: egui::Color32, t: f32) -> egui::Color32 {
     egui::Color32::from_rgba_unmultiplied(mix(c.r()), mix(c.g()), mix(c.b()), c.a())
 }
 
+fn blend_color(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let mix = |x: u8, y: u8| -> u8 {
+        ((x as f32) * (1.0 - t) + (y as f32) * t)
+            .round()
+            .clamp(0.0, 255.0) as u8
+    };
+    egui::Color32::from_rgba_unmultiplied(
+        mix(a.r(), b.r()),
+        mix(a.g(), b.g()),
+        mix(a.b(), b.b()),
+        mix(a.a(), b.a()),
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VoiceSessionConnectionStatus {
     Idle,
@@ -642,7 +657,8 @@ impl DesktopGuiApp {
                 UiEvent::InviteCreated(invite_code) => {
                     self.password_or_invite = invite_code;
                     self.status =
-                        "Invite code created; share this code with another user".to_string();
+                        "Invite created and copied into Invite code field for quick join/share"
+                            .to_string();
                 }
                 UiEvent::SenderDirectoryUpdated { user_id, username } => {
                     self.sender_directory.insert(user_id, username);
@@ -904,6 +920,7 @@ impl DesktopGuiApp {
                 ui.separator();
                 ui.label("Accent color");
                 ui.color_edit_button_srgba(&mut self.theme.accent_color);
+                ui.small("Used for selected rows, hover emphasis, and primary actions.");
                 ui.add(
                     egui::Slider::new(&mut self.theme.panel_rounding, 0..=16)
                         .text("Panel rounding"),
@@ -1053,7 +1070,11 @@ impl DesktopGuiApp {
                             .rounding(12.0)
                             .inner_margin(egui::Margin::symmetric(14.0, 12.0))
                             .show(ui, |ui| {
-                                ui.label(egui::RichText::new("Account").strong());
+                                ui.label(
+                                    egui::RichText::new("Account")
+                                        .strong()
+                                        .size(20.0 * self.readability.text_scale),
+                                );
                                 ui.add_space(6.0);
 
                                 let mut server_url_buf = self.server_url.clone();
@@ -1521,17 +1542,56 @@ impl DesktopGuiApp {
                         queue_command(&self.cmd_tx, BackendCommand::ListGuilds, &mut self.status);
                     }
 
-                    if ui.button("Join Invite").clicked() {
-                        let invite_code = self.password_or_invite.trim().to_string();
-                        if invite_code.is_empty() {
-                            self.status = "Enter an invite code first".to_string();
-                        } else {
-                            queue_command(
-                                &self.cmd_tx,
-                                BackendCommand::JoinWithInvite { invite_code },
-                                &mut self.status,
-                            );
+                    ui.separator();
+                    ui.label("Invite");
+
+                    let invite_width = (ui.available_width() - 220.0).max(140.0);
+                    let invite_input = ui.add_sized(
+                        [invite_width, ui.spacing().interact_size.y],
+                        egui::TextEdit::singleline(&mut self.password_or_invite)
+                            .id_source("main_invite_input")
+                            .hint_text("Paste invite code"),
+                    );
+
+                    if ui.button("Paste").clicked() {
+                        if let Ok(mut clipboard) = Clipboard::new() {
+                            if let Ok(text) = clipboard.get_text() {
+                                self.password_or_invite = text;
+                            }
                         }
+                    }
+
+                    if ui.button("Clear").clicked() {
+                        self.password_or_invite.clear();
+                    }
+
+                    if ui
+                        .add_enabled(
+                            !self.password_or_invite.trim().is_empty(),
+                            egui::Button::new("Copy"),
+                        )
+                        .clicked()
+                    {
+                        ui.ctx()
+                            .copy_text(self.password_or_invite.trim().to_string());
+                        self.status = "Copied invite code to clipboard".to_string();
+                    }
+
+                    let join_enabled =
+                        self.auth_session_established && !self.password_or_invite.trim().is_empty();
+                    let join_clicked = ui
+                        .add_enabled(join_enabled, egui::Button::new("Join"))
+                        .clicked();
+                    let join_with_enter = invite_input.has_focus()
+                        && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                        && join_enabled;
+                    if join_clicked || join_with_enter {
+                        let invite_code = self.password_or_invite.trim().to_string();
+                        queue_command(
+                            &self.cmd_tx,
+                            BackendCommand::JoinWithInvite { invite_code },
+                            &mut self.status,
+                        );
                     }
                 });
 
@@ -2217,66 +2277,89 @@ impl DesktopGuiApp {
                                 } else {
                                     egui::Frame::none()
                                 };
-                                let message_response = frame
-                                    .rounding(egui::Rounding::same(f32::from(
-                                        self.theme.panel_rounding,
-                                    )))
-                                    .inner_margin(message_margin)
-                                    .show(ui, |ui| {
-                                        ui.horizontal_wrapped(|ui| {
-                                            ui.label(egui::RichText::new(sender_display).strong());
-                                            if self.readability.show_timestamps {
-                                                ui.label(
-                                                    egui::RichText::new(sent_at).small().weak(),
-                                                );
-                                            }
-                                        });
-                                        ui.label(&msg.plaintext);
-                                        if let Some(attachment) = &msg.wire.attachment {
-                                            if attachment_is_image(attachment) {
-                                                self.render_image_attachment_preview(
-                                                    ui, attachment,
-                                                );
-                                            } else {
-                                                ui.horizontal(|ui| {
-                                                    ui.label(format!(
-                                                        "📎 {} ({})",
-                                                        attachment.filename,
-                                                        human_readable_bytes(attachment.size_bytes)
-                                                    ));
-                                                    if ui.button("Download").clicked() {
-                                                        queue_command(
-                                                            &self.cmd_tx,
-                                                            BackendCommand::DownloadAttachment {
-                                                                file_id: attachment.file_id,
-                                                                filename: attachment
-                                                                    .filename
-                                                                    .clone(),
-                                                            },
-                                                            &mut self.status,
+
+                                let row_response = ui
+                                    .allocate_ui_with_layout(
+                                        egui::vec2(ui.available_width(), 0.0),
+                                        egui::Layout::top_down(egui::Align::Min),
+                                        |ui| {
+                                            frame
+                                                .rounding(egui::Rounding::same(f32::from(
+                                                    self.theme.panel_rounding,
+                                                )))
+                                                .inner_margin(message_margin)
+                                                .show(ui, |ui| {
+                                                    ui.set_width(ui.available_width());
+                                                    ui.horizontal_wrapped(|ui| {
+                                                        ui.label(
+                                                            egui::RichText::new(sender_display)
+                                                                .strong(),
                                                         );
+                                                        if self.readability.show_timestamps {
+                                                            ui.label(
+                                                                egui::RichText::new(sent_at)
+                                                                    .small()
+                                                                    .weak(),
+                                                            );
+                                                        }
+                                                    });
+                                                    ui.label(&msg.plaintext);
+                                                    if let Some(attachment) = &msg.wire.attachment {
+                                                        if attachment_is_image(attachment) {
+                                                            self.render_image_attachment_preview(
+                                                                ui, attachment,
+                                                            );
+                                                        } else {
+                                                            ui.horizontal(|ui| {
+                                                                ui.label(format!(
+                                                                    "📎 {} ({})",
+                                                                    attachment.filename,
+                                                                    human_readable_bytes(
+                                                                        attachment.size_bytes
+                                                                    )
+                                                                ));
+                                                                if ui.button("Download").clicked()
+                                                                {
+                                                                    queue_command(
+                                                                        &self.cmd_tx,
+                                                                        BackendCommand::DownloadAttachment {
+                                                                            file_id: attachment.file_id,
+                                                                            filename: attachment
+                                                                                .filename
+                                                                                .clone(),
+                                                                        },
+                                                                        &mut self.status,
+                                                                    );
+                                                                }
+                                                            });
+                                                        }
                                                     }
-                                                });
-                                            }
-                                        }
-                                    })
+                                                })
+                                                .response
+                                        },
+                                    )
                                     .response;
 
-                                if message_response.hovered() {
-                                    if let Some(palette) = discord_dark {
-                                        ui.ctx()
-                                            .layer_painter(egui::LayerId::new(
-                                                egui::Order::Background,
-                                                egui::Id::new("message_hover_row"),
-                                            ))
-                                            .rect_filled(
-                                                message_response.rect,
-                                                egui::Rounding::same(f32::from(
-                                                    self.theme.panel_rounding,
-                                                )),
-                                                palette.message_row_hover,
-                                            );
-                                    }
+                                if row_response.hovered() {
+                                    let hover_color = discord_dark
+                                        .map(|p| p.message_row_hover)
+                                        .unwrap_or_else(|| {
+                                            ui.visuals().widgets.hovered.bg_fill.gamma_multiply(0.5)
+                                        });
+                                    ui.ctx()
+                                        .layer_painter(egui::LayerId::new(
+                                            egui::Order::Background,
+                                            egui::Id::new((
+                                                "message_hover_row",
+                                                channel_id.0,
+                                                msg.wire.message_id.0,
+                                            )),
+                                        ))
+                                        .rect_filled(
+                                            row_response.rect,
+                                            egui::Rounding::same(f32::from(self.theme.panel_rounding)),
+                                            hover_color,
+                                        );
                                 }
 
                                 ui.add_space(if self.readability.compact_density {
@@ -2622,21 +2705,28 @@ struct DiscordDarkPalette {
 }
 
 fn theme_discord_dark_palette(theme: ThemeSettings) -> Option<DiscordDarkPalette> {
-    (theme.preset == ThemePreset::DiscordDark).then_some(DiscordDarkPalette {
-        app_background: egui::Color32::from_rgb(26, 26, 30),
-        message_background: egui::Color32::from_rgb(26, 26, 30),
-        members_background: egui::Color32::from_rgb(26, 26, 30),
-        navigation_background: egui::Color32::from_rgb(18, 18, 20),
-        message_row_hover: egui::Color32::from_rgb(36, 36, 40),
-        guild_entry_hover: egui::Color32::from_rgb(29, 29, 30),
-        guild_entry_active: egui::Color32::from_rgb(44, 44, 48),
-        guild_entry_stroke: egui::Color32::from_rgb(48, 48, 56),
-        guild_entry_stroke_active: egui::Color32::from_rgb(92, 92, 105),
-        guild_text_unhighlighted: egui::Color32::from_rgb(129, 130, 138),
-        guild_text_hovered: egui::Color32::from_rgb(214, 216, 220),
-        guild_text_highlighted: egui::Color32::from_rgb(251, 251, 251),
-        side_panel_button_fill: egui::Color32::from_rgb(35, 35, 40),
-        side_panel_button_text: egui::Color32::from_rgb(236, 237, 240),
+    (theme.preset == ThemePreset::DiscordDark).then_some({
+        let accent = theme.accent_color;
+        DiscordDarkPalette {
+            app_background: egui::Color32::from_rgb(26, 26, 30),
+            message_background: egui::Color32::from_rgb(26, 26, 30),
+            members_background: egui::Color32::from_rgb(26, 26, 30),
+            navigation_background: egui::Color32::from_rgb(18, 18, 20),
+            message_row_hover: blend_color(egui::Color32::from_rgb(36, 36, 40), accent, 0.08),
+            guild_entry_hover: blend_color(egui::Color32::from_rgb(29, 29, 30), accent, 0.06),
+            guild_entry_active: blend_color(egui::Color32::from_rgb(44, 44, 48), accent, 0.28),
+            guild_entry_stroke: egui::Color32::from_rgb(48, 48, 56),
+            guild_entry_stroke_active: blend_color(
+                egui::Color32::from_rgb(92, 92, 105),
+                accent,
+                0.45,
+            ),
+            guild_text_unhighlighted: egui::Color32::from_rgb(129, 130, 138),
+            guild_text_hovered: egui::Color32::from_rgb(214, 216, 220),
+            guild_text_highlighted: egui::Color32::from_rgb(251, 251, 251),
+            side_panel_button_fill: blend_color(egui::Color32::from_rgb(35, 35, 40), accent, 0.32),
+            side_panel_button_text: egui::Color32::from_rgb(236, 237, 240),
+        }
     })
 }
 
