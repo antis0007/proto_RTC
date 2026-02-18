@@ -135,6 +135,68 @@ Use **bash scripts (`.sh`) on Linux/macOS**, and **PowerShell scripts (`.ps1`) o
 2. Start GUI: `./scripts/run-gui.sh` (Windows: `./scripts/run-gui.ps1`)
 3. Login and chat, or use **Create Invite** / **Join Invite** for multi-user tests.
 
+### A.1) Windows + LiveKit quick start (recommended)
+
+If you want voice/screen support enabled and a clean local setup on Windows, use this sequence:
+
+1. Open terminal #1 and start LiveKit in dev mode:
+
+   ```powershell
+   docker run --rm -p 7880:7880 -p 7881:7881 livekit/livekit-server:latest --dev --bind 0.0.0.0
+   ```
+
+2. Open terminal #2 in repo root and prepare `.env` if needed:
+
+   ```powershell
+   Copy-Item .env.example .env
+   ```
+
+3. In the same terminal, make sure LiveKit env values are present for this session:
+
+   ```powershell
+   $env:LIVEKIT_URL = 'ws://127.0.0.1:7880'
+   $env:LIVEKIT_API_KEY = 'devkey'
+   $env:LIVEKIT_API_SECRET = 'devsecret'
+   ```
+
+4. Start a fresh temporary server database (avoids stale MLS state):
+
+   ```powershell
+   ./scripts/run-temp-server.ps1
+   ```
+
+5. Open terminal #3 and start GUI:
+
+   ```powershell
+   ./scripts/run-gui.ps1
+   ```
+
+6. In GUI, keep server URL as `http://127.0.0.1:8443`, then login.
+
+> Why this helps: `run-temp-server.ps1` always starts with a throwaway SQLite DB, which prevents old MLS key state from previous runs from causing decrypt/send failures.
+
+### A.2) Troubleshooting MLS send failures on Windows
+
+If you see errors like:
+
+- `openmls::tree::secret_tree: This is the wrong ratchet type.`
+- `Ciphertext generation out of bounds ... RatchetTypeError`
+
+run through this reset checklist:
+
+1. Stop **all** running `server`, `desktop_gui`, and `desktop` processes.
+2. Prefer `./scripts/run-temp-server.ps1` over `run-server.ps1` while debugging.
+3. If you need persistent mode, delete `./data/server.db` once and restart server.
+4. Log in again (new user sessions), re-create/join invite, then retry sending.
+5. Confirm server and GUI point at the same `SERVER_PUBLIC_URL` (`http://127.0.0.1:8443` by default).
+6. Keep only one local server process bound to 8443.
+
+For quick validation that text messaging works end-to-end before opening GUI, run:
+
+```powershell
+./scripts/test-local-stack.ps1
+```
+
 ### B) One computer: server + 2 clients (automated smoke test)
 
 This is the fastest reproducible test path.
