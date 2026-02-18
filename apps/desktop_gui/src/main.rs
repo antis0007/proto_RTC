@@ -494,7 +494,6 @@ enum AppViewState {
 enum LoginFocusField {
     Server,
     Username,
-    Invite,
 }
 
 #[derive(Debug, Clone)]
@@ -520,7 +519,7 @@ struct DesktopGuiApp {
 
     server_url: String,
     username: String,
-    password_or_invite: String,
+    invite_code_input: String,
     auth_session_established: bool,
 
     composer: String,
@@ -601,7 +600,7 @@ impl DesktopGuiApp {
             ui_rx,
             server_url: "http://127.0.0.1:8443".to_string(),
             username: "alice".to_string(),
-            password_or_invite: String::new(),
+            invite_code_input: String::new(),
             auth_session_established: false,
             composer: String::new(),
             pending_attachment: None,
@@ -655,9 +654,12 @@ impl DesktopGuiApp {
                     self.status = message;
                 }
                 UiEvent::InviteCreated(invite_code) => {
-                    self.password_or_invite = invite_code;
+                    self.invite_code_input = invite_code;
+                    if let Ok(mut clipboard) = Clipboard::new() {
+                        let _ = clipboard.set_text(self.invite_code_input.clone());
+                    }
                     self.status =
-                        "Invite created and copied into Invite code field for quick join/share"
+                        "Invite created, copied to clipboard, and inserted into the Invite field"
                             .to_string();
                 }
                 UiEvent::SenderDirectoryUpdated { user_id, username } => {
@@ -1061,9 +1063,6 @@ impl DesktopGuiApp {
                             self.login_ui.focus = None;
                         }
 
-                        // We defer Join Invite actions until after UI closures end (prevents &mut self reborrow)
-                        let mut join_invite_request: Option<String> = None;
-
                         // Fields (stacked)
                         egui::Frame::none()
                             .fill(ui.visuals().faint_bg_color.gamma_multiply(0.55))
@@ -1132,79 +1131,6 @@ impl DesktopGuiApp {
                                 self.login_ui.last_login_click_tick = self.tick;
                             }
                         });
-
-                        ui.add_space(10.0);
-
-                        // Invite section (stacked + clearer)
-                        egui::Frame::none()
-                            .fill(ui.visuals().faint_bg_color.gamma_multiply(0.45))
-                            .rounding(12.0)
-                            .inner_margin(egui::Margin::symmetric(14.0, 12.0))
-                            .show(ui, |ui| {
-                                ui.label(egui::RichText::new("Invite").strong());
-                                ui.weak("Paste an invite code to join a guild (after signing in).");
-                                ui.add_space(6.0);
-                                let mut invite_buf = self.password_or_invite.clone();
-                                // Invite field
-                                let invite_resp = self.login_text_field(
-                                    ui,
-                                    "login_invite",
-                                    "Invite code",
-                                    "XXXX-XXXX",
-                                    &mut invite_buf,
-                                    focus_to_set == Some(LoginFocusField::Invite),
-                                );
-
-                                ui.add_space(6.0);
-
-                                let can_join = self.auth_session_established
-                                    && !self.password_or_invite.trim().is_empty();
-
-                                ui.horizontal(|ui| {
-                                    if ui.button("Paste").clicked() {
-                                        if let Ok(mut clipboard) = Clipboard::new() {
-                                            if let Ok(text) = clipboard.get_text() {
-                                                invite_buf = text;
-                                            }
-                                        }
-                                    }
-
-                                    ui.with_layout(
-                                        egui::Layout::right_to_left(egui::Align::Center),
-                                        |ui| {
-                                            if ui
-                                                .add_enabled(
-                                                    can_join,
-                                                    egui::Button::new("Join Invite")
-                                                        .min_size(egui::vec2(140.0, 32.0)),
-                                                )
-                                                .clicked()
-                                            {
-                                                join_invite_request = Some(
-                                                    self.password_or_invite.trim().to_string(),
-                                                );
-                                            }
-                                        },
-                                    );
-                                });
-                                self.password_or_invite = invite_buf;
-
-                                // Enter joins if invite field has focus
-                                let enter_pressed = ctx.input(|i| i.key_pressed(egui::Key::Enter));
-                                if invite_resp.has_focus() && enter_pressed && can_join {
-                                    join_invite_request =
-                                        Some(self.password_or_invite.trim().to_string());
-                                }
-                            });
-
-                        // Execute deferred join request AFTER UI closures (fixes borrow checker error)
-                        if let Some(invite_code) = join_invite_request {
-                            queue_command(
-                                &self.cmd_tx,
-                                BackendCommand::JoinWithInvite { invite_code },
-                                &mut self.status,
-                            );
-                        }
 
                         ui.add_space(10.0);
                         ui.separator();
@@ -1502,11 +1428,22 @@ impl DesktopGuiApp {
         const TOOLBAR_H_PADDING: f32 = 12.0;
         const TOOLBAR_V_PADDING: f32 = 8.0;
         const SECTION_VERTICAL_GAP: f32 = 8.0;
-        const STATUS_VERTICAL_MARGIN: f32 = 6.0;
+        const TOP_BAR_V_PADDING: f32 = 4.0;
+        const ACTION_BAR_V_PADDING: f32 = 6.0;
 
         let top_bar_bg = theme_discord_dark_palette(self.theme)
             .map(|p| p.navigation_background)
             .unwrap_or(ctx.style().visuals.panel_fill);
+
+        let workspace_label = self
+            .selected_guild
+            .and_then(|guild_id| {
+                self.guilds
+                    .iter()
+                    .find(|guild| guild.guild_id == guild_id)
+                    .map(|guild| guild.name.clone())
+            })
+            .unwrap_or_else(|| "No workspace selected".to_string());
 
         egui::TopBottomPanel::top("top_bar")
             .frame(
@@ -1514,11 +1451,11 @@ impl DesktopGuiApp {
                     .fill(top_bar_bg)
                     .inner_margin(egui::Margin::symmetric(
                         TOOLBAR_H_PADDING,
-                        TOOLBAR_V_PADDING,
+                        TOP_BAR_V_PADDING,
                     )),
             )
             .show(ctx, |ui| {
-                egui::menu::bar(ui, |ui| {
+                ui.horizontal(|ui| {
                     if ui.button("⚙ Settings").clicked() {
                         self.settings_open = true;
                     }
@@ -1533,10 +1470,22 @@ impl DesktopGuiApp {
                             ui.close_menu();
                         }
                     });
+
+                    ui.separator();
+                    ui.weak(format!("Workspace: {workspace_label}"));
                 });
+            });
 
-                ui.add_space(SECTION_VERTICAL_GAP);
-
+        egui::TopBottomPanel::top("workspace_actions_bar")
+            .frame(
+                egui::Frame::none()
+                    .fill(top_bar_bg)
+                    .inner_margin(egui::Margin::symmetric(
+                        TOOLBAR_H_PADDING,
+                        ACTION_BAR_V_PADDING,
+                    )),
+            )
+            .show(ctx, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     if ui.button("Refresh Guilds").clicked() {
                         queue_command(&self.cmd_tx, BackendCommand::ListGuilds, &mut self.status);
@@ -1545,40 +1494,28 @@ impl DesktopGuiApp {
                     ui.separator();
                     ui.label("Invite");
 
-                    let invite_width = (ui.available_width() - 220.0).max(140.0);
+                    let invite_width = (ui.available_width() - 290.0).max(180.0);
                     let invite_input = ui.add_sized(
                         [invite_width, ui.spacing().interact_size.y],
-                        egui::TextEdit::singleline(&mut self.password_or_invite)
+                        egui::TextEdit::singleline(&mut self.invite_code_input)
                             .id_source("main_invite_input")
-                            .hint_text("Paste invite code"),
+                            .hint_text("Paste invite code (example: Z3VpbGQ6MQ)"),
                     );
 
                     if ui.button("Paste").clicked() {
                         if let Ok(mut clipboard) = Clipboard::new() {
                             if let Ok(text) = clipboard.get_text() {
-                                self.password_or_invite = text;
+                                self.invite_code_input = text;
                             }
                         }
                     }
 
                     if ui.button("Clear").clicked() {
-                        self.password_or_invite.clear();
-                    }
-
-                    if ui
-                        .add_enabled(
-                            !self.password_or_invite.trim().is_empty(),
-                            egui::Button::new("Copy"),
-                        )
-                        .clicked()
-                    {
-                        ui.ctx()
-                            .copy_text(self.password_or_invite.trim().to_string());
-                        self.status = "Copied invite code to clipboard".to_string();
+                        self.invite_code_input.clear();
                     }
 
                     let join_enabled =
-                        self.auth_session_established && !self.password_or_invite.trim().is_empty();
+                        self.auth_session_established && !self.invite_code_input.trim().is_empty();
                     let join_clicked = ui
                         .add_enabled(join_enabled, egui::Button::new("Join"))
                         .clicked();
@@ -1586,7 +1523,7 @@ impl DesktopGuiApp {
                         && ui.input(|i| i.key_pressed(egui::Key::Enter))
                         && join_enabled;
                     if join_clicked || join_with_enter {
-                        let invite_code = self.password_or_invite.trim().to_string();
+                        let invite_code = self.invite_code_input.trim().to_string();
                         queue_command(
                             &self.cmd_tx,
                             BackendCommand::JoinWithInvite { invite_code },
@@ -1595,10 +1532,9 @@ impl DesktopGuiApp {
                     }
                 });
 
-                ui.add_space(STATUS_VERTICAL_MARGIN);
+                ui.add_space(4.0);
                 ui.label(&self.status);
                 self.show_status_banner(ui);
-                ui.add_space(STATUS_VERTICAL_MARGIN);
             });
 
         self.show_settings_window(ctx);
