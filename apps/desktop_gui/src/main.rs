@@ -3,6 +3,7 @@ use std::{
     fs,
     hash::{Hash, Hasher},
     path::PathBuf,
+    sync::Arc,
     thread,
     time::SystemTime,
 };
@@ -16,6 +17,7 @@ use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 use eframe::egui;
 use egui::TextureHandle;
 use image::GenericImageView;
+use reqwest::Client as HttpClient;
 use serde::{Deserialize, Serialize};
 use shared::{
     domain::{ChannelId, ChannelKind, FileId, GuildId, MessageId, Role},
@@ -2696,6 +2698,12 @@ fn scaled_text_styles(text_scale: f32) -> BTreeMap<egui::TextStyle, egui::FontId
 }
 
 const SETTINGS_STORAGE_KEY: &str = "desktop_gui.settings";
+const DESKTOP_GUI_DEVICE_ID: &str = "desktop-gui";
+
+#[derive(Debug, Deserialize)]
+struct LoginResponse {
+    user_id: i64,
+}
 
 impl eframe::App for DesktopGuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -2777,6 +2785,54 @@ fn resolve_mls_gui_data_dir() -> Result<PathBuf, String> {
     ))
 }
 
+fn resolve_user_mls_data_dir(base_dir: &std::path::Path, user_id: i64) -> PathBuf {
+    base_dir.join("mls").join(format!("user_{user_id}"))
+}
+
+async fn fetch_user_id_for_login(server_url: &str, username: &str) -> Result<i64, String> {
+    let response = HttpClient::new()
+        .post(format!("{server_url}/login"))
+        .json(&serde_json::json!({ "username": username }))
+        .send()
+        .await
+        .map_err(|err| format!("failed to reach login endpoint: {err}"))?
+        .error_for_status()
+        .map_err(|err| format!("login endpoint returned error: {err}"))?;
+
+    let body: LoginResponse = response
+        .json()
+        .await
+        .map_err(|err| format!("invalid login response payload: {err}"))?;
+    Ok(body.user_id)
+}
+
+async fn build_user_scoped_mls_client(
+    base_dir: &std::path::Path,
+    user_id: i64,
+) -> Result<Arc<RealtimeClient<PassthroughCrypto>>, String> {
+    let user_mls_state_dir = resolve_user_mls_data_dir(base_dir, user_id);
+    std::fs::create_dir_all(&user_mls_state_dir).map_err(|err| {
+        format!(
+            "could not prepare per-user MLS state directory '{}' for user_id={user_id}: {err}",
+            user_mls_state_dir.display()
+        )
+    })?;
+
+    let mls_db_url = DurableMlsSessionManager::sqlite_url_for_gui_data_dir(&user_mls_state_dir);
+    let mls_manager = DurableMlsSessionManager::initialize(&mls_db_url, user_id, DESKTOP_GUI_DEVICE_ID)
+        .await
+        .map_err(|err| {
+            format!(
+                "failed to initialize persistent MLS backend for user_id={user_id} ({mls_db_url}): {err:#}"
+            )
+        })?;
+
+    Ok(RealtimeClient::new_with_mls_session_manager(
+        PassthroughCrypto,
+        mls_manager,
+    ))
+}
+
 fn spawn_backend_thread(cmd_rx: Receiver<BackendCommand>, ui_tx: Sender<UiEvent>) {
     thread::spawn(move || {
         let _ = ui_tx.try_send(UiEvent::Info("Backend worker starting...".to_string()));
@@ -2837,88 +2893,87 @@ fn spawn_backend_thread(cmd_rx: Receiver<BackendCommand>, ui_tx: Sender<UiEvent>
                 return;
             }
 
-            let mls_db_url = DurableMlsSessionManager::sqlite_url_for_gui_data_dir(&mls_state_dir);
-
-            let mls_manager =
-                match DurableMlsSessionManager::initialize(&mls_db_url, 0, "desktop-gui").await {
-                    Ok(manager) => manager,
-                    Err(err) => {
-                        let _ = ui_tx.try_send(UiEvent::Error(UiError::from_message(
-                            UiErrorContext::BackendStartup,
-                            format!(
-                                "backend worker startup failure: failed to initialize persistent MLS backend ({mls_db_url}): {err:#}"
-                            ),
-                        )));
-                        tracing::error!(
-                            "failed to initialize persistent MLS backend ({mls_db_url}): {err:#}"
-                        );
-                        return;
-                    }
-                };
-
-            let client =
-                RealtimeClient::new_with_mls_session_manager(PassthroughCrypto, mls_manager);
+            let mut client = RealtimeClient::new(PassthroughCrypto);
             let _ = ui_tx.try_send(UiEvent::Info("Backend worker ready".to_string()));
 
-            let mut subscribed = false;
+            let mut event_task: Option<tokio::task::JoinHandle<()>> = None;
             while let Ok(cmd) = cmd_rx.recv() {
                 match cmd {
                     BackendCommand::Login {
                         server_url,
                         username,
-                    } => match client.login(&server_url, &username, "").await {
-                        Ok(()) => {
-                            if !subscribed {
-                                subscribed = true;
-                                let mut events = client.subscribe_events();
-                                let ui_tx_clone = ui_tx.clone();
-                                tokio::spawn(async move {
-                                    while let Ok(event) = events.recv().await {
-                                        let evt = match event {
-                                            ClientEvent::Server(evt) => UiEvent::Server(evt),
-                                            ClientEvent::UserDirectoryUpdated {
-                                                user_id,
-                                                username,
-                                            } => UiEvent::SenderDirectoryUpdated {
-                                                user_id,
-                                                username,
-                                            },
-                                            ClientEvent::MessageDecrypted {
-                                                message,
-                                                plaintext,
-                                            } => UiEvent::MessageDecrypted { message, plaintext },
-                                            ClientEvent::VoiceSessionStateChanged(snapshot) => {
-                                                UiEvent::VoiceSessionStateChanged(snapshot)
-                                            }
-                                            ClientEvent::VoiceParticipantsUpdated {
-                                                guild_id,
-                                                channel_id,
-                                                participants,
-                                            } => UiEvent::VoiceParticipantsUpdated {
-                                                guild_id,
-                                                channel_id,
-                                                participants,
-                                            },
-                                            ClientEvent::Error(err) => UiEvent::Error(
-                                                UiError::from_message(
-                                                    UiErrorContext::DecryptMessage,
-                                                    err,
-                                                ),
-                                            ),
-                                        };
-                                        let _ = ui_tx_clone.try_send(evt);
-                                    }
-                                });
+                    } => {
+                        let user_id = match fetch_user_id_for_login(&server_url, &username).await {
+                            Ok(user_id) => user_id,
+                            Err(err) => {
+                                let _ = ui_tx.try_send(UiEvent::Error(UiError::from_message(
+                                    UiErrorContext::Login,
+                                    err,
+                                )));
+                                continue;
                             }
-                            let _ = ui_tx.try_send(UiEvent::LoginOk);
+                        };
+
+                        let rebound_client = match build_user_scoped_mls_client(&mls_state_dir, user_id).await {
+                            Ok(client) => client,
+                            Err(err) => {
+                                let _ = ui_tx.try_send(UiEvent::Error(UiError::from_message(
+                                    UiErrorContext::Login,
+                                    err,
+                                )));
+                                continue;
+                            }
+                        };
+
+                        if let Some(task) = event_task.take() {
+                            task.abort();
                         }
-                        Err(err) => {
-                            let _ = ui_tx.try_send(UiEvent::Error(UiError::from_message(
-                                UiErrorContext::Login,
-                                err.to_string(),
-                            )));
+
+                        let mut events = rebound_client.subscribe_events();
+                        let ui_tx_clone = ui_tx.clone();
+                        event_task = Some(tokio::spawn(async move {
+                            while let Ok(event) = events.recv().await {
+                                let evt = match event {
+                                    ClientEvent::Server(evt) => UiEvent::Server(evt),
+                                    ClientEvent::UserDirectoryUpdated { user_id, username } => {
+                                        UiEvent::SenderDirectoryUpdated { user_id, username }
+                                    }
+                                    ClientEvent::MessageDecrypted { message, plaintext } => {
+                                        UiEvent::MessageDecrypted { message, plaintext }
+                                    }
+                                    ClientEvent::VoiceSessionStateChanged(snapshot) => {
+                                        UiEvent::VoiceSessionStateChanged(snapshot)
+                                    }
+                                    ClientEvent::VoiceParticipantsUpdated {
+                                        guild_id,
+                                        channel_id,
+                                        participants,
+                                    } => UiEvent::VoiceParticipantsUpdated {
+                                        guild_id,
+                                        channel_id,
+                                        participants,
+                                    },
+                                    ClientEvent::Error(err) => UiEvent::Error(
+                                        UiError::from_message(UiErrorContext::DecryptMessage, err),
+                                    ),
+                                };
+                                let _ = ui_tx_clone.try_send(evt);
+                            }
+                        }));
+
+                        client = rebound_client;
+                        match client.login(&server_url, &username, "").await {
+                            Ok(()) => {
+                                let _ = ui_tx.try_send(UiEvent::LoginOk);
+                            }
+                            Err(err) => {
+                                let _ = ui_tx.try_send(UiEvent::Error(UiError::from_message(
+                                    UiErrorContext::Login,
+                                    err.to_string(),
+                                )));
+                            }
                         }
-                    },
+                    }
                     BackendCommand::ListGuilds => {
                         if let Err(err) = client.list_guilds().await {
                             let _ = ui_tx.try_send(UiEvent::Error(UiError::from_message(

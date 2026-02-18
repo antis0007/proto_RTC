@@ -20,3 +20,5 @@ rfd = "0.14"
 mime_guess = "2.0"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
 arboard = "3.4"
+
+reqwest.workspace = true
