@@ -9,4 +9,4 @@ anyhow.workspace = true
 clap.workspace = true
 shared = { path = "../../crates/shared" }
 storage = { path = "../../crates/storage" }
-tokio.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

@@ -28,6 +28,8 @@ jobs:
           fi
 
           echo "default-members guard passed"
+      - name: Guard tokio/full in non-runtime crates
+        run: python scripts/ci/check_tokio_full.py
       - name: Format check
         run: cargo fmt --all -- --check
       - name: Clippy (default-members fast lane)

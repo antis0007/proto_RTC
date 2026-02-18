@@ -11,14 +11,18 @@ eframe = { version = "0.28", default-features = true }
 egui = "0.28"
 shared = { path = "../../crates/shared" }
 crossbeam-channel = "0.5"
-tokio.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "fs"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 rfd = "0.14"
 mime_guess = "2.0"
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 arboard = "3.4"
 
 reqwest.workspace = true
+
+[features]
+default = ["image-format-extended"]
+image-format-extended = ["image/gif", "image/webp", "image/bmp"]
