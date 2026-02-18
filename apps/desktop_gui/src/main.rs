@@ -9,8 +9,8 @@ use std::{
 
 use arboard::{Clipboard, ImageData};
 use client_core::{
-    AttachmentUpload, ClientEvent, ClientHandle, DurableMlsSessionManager, PassthroughCrypto,
-    RealtimeClient, VoiceConnectOptions, VoiceParticipantState, VoiceSessionSnapshot,
+    AttachmentUpload, ClientEvent, ClientHandle, DurableMlsSessionManager, PassthroughCrypto, RealtimeClient,
+    VoiceConnectOptions, VoiceParticipantState, VoiceSessionSnapshot,
 };
 use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 use eframe::egui;
@@ -326,7 +326,7 @@ impl ThemeSettings {
         Self {
             preset: ThemePreset::DiscordDark,
             accent_color: egui::Color32::from_rgb(88, 101, 242),
-            panel_rounding: 6,
+            panel_rounding: 10,
             list_row_shading: true,
         }
     }
@@ -457,35 +457,80 @@ impl PersistedDesktopSettings {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppViewState {
+    Login,
+    Main,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoginFocusField {
+    Server,
+    Username,
+    Invite,
+}
+
+#[derive(Debug, Clone)]
+struct LoginUiState {
+    focus: Option<LoginFocusField>,
+    attempted_auto_focus: bool,
+    last_login_click_tick: u64,
+}
+
+impl Default for LoginUiState {
+    fn default() -> Self {
+        Self {
+            focus: Some(LoginFocusField::Username),
+            attempted_auto_focus: false,
+            last_login_click_tick: 0,
+        }
+    }
+}
+
 struct DesktopGuiApp {
     cmd_tx: Sender<BackendCommand>,
     ui_rx: Receiver<UiEvent>,
+
     server_url: String,
     username: String,
     password_or_invite: String,
     auth_session_established: bool,
+
     composer: String,
     pending_attachment: Option<PathBuf>,
     attachment_preview_cache: HashMap<AttachmentPreviewCacheKey, AttachmentPreview>,
+
     guilds: Vec<GuildSummary>,
     channels: Vec<ChannelSummary>,
     selected_guild: Option<GuildId>,
     selected_channel: Option<ChannelId>,
+
     messages: HashMap<ChannelId, Vec<DisplayMessage>>,
     members: HashMap<GuildId, Vec<MemberSummary>>,
     message_ids: HashMap<ChannelId, HashSet<MessageId>>,
+
     status: String,
     status_banner: Option<StatusBanner>,
+
     sender_directory: HashMap<i64, String>,
     attachment_previews: HashMap<FileId, AttachmentPreviewState>,
     expanded_preview: Option<FileId>,
+
     voice_ui: VoiceSessionUiState,
+
     settings_open: bool,
     view_state: AppViewState,
+
     theme: ThemeSettings,
     applied_theme: Option<ThemeSettings>,
     readability: UiReadabilitySettings,
     applied_readability: Option<UiReadabilitySettings>,
+
+    // New: stable per-view UI state so text boxes keep focus reliably.
+    login_ui: LoginUiState,
+
+    // Simple frame tick (used for debouncing and UI heuristics).
+    tick: u64,
 }
 
 #[derive(Clone)]
@@ -515,12 +560,6 @@ impl Hash for AttachmentPreviewCacheKey {
         self.path.hash(state);
         self.modified.hash(state);
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AppViewState {
-    Login,
-    Main,
 }
 
 impl DesktopGuiApp {
@@ -559,6 +598,8 @@ impl DesktopGuiApp {
             applied_theme: None,
             readability,
             applied_readability: None,
+            login_ui: LoginUiState::default(),
+            tick: 0,
         }
     }
 
@@ -605,6 +646,7 @@ impl DesktopGuiApp {
                                 "Session expired or invalid credentials. Please sign in again."
                                     .to_string(),
                         });
+                        self.login_ui.focus = Some(LoginFocusField::Username);
                     } else {
                         self.status = if err.context == UiErrorContext::Login {
                             classify_login_failure(&err.message)
@@ -781,14 +823,29 @@ impl DesktopGuiApp {
         let mut style = (*ctx.style()).clone();
         style.visuals = visuals_for_theme(self.theme);
         style.text_styles = scaled_text_styles(self.readability.text_scale);
+
+        // Make text inputs reliably clickable and visible:
+        style.visuals.widgets.inactive.bg_stroke = egui::Stroke::new(
+            1.0,
+            style.visuals.widgets.noninteractive.bg_stroke.color,
+        );
+        style.visuals.widgets.hovered.bg_stroke = egui::Stroke::new(
+            1.0,
+            style.visuals.widgets.hovered.bg_stroke.color,
+        );
+        style.visuals.widgets.active.bg_stroke = egui::Stroke::new(
+            1.2,
+            style.visuals.selection.bg_fill.gamma_multiply(0.9),
+        );
+
         if self.readability.compact_density {
             style.spacing.item_spacing = egui::vec2(6.0, 4.0);
-            style.spacing.button_padding = egui::vec2(6.0, 4.0);
-            style.spacing.interact_size.y = 22.0;
+            style.spacing.button_padding = egui::vec2(8.0, 5.0);
+            style.spacing.interact_size = egui::vec2(40.0, 24.0);
         } else {
             style.spacing.item_spacing = egui::vec2(8.0, 6.0);
-            style.spacing.button_padding = egui::vec2(8.0, 5.0);
-            style.spacing.interact_size.y = 28.0;
+            style.spacing.button_padding = egui::vec2(10.0, 6.0);
+            style.spacing.interact_size = egui::vec2(40.0, 30.0);
         }
         ctx.set_style(style);
         self.applied_theme = Some(self.theme);
@@ -877,202 +934,296 @@ impl DesktopGuiApp {
             egui::Frame::none()
                 .fill(fill)
                 .stroke(stroke)
-                .rounding(4.0)
-                .inner_margin(egui::Margin::symmetric(8.0, 6.0))
+                .rounding(8.0)
+                .inner_margin(egui::Margin::symmetric(10.0, 8.0))
                 .show(ui, |ui| {
                     ui.horizontal_wrapped(|ui| {
                         ui.label(egui::RichText::new(&banner.message).color(egui::Color32::WHITE));
-                        if ui.button("Dismiss").clicked() {
-                            self.status_banner = None;
-                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("Dismiss").clicked() {
+                                self.status_banner = None;
+                            }
+                        });
                     });
                 });
         }
     }
 
+    // ---------- Improved login UI helpers (stable IDs + stacked layout) ----------
+
+    fn login_text_field(
+        &mut self,
+        ui: &mut egui::Ui,
+        id: &'static str,
+        label: &str,
+        hint: &str,
+        value: &mut String,
+        focus_to_set: Option<LoginFocusField>,
+        field_kind: LoginFocusField,
+    ) -> egui::Response {
+        ui.label(egui::RichText::new(label).strong());
+        let mut edit = egui::TextEdit::singleline(value)
+            .id_source(id)
+            .hint_text(hint)
+            .desired_width(f32::INFINITY);
+
+        // Taller inputs are easier to click and feel “app-like”.
+        let response = ui.add_sized([ui.available_width(), 34.0], edit);
+
+        // One-time / directed focus that doesn't flicker.
+        if let Some(focus) = focus_to_set {
+            if focus == field_kind {
+                response.request_focus();
+            }
+        }
+
+        response
+    }
     fn show_login_screen(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default().show(ctx, |ui| {
-            let available_width = ui.available_width();
-            let card_width = available_width.clamp(460.0, 560.0);
-            let available_height = ui.available_height();
-            let vertical_band = (available_height * 0.12).clamp(24.0, 96.0);
-            let top_bottom_space = (available_height * 0.06).clamp(16.0, 52.0);
+            // Background spacing
+            let avail = ui.available_size();
+            let card_width = avail.x.clamp(440.0, 560.0);
+            let top_space = (avail.y * 0.12).clamp(18.0, 90.0);
 
-            ui.add_space(top_bottom_space);
-            ui.horizontal_centered(|ui| {
+            ui.add_space(top_space);
+
+            // Centered card
+            ui.vertical_centered(|ui| {
                 ui.set_width(card_width);
+
+                let palette = theme_discord_dark_palette(self.theme);
+                let card_fill = palette
+                    .map(|p| p.app_background.gamma_multiply(1.05))
+                    .unwrap_or_else(|| ui.visuals().panel_fill.gamma_multiply(0.94));
+
                 egui::Frame::none()
-                    .fill(ui.visuals().panel_fill.gamma_multiply(0.92))
-                    .rounding(12.0)
-                    .inner_margin(egui::Margin::symmetric(24.0, 22.0))
+                    .fill(card_fill)
+                    .rounding(14.0)
+                    .stroke(egui::Stroke::new(
+                        1.0,
+                        ui.visuals().widgets.noninteractive.bg_stroke.color,
+                    ))
+                    .inner_margin(egui::Margin::symmetric(20.0, 18.0))
                     .show(ui, |ui| {
-                        ui.style_mut().spacing.item_spacing = egui::vec2(10.0, 12.0);
+                        ui.style_mut().spacing.item_spacing = egui::vec2(10.0, 10.0);
 
-                        egui::Frame::none()
-                            .fill(ui.visuals().faint_bg_color)
-                            .rounding(8.0)
-                            .inner_margin(egui::Margin::symmetric(10.0, 8.0))
-                            .show(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    ui.label(
-                                        egui::RichText::new("💬")
-                                            .size(22.0)
-                                            .color(ui.visuals().strong_text_color()),
-                                    );
-                                    ui.vertical(|ui| {
-                                        ui.heading("Realtime Chat");
-                                        ui.label("Sign in to continue to your shared workspace.");
-                                    });
-                                });
+                        // Header
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("💬").size(24.0));
+                            ui.vertical(|ui| {
+                                ui.heading("Proto RTC");
+                                ui.weak("Sign in to your workspace.");
                             });
-
-                        ui.add_space(6.0);
-                        egui::Frame::none()
-                            .fill(ui.visuals().extreme_bg_color.gamma_multiply(0.45))
-                            .stroke(egui::Stroke::new(
-                                1.0,
-                                ui.visuals().widgets.noninteractive.bg_stroke.color,
-                            ))
-                            .rounding(10.0)
-                            .inner_margin(egui::Margin::symmetric(14.0, 12.0))
-                            .show(ui, |ui| {
-                                ui.label(egui::RichText::new("Credentials").strong());
-                                ui.add_space(4.0);
-
-                                egui::Grid::new("login_form_credentials")
-                                    .num_columns(2)
-                                    .min_col_width(90.0)
-                                    .spacing([16.0, 14.0])
-                                    .show(ui, |ui| {
-                                        ui.add_sized([84.0, 0.0], egui::Label::new("Server"));
-                                        ui.scope(|ui| {
-                                            ui.visuals_mut().widgets.inactive.bg_fill =
-                                                ui.visuals().code_bg_color;
-                                            ui.visuals_mut().widgets.inactive.bg_stroke =
-                                                egui::Stroke::new(
-                                                    1.0,
-                                                    ui.visuals().widgets.noninteractive.fg_stroke.color,
-                                                );
-                                            ui.add_sized(
-                                                [ui.available_width(), 28.0],
-                                                egui::TextEdit::singleline(&mut self.server_url),
-                                            );
-                                        });
-                                        ui.end_row();
-
-                                        ui.add_sized([84.0, 0.0], egui::Label::new("Username"));
-                                        ui.scope(|ui| {
-                                            ui.visuals_mut().widgets.inactive.bg_fill =
-                                                ui.visuals().code_bg_color;
-                                            ui.visuals_mut().widgets.inactive.bg_stroke =
-                                                egui::Stroke::new(
-                                                    1.0,
-                                                    ui.visuals().widgets.noninteractive.fg_stroke.color,
-                                                );
-                                            ui.add_sized(
-                                                [ui.available_width(), 28.0],
-                                                egui::TextEdit::singleline(&mut self.username),
-                                            );
-                                        });
-                                        ui.end_row();
-                                    });
-                            });
-
-                        ui.add_space(4.0);
-                        ui.scope(|ui| {
-                            let cta_color = egui::Color32::from_rgb(76, 129, 255);
-                            ui.visuals_mut().widgets.inactive.bg_fill = cta_color;
-                            ui.visuals_mut().widgets.hovered.bg_fill = cta_color.gamma_multiply(1.0);
-                            ui.visuals_mut().widgets.active.bg_fill = cta_color.gamma_multiply(0.9);
-                            ui.visuals_mut().widgets.inactive.fg_stroke.color = egui::Color32::WHITE;
-                            ui.visuals_mut().widgets.hovered.fg_stroke.color = egui::Color32::WHITE;
-                            ui.visuals_mut().widgets.active.fg_stroke.color = egui::Color32::WHITE;
-
-                            if ui
-                                .add_sized([ui.available_width(), 40.0], egui::Button::new("Sign in"))
-                                .clicked()
-                            {
-                                let username = self.username.trim().to_string();
-                                if username.is_empty() {
-                                    self.status =
-                                        "Username is required for username-only sign in".to_string();
-                                } else {
-                                    self.auth_session_established = false;
-                                    queue_command(
-                                        &self.cmd_tx,
-                                        BackendCommand::Login {
-                                            server_url: self.server_url.clone(),
-                                            username,
-                                        },
-                                        &mut self.status,
-                                    );
-                                }
-                            }
                         });
 
                         ui.add_space(8.0);
+                        self.show_status_banner(ui);
+
+                        // Determine focus request (once, or after clicking label buttons)
+                        let mut focus_to_set = None;
+                        if !self.login_ui.attempted_auto_focus {
+                            self.login_ui.attempted_auto_focus = true;
+                            focus_to_set = self.login_ui.focus;
+                        } else if self.login_ui.focus.is_some() {
+                            focus_to_set = self.login_ui.focus;
+                            self.login_ui.focus = None;
+                        }
+
+                        // We defer Join Invite actions until after UI closures end (prevents &mut self reborrow)
+                        let mut join_invite_request: Option<String> = None;
+
+                        // Fields (stacked)
                         egui::Frame::none()
-                            .fill(ui.visuals().extreme_bg_color.gamma_multiply(0.35))
-                            .stroke(egui::Stroke::new(
-                                1.0,
-                                ui.visuals().widgets.noninteractive.bg_stroke.color,
-                            ))
-                            .rounding(10.0)
+                            .fill(ui.visuals().faint_bg_color.gamma_multiply(0.55))
+                            .rounding(12.0)
+                            .inner_margin(egui::Margin::symmetric(14.0, 12.0))
+                            .show(ui, |ui| {
+                                ui.label(egui::RichText::new("Account").strong());
+                                ui.add_space(6.0);
+
+                                let mut server_url_buf = self.server_url.clone();
+                                let mut username_buf = self.username.clone();
+                                
+
+                                // Account fields
+                                let server_resp = self.login_text_field(
+                                    ui,
+                                    "login_server_url",
+                                    "Server URL",
+                                    "http://127.0.0.1:8443",
+                                    &mut server_url_buf,
+                                    focus_to_set,
+                                    LoginFocusField::Server,
+                                );
+
+                                ui.add_space(6.0);
+
+                                let user_resp = self.login_text_field(
+                                    ui,
+                                    "login_username",
+                                    "Username",
+                                    "alice",
+                                    &mut username_buf,
+                                    focus_to_set,
+                                    LoginFocusField::Username,
+                                );
+                                self.server_url = server_url_buf;
+                                self.username = username_buf;
+
+                                // Enter submits if username/server has focus
+                                let enter_pressed = ctx.input(|i| i.key_pressed(egui::Key::Enter));
+                                let can_submit = user_resp.has_focus() || server_resp.has_focus();
+                                if can_submit && enter_pressed {
+                                    self.try_login();
+                                }
+                            });
+
+                        ui.add_space(10.0);
+
+                        // Sign in button row
+                        ui.horizontal(|ui| {
+                            let is_busy = !self.auth_session_established
+                                && self.status.to_ascii_lowercase().contains("starting");
+                            let mut btn = egui::Button::new(
+                                egui::RichText::new("Sign in").strong().size(16.0),
+                            )
+                            .min_size(egui::vec2(ui.available_width(), 40.0));
+                            if let Some(p) = theme_discord_dark_palette(self.theme) {
+                                btn = btn
+                                    .fill(self.theme.accent_color)
+                                    .stroke(egui::Stroke::new(1.0, p.guild_entry_stroke_active));
+                            }
+
+                            if ui.add_enabled(!is_busy, btn).clicked() {
+                                self.try_login();
+                                self.login_ui.last_login_click_tick = self.tick;
+                            }
+                        });
+
+                        ui.add_space(10.0);
+
+                        // Invite section (stacked + clearer)
+                        egui::Frame::none()
+                            .fill(ui.visuals().faint_bg_color.gamma_multiply(0.45))
+                            .rounding(12.0)
                             .inner_margin(egui::Margin::symmetric(14.0, 12.0))
                             .show(ui, |ui| {
                                 ui.label(egui::RichText::new("Invite").strong());
-                                ui.label("Already have an invite code? Paste it below to join a guild after signing in.");
+                                ui.weak("Paste an invite code to join a guild (after signing in).");
+                                ui.add_space(6.0);
+                                let mut invite_buf = self.password_or_invite.clone();
+                                // Invite field
+                                let invite_resp = self.login_text_field(
+                                    ui,
+                                    "login_invite",
+                                    "Invite code",
+                                    "XXXX-XXXX",
+                                    &mut invite_buf,
+                                    focus_to_set,
+                                    LoginFocusField::Invite,
+                                );
+                                
 
-                                ui.add_space(2.0);
-                                egui::Grid::new("login_form_invite")
-                                    .num_columns(2)
-                                    .min_col_width(90.0)
-                                    .spacing([16.0, 12.0])
-                                    .show(ui, |ui| {
-                                        ui.add_sized([84.0, 0.0], egui::Label::new("Invite code"));
-                                        ui.scope(|ui| {
-                                            ui.visuals_mut().widgets.inactive.bg_fill =
-                                                ui.visuals().code_bg_color;
-                                            ui.visuals_mut().widgets.inactive.bg_stroke =
-                                                egui::Stroke::new(
-                                                    1.0,
-                                                    ui.visuals().widgets.noninteractive.fg_stroke.color,
-                                                );
-                                            ui.add_sized(
-                                                [ui.available_width(), 28.0],
-                                                egui::TextEdit::singleline(&mut self.password_or_invite),
-                                            );
-                                        });
-                                        ui.end_row();
-                                    });
+                                ui.add_space(8.0);
+
+                                let can_join = self.auth_session_established
+                                    && !self.password_or_invite.trim().is_empty();
 
                                 ui.horizontal(|ui| {
-                                    ui.add_space(84.0);
-                                    if ui
-                                        .add_sized([140.0, 30.0], egui::Button::new("Join Invite"))
-                                        .clicked()
-                                    {
-                                        let invite_code = self.password_or_invite.trim().to_string();
-                                        if invite_code.is_empty() {
-                                            self.status = "Enter an invite code first".to_string();
-                                        } else {
-                                            queue_command(
-                                                &self.cmd_tx,
-                                                BackendCommand::JoinWithInvite { invite_code },
-                                                &mut self.status,
-                                            );
+                                    if ui.button("Paste").clicked() {
+                                        if let Ok(mut clipboard) = Clipboard::new() {
+                                            if let Ok(text) = clipboard.get_text() {
+                                                invite_buf = text;
+                                            }
                                         }
                                     }
+
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            if ui
+                                                .add_enabled(
+                                                    can_join,
+                                                    egui::Button::new("Join Invite")
+                                                        .min_size(egui::vec2(140.0, 32.0)),
+                                                )
+                                                .clicked()
+                                            {
+                                                join_invite_request =
+                                                    Some(self.password_or_invite.trim().to_string());
+                                            }
+                                        },
+                                    );
                                 });
+                                self.password_or_invite = invite_buf;
+
+                                // Enter joins if invite field has focus
+                                let enter_pressed = ctx.input(|i| i.key_pressed(egui::Key::Enter));
+                                if invite_resp.has_focus() && enter_pressed && can_join {
+                                    join_invite_request =
+                                        Some(self.password_or_invite.trim().to_string());
+                                }
                             });
 
-                        ui.add_space(8.0);
-                        ui.label(&self.status);
-                        self.show_status_banner(ui);
+                        // Execute deferred join request AFTER UI closures (fixes borrow checker error)
+                        if let Some(invite_code) = join_invite_request {
+                            queue_command(
+                                &self.cmd_tx,
+                                BackendCommand::JoinWithInvite { invite_code },
+                                &mut self.status,
+                            );
+                        }
+
+                        ui.add_space(10.0);
+                        ui.separator();
+                        ui.add_space(6.0);
+
+                        ui.horizontal_wrapped(|ui| {
+                            ui.small("Status:");
+                            ui.small(egui::RichText::new(&self.status).weak());
+                        });
                     });
             });
-            ui.add_space(vertical_band + top_bottom_space);
+
+            ui.add_space((avail.y * 0.08).clamp(12.0, 60.0));
         });
+    }
+
+
+    fn try_login(&mut self) {
+        let username = self.username.trim().to_string();
+        if username.is_empty() {
+            self.status = "Username is required for username-only sign in".to_string();
+            self.status_banner = Some(StatusBanner {
+                severity: StatusBannerSeverity::Error,
+                message: "Please enter a username.".to_string(),
+            });
+            self.login_ui.focus = Some(LoginFocusField::Username);
+            return;
+        }
+
+        let server = self.server_url.trim().to_string();
+        if server.is_empty() {
+            self.status = "Server URL is required".to_string();
+            self.status_banner = Some(StatusBanner {
+                severity: StatusBannerSeverity::Error,
+                message: "Please enter a server URL.".to_string(),
+            });
+            self.login_ui.focus = Some(LoginFocusField::Server);
+            return;
+        }
+
+        self.auth_session_established = false;
+        self.status_banner = None;
+        queue_command(
+            &self.cmd_tx,
+            BackendCommand::Login {
+                server_url: server,
+                username,
+            },
+            &mut self.status,
+        );
     }
 
     fn attachment_preview_cache_key(path: &std::path::Path) -> AttachmentPreviewCacheKey {
@@ -1310,6 +1461,8 @@ impl DesktopGuiApp {
         }
     }
 
+    // ------------------- Main workspace (mostly unchanged) -------------------
+
     fn show_main_workspace(&mut self, ctx: &egui::Context) {
         const TOOLBAR_H_PADDING: f32 = 12.0;
         const TOOLBAR_V_PADDING: f32 = 8.0;
@@ -1319,6 +1472,7 @@ impl DesktopGuiApp {
         let top_bar_bg = theme_discord_dark_palette(self.theme)
             .map(|p| p.navigation_background)
             .unwrap_or(ctx.style().visuals.panel_fill);
+
         egui::TopBottomPanel::top("top_bar")
             .frame(
                 egui::Frame::none()
@@ -1336,146 +1490,44 @@ impl DesktopGuiApp {
 
                     ui.menu_button("Account", |ui| {
                         ui.label("Signed in as current user");
-                    });
-                });
-
-                ui.add_space(SECTION_VERTICAL_GAP);
-
-                let is_narrow = ui.available_width() < 560.0;
-                let field_min_width = if is_narrow { 120.0 } else { 180.0 };
-                let field_max_width = if is_narrow { 240.0 } else { 340.0 };
-                let input_row = |ui: &mut egui::Ui,
-                                 label: &str,
-                                 value: &mut String,
-                                 min_width: f32,
-                                 max_width: f32| {
-                    ui.horizontal(|ui| {
-                        ui.label(label);
-                        let width = ui.available_width().clamp(min_width, max_width);
-                        ui.add_sized([width, 0.0], egui::TextEdit::singleline(value));
-                    });
-                };
-
-                ui.horizontal_wrapped(|ui| {
-                    egui::Frame::group(ui.style())
-                        .inner_margin(egui::Margin::symmetric(10.0, 8.0))
-                        .show(ui, |ui| {
-                            ui.vertical(|ui| {
-                                ui.small("Auth");
-                                ui.horizontal_wrapped(|ui| {
-                                    input_row(
-                                        ui,
-                                        "Server:",
-                                        &mut self.server_url,
-                                        field_min_width,
-                                        field_max_width,
-                                    );
-                                    input_row(
-                                        ui,
-                                        "Username:",
-                                        &mut self.username,
-                                        field_min_width,
-                                        field_max_width,
-                                    );
-                                });
-                            });
-                        });
-
-                    egui::Frame::group(ui.style())
-                        .inner_margin(egui::Margin::symmetric(10.0, 8.0))
-                        .show(ui, |ui| {
-                            ui.vertical(|ui| {
-                                ui.small("Invite");
-                                input_row(
-                                    ui,
-                                    "Invite:",
-                                    &mut self.password_or_invite,
-                                    field_min_width,
-                                    field_max_width,
-                                );
-                            });
-                        });
-                });
-
-                ui.add_space(SECTION_VERTICAL_GAP);
-
-                ui.horizontal_wrapped(|ui| {
-                    if ui.button("Sign in").clicked() {
-                        let username = self.username.trim().to_string();
-                        if username.is_empty() {
-                            self.status =
-                                "Username is required for username-only sign in".to_string();
-                        } else {
+                        if ui.button("Sign out").clicked() {
                             self.auth_session_established = false;
-                            queue_command(
-                                &self.cmd_tx,
-                                BackendCommand::Login {
-                                    server_url: self.server_url.clone(),
-                                    username,
-                                },
-                                &mut self.status,
-                            );
+                            self.view_state = AppViewState::Login;
+                            self.status = "Signed out".to_string();
+                            self.status_banner = None;
+                            ui.close_menu();
                         }
+                    });
+                });
+
+                ui.add_space(SECTION_VERTICAL_GAP);
+
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("Refresh Guilds").clicked() {
+                        queue_command(
+                            &self.cmd_tx,
+                            BackendCommand::ListGuilds,
+                            &mut self.status,
+                        );
                     }
 
-                    let constrained = ui.available_width() < 280.0;
-                    if constrained {
-                        ui.menu_button("Actions", |ui| {
-                            if ui.button("Refresh Guilds").clicked() {
-                                queue_command(
-                                    &self.cmd_tx,
-                                    BackendCommand::ListGuilds,
-                                    &mut self.status,
-                                );
-                                ui.close_menu();
-                            }
-
-                            if ui.button("Join Invite").clicked() {
-                                let invite_code = self.password_or_invite.trim().to_string();
-                                if invite_code.is_empty() {
-                                    self.status = "Enter an invite code first".to_string();
-                                } else {
-                                    queue_command(
-                                        &self.cmd_tx,
-                                        BackendCommand::JoinWithInvite { invite_code },
-                                        &mut self.status,
-                                    );
-                                }
-                                ui.close_menu();
-                            }
-                        });
-                    } else {
-                        if ui.button("Refresh Guilds").clicked() {
+                    if ui.button("Join Invite").clicked() {
+                        let invite_code = self.password_or_invite.trim().to_string();
+                        if invite_code.is_empty() {
+                            self.status = "Enter an invite code first".to_string();
+                        } else {
                             queue_command(
                                 &self.cmd_tx,
-                                BackendCommand::ListGuilds,
+                                BackendCommand::JoinWithInvite { invite_code },
                                 &mut self.status,
                             );
-                        }
-
-                        if ui.button("Join Invite").clicked() {
-                            let invite_code = self.password_or_invite.trim().to_string();
-                            if invite_code.is_empty() {
-                                self.status = "Enter an invite code first".to_string();
-                            } else {
-                                queue_command(
-                                    &self.cmd_tx,
-                                    BackendCommand::JoinWithInvite { invite_code },
-                                    &mut self.status,
-                                );
-                            }
                         }
                     }
                 });
 
                 ui.add_space(STATUS_VERTICAL_MARGIN);
-
-                ui.colored_label(
-                    egui::Color32::YELLOW,
-                    "Username-only sign-in mode is active.",
-                );
-                ui.add_space(2.0);
                 ui.label(&self.status);
+                self.show_status_banner(ui);
                 ui.add_space(STATUS_VERTICAL_MARGIN);
             });
 
@@ -1484,8 +1536,9 @@ impl DesktopGuiApp {
         let nav_bg = theme_discord_dark_palette(self.theme)
             .map(|p| p.navigation_background)
             .unwrap_or(ctx.style().visuals.panel_fill);
+
         egui::SidePanel::left("guilds_panel")
-            .default_width(140.0)
+            .default_width(160.0)
             .frame(
                 egui::Frame::none()
                     .fill(nav_bg)
@@ -1498,6 +1551,7 @@ impl DesktopGuiApp {
                 ui.heading("Guilds");
                 let discord_dark = theme_discord_dark_palette(self.theme);
                 ui.add_space(SECTION_VERTICAL_GAP);
+
                 ui.add_enabled_ui(self.auth_session_established, |ui| {
                     if let Some(guild_id) = self.selected_guild {
                         let label = if let Some(palette) = discord_dark {
@@ -1507,7 +1561,7 @@ impl DesktopGuiApp {
                             egui::RichText::new("Create Invite")
                         };
                         let mut invite_button = egui::Button::new(label)
-                            .min_size(egui::vec2(ui.available_width(), 28.0));
+                            .min_size(egui::vec2(ui.available_width(), 30.0));
                         if let Some(palette) = discord_dark {
                             invite_button = invite_button
                                 .fill(palette.side_panel_button_fill)
@@ -1520,6 +1574,7 @@ impl DesktopGuiApp {
                                 &mut self.status,
                             );
                         }
+                        ui.add_space(6.0);
                     }
 
                     for guild in &self.guilds {
@@ -1537,13 +1592,10 @@ impl DesktopGuiApp {
                             .map(|p| p.guild_entry_active)
                             .unwrap_or_else(|| {
                                 ui.visuals().selection.bg_fill.gamma_multiply(
-                                    if self.theme.list_row_shading {
-                                        0.35
-                                    } else {
-                                        0.22
-                                    },
+                                    if self.theme.list_row_shading { 0.35 } else { 0.22 },
                                 )
                             });
+
                         let row_stroke = discord_dark
                             .map(|palette| {
                                 egui::Stroke::new(
@@ -1572,9 +1624,10 @@ impl DesktopGuiApp {
                             });
 
                         let (rect, response) = ui.allocate_exact_size(
-                            egui::vec2(ui.available_width(), 32.0),
+                            egui::vec2(ui.available_width(), 34.0),
                             egui::Sense::click(),
                         );
+
                         let row_fill = if selected {
                             selected_bg
                         } else if response.hovered() {
@@ -1584,6 +1637,7 @@ impl DesktopGuiApp {
                         } else {
                             base_bg
                         };
+
                         ui.painter().rect_filled(
                             rect,
                             egui::Rounding::same(f32::from(self.theme.panel_rounding)),
@@ -1596,6 +1650,7 @@ impl DesktopGuiApp {
                                 row_stroke,
                             );
                         }
+
                         let text_color = if selected {
                             discord_dark
                                 .map(|p| p.guild_text_highlighted)
@@ -1609,6 +1664,7 @@ impl DesktopGuiApp {
                                 .map(|p| p.guild_text_unhighlighted)
                                 .unwrap_or(ui.visuals().text_color())
                         };
+
                         ui.painter().text(
                             rect.left_center() + egui::vec2(10.0, 0.0),
                             egui::Align2::LEFT_CENTER,
@@ -1616,6 +1672,7 @@ impl DesktopGuiApp {
                             egui::TextStyle::Button.resolve(ui.style()),
                             text_color,
                         );
+
                         if response.clicked() {
                             self.selected_guild = Some(guild.guild_id);
                             self.selected_channel = None;
@@ -1636,19 +1693,20 @@ impl DesktopGuiApp {
                                 &mut self.status,
                             );
                         }
-                        ui.add_space(4.0);
+
+                        ui.add_space(6.0);
                     }
                 });
 
                 if !self.auth_session_established {
                     ui.separator();
                     ui.add_space(4.0);
-                    ui.label("Sign in or create an account to access guilds.");
+                    ui.label("Sign in to access guilds.");
                 }
             });
 
         egui::SidePanel::left("channels_panel")
-            .default_width(220.0)
+            .default_width(260.0)
             .frame(
                 egui::Frame::none()
                     .fill(nav_bg)
@@ -1699,6 +1757,7 @@ impl DesktopGuiApp {
                         };
                         let selected = self.selected_channel == Some(channel.channel_id);
                         let discord_dark = theme_discord_dark_palette(self.theme);
+
                         let base_bg = discord_dark
                             .map(|p| p.navigation_background)
                             .unwrap_or_else(|| {
@@ -1712,11 +1771,7 @@ impl DesktopGuiApp {
                             .map(|p| p.guild_entry_active)
                             .unwrap_or_else(|| {
                                 ui.visuals().selection.bg_fill.gamma_multiply(
-                                    if self.theme.list_row_shading {
-                                        0.35
-                                    } else {
-                                        0.22
-                                    },
+                                    if self.theme.list_row_shading { 0.35 } else { 0.22 },
                                 )
                             });
                         let row_stroke = discord_dark
@@ -1745,6 +1800,7 @@ impl DesktopGuiApp {
                                     egui::Stroke::NONE
                                 }
                             });
+
                         let occupancy = if channel.kind == ChannelKind::Voice {
                             Some(self.voice_ui.occupancy_for_channel(channel.channel_id))
                         } else {
@@ -1758,9 +1814,10 @@ impl DesktopGuiApp {
                             };
 
                         let (rect, response) = ui.allocate_exact_size(
-                            egui::vec2(ui.available_width(), 34.0),
+                            egui::vec2(ui.available_width(), 36.0),
                             egui::Sense::click(),
                         );
+
                         let row_fill = if selected {
                             selected_bg
                         } else if response.hovered() {
@@ -1770,6 +1827,7 @@ impl DesktopGuiApp {
                         } else {
                             base_bg
                         };
+
                         ui.painter().rect_filled(
                             rect,
                             egui::Rounding::same(f32::from(self.theme.panel_rounding)),
@@ -1796,6 +1854,7 @@ impl DesktopGuiApp {
                                 .map(|p| p.guild_text_unhighlighted)
                                 .unwrap_or(ui.visuals().text_color())
                         };
+
                         let channel_label = match (occupancy, connection_hint) {
                             (Some(count), Some(hint)) => {
                                 format!("{icon}  {} ({count}) {hint}", channel.name)
@@ -1803,6 +1862,7 @@ impl DesktopGuiApp {
                             (Some(count), None) => format!("{icon}  {} ({count})", channel.name),
                             (None, _) => format!("{icon}  {}", channel.name),
                         };
+
                         ui.painter().text(
                             rect.left_center() + egui::vec2(10.0, 0.0),
                             egui::Align2::LEFT_CENTER,
@@ -1810,6 +1870,7 @@ impl DesktopGuiApp {
                             egui::TextStyle::Button.resolve(ui.style()),
                             text_color,
                         );
+
                         if response.clicked() {
                             self.selected_channel = Some(channel.channel_id);
                             if channel.kind == ChannelKind::Voice {
@@ -1823,7 +1884,8 @@ impl DesktopGuiApp {
                                 &mut self.status,
                             );
                         }
-                        ui.add_space(4.0);
+
+                        ui.add_space(6.0);
                     }
 
                     if let Some(channel) = self.selected_voice_channel().cloned() {
@@ -1840,7 +1902,7 @@ impl DesktopGuiApp {
                             egui::RichText::new(cta_label)
                         };
                         let mut cta_button = egui::Button::new(cta_text)
-                            .min_size(egui::vec2(ui.available_width(), 28.0));
+                            .min_size(egui::vec2(ui.available_width(), 30.0));
                         if let Some(palette) = discord_dark {
                             cta_button = cta_button
                                 .fill(palette.side_panel_button_fill)
@@ -1880,7 +1942,7 @@ impl DesktopGuiApp {
             });
 
         egui::SidePanel::right("members_panel")
-            .default_width(220.0)
+            .default_width(260.0)
             .show(ctx, |ui| {
                 let members_bg = theme_discord_dark_palette(self.theme)
                     .map(|p| p.members_background)
@@ -1997,22 +2059,25 @@ impl DesktopGuiApp {
                                     ui.visuals_mut().extreme_bg_color = palette.message_background;
                                 }
                                 ui.add_sized(
-                                    [ui.available_width() - 130.0, 72.0],
-                                    egui::TextEdit::multiline(&mut self.composer).hint_text(
-                                        "Message #channel (Enter to send, Shift+Enter for newline)",
-                                    ),
+                                    [ui.available_width() - 140.0, 74.0],
+                                    egui::TextEdit::multiline(&mut self.composer)
+                                        .id_source("composer_text")
+                                        .hint_text(
+                                            "Message #channel (Enter to send, Shift+Enter for newline)",
+                                        ),
                                 )
                             })
                             .inner;
                         let send_shortcut = response.has_focus()
                             && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
                         let clicked_send = ui
-                            .add_sized([80.0, 72.0], egui::Button::new("⬆ Send"))
+                            .add_sized([92.0, 74.0], egui::Button::new("⬆ Send"))
                             .clicked();
                         if send_shortcut || clicked_send {
                             self.try_send_current_composer(&response);
                         }
                     });
+
                     if let Some(path) = self.pending_attachment.clone() {
                         ui.horizontal_wrapped(|ui| {
                             ui.small(format!("Attached: {}", path.display()));
@@ -2120,9 +2185,9 @@ impl DesktopGuiApp {
                                     msg.wire.sent_at.format("%Y-%m-%d %H:%M:%S UTC").to_string();
 
                                 let message_margin = if self.readability.compact_density {
-                                    egui::Margin::symmetric(6.0, 4.0)
-                                } else {
                                     egui::Margin::symmetric(8.0, 6.0)
+                                } else {
+                                    egui::Margin::symmetric(10.0, 8.0)
                                 };
                                 let discord_dark = theme_discord_dark_palette(self.theme);
                                 let base_message_bg =
@@ -2151,9 +2216,7 @@ impl DesktopGuiApp {
                                         ui.label(&msg.plaintext);
                                         if let Some(attachment) = &msg.wire.attachment {
                                             if attachment_is_image(attachment) {
-                                                self.render_image_attachment_preview(
-                                                    ui, attachment,
-                                                );
+                                                self.render_image_attachment_preview(ui, attachment);
                                             } else {
                                                 ui.horizontal(|ui| {
                                                     ui.label(format!(
@@ -2178,6 +2241,7 @@ impl DesktopGuiApp {
                                         }
                                     })
                                     .response;
+
                                 if message_response.hovered() {
                                     if let Some(palette) = discord_dark {
                                         ui.ctx()
@@ -2194,10 +2258,11 @@ impl DesktopGuiApp {
                                             );
                                     }
                                 }
+
                                 ui.add_space(if self.readability.compact_density {
-                                    4.0
-                                } else {
                                     6.0
+                                } else {
+                                    8.0
                                 });
                             }
                         } else {
@@ -2286,12 +2351,13 @@ impl DesktopGuiApp {
                 let preview_bytes = preview_png.clone();
 
                 if let Some(texture) = texture_handle {
-                    let max_width = (ui.available_width() * 0.75).clamp(120.0, 360.0);
+                    let max_width = (ui.available_width() * 0.75).clamp(120.0, 380.0);
                     let mut preview_size = texture.size_vec2();
                     if preview_size.x > max_width {
                         preview_size *= max_width / preview_size.x;
                     }
-                    preview_size.y = preview_size.y.min(240.0);
+                    preview_size.y = preview_size.y.min(260.0);
+
                     let response = ui
                         .add(
                             egui::ImageButton::new(
@@ -2302,6 +2368,7 @@ impl DesktopGuiApp {
                         .on_hover_text(
                             "Left click to open large preview · Right click for actions",
                         );
+
                     if response.clicked() {
                         self.expanded_preview = Some(attachment.file_id);
                     }
@@ -2337,11 +2404,7 @@ impl DesktopGuiApp {
         }
     }
 
-    fn render_attachment_download_row(
-        &mut self,
-        ui: &mut egui::Ui,
-        attachment: &AttachmentPayload,
-    ) {
+    fn render_attachment_download_row(&mut self, ui: &mut egui::Ui, attachment: &AttachmentPayload) {
         ui.horizontal(|ui| {
             if ui.button("Download original").clicked() {
                 queue_command(
@@ -2395,15 +2458,12 @@ fn human_readable_bytes(bytes: u64) -> String {
     if bytes < KB {
         return format!("{bytes} B");
     }
-
     if bytes < MB {
         return format_scaled_unit(bytes, KB, "KB");
     }
-
     if bytes < GB {
         return format_scaled_unit(bytes, MB, "MB");
     }
-
     format_scaled_unit(bytes, GB, "GB")
 }
 
@@ -2617,6 +2677,8 @@ const SETTINGS_STORAGE_KEY: &str = "desktop_gui.settings";
 
 impl eframe::App for DesktopGuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.tick = self.tick.wrapping_add(1);
+
         self.process_ui_events();
         self.apply_theme_if_needed(ctx);
 
@@ -2762,8 +2824,8 @@ fn spawn_backend_thread(cmd_rx: Receiver<BackendCommand>, ui_tx: Sender<UiEvent>
                         let _ = ui_tx.try_send(UiEvent::Error(UiError::from_message(
                             UiErrorContext::BackendStartup,
                             format!(
-                            "backend worker startup failure: failed to initialize persistent MLS backend ({mls_db_url}): {err:#}"
-                        ),
+                                "backend worker startup failure: failed to initialize persistent MLS backend ({mls_db_url}): {err:#}"
+                            ),
                         )));
                         tracing::error!(
                             "failed to initialize persistent MLS backend ({mls_db_url}): {err:#}"
@@ -2774,9 +2836,7 @@ fn spawn_backend_thread(cmd_rx: Receiver<BackendCommand>, ui_tx: Sender<UiEvent>
 
             let client =
                 RealtimeClient::new_with_mls_session_manager(PassthroughCrypto, mls_manager);
-            let _ = ui_tx.try_send(UiEvent::Info(
-                "Backend worker ready".to_string(),
-            ));
+            let _ = ui_tx.try_send(UiEvent::Info("Backend worker ready".to_string()));
 
             let mut subscribed = false;
             while let Ok(cmd) = cmd_rx.recv() {
@@ -2817,12 +2877,12 @@ fn spawn_backend_thread(cmd_rx: Receiver<BackendCommand>, ui_tx: Sender<UiEvent>
                                                 channel_id,
                                                 participants,
                                             },
-                                            ClientEvent::Error(err) => {
-                                                UiEvent::Error(UiError::from_message(
+                                            ClientEvent::Error(err) => UiEvent::Error(
+                                                UiError::from_message(
                                                     UiErrorContext::DecryptMessage,
                                                     err,
-                                                ))
-                                            }
+                                                ),
+                                            ),
                                         };
                                         let _ = ui_tx_clone.try_send(evt);
                                     }
@@ -2919,21 +2979,28 @@ fn spawn_backend_thread(cmd_rx: Receiver<BackendCommand>, ui_tx: Sender<UiEvent>
                     }
                     BackendCommand::FetchAttachmentPreview { file_id } => {
                         match client.download_file(file_id).await {
-                            Ok(bytes) => match decode_preview_image(&bytes) {
-                                Ok(image) => {
-                                    let _ = ui_tx.try_send(UiEvent::AttachmentPreviewLoaded {
-                                        file_id,
-                                        image,
-                                        original_bytes: bytes,
-                                    });
+                            Ok(bytes) => {
+                                // `bytes` might be Vec<u8>, bytes::Bytes, or something slice-like.
+                                // Make an owned Vec<u8> once, use it for both decode + storage.
+                                let slice: &[u8] = bytes.as_ref();
+                                let owned: Vec<u8> = slice.to_vec();
+
+                                match decode_preview_image(&owned) {
+                                    Ok(image) => {
+                                        let _ = ui_tx.try_send(UiEvent::AttachmentPreviewLoaded {
+                                            file_id,
+                                            image,
+                                            original_bytes: owned,
+                                        });
+                                    }
+                                    Err(err) => {
+                                        let _ = ui_tx.try_send(UiEvent::AttachmentPreviewFailed {
+                                            file_id,
+                                            reason: err,
+                                        });
+                                    }
                                 }
-                                Err(err) => {
-                                    let _ = ui_tx.try_send(UiEvent::AttachmentPreviewFailed {
-                                        file_id,
-                                        reason: err,
-                                    });
-                                }
-                            },
+                            }
                             Err(err) => {
                                 let _ = ui_tx.try_send(UiEvent::AttachmentPreviewFailed {
                                     file_id,
@@ -3008,10 +3075,7 @@ fn spawn_backend_thread(cmd_rx: Receiver<BackendCommand>, ui_tx: Sender<UiEvent>
                             }
                         }
                     }
-                    BackendCommand::ConnectVoice {
-                        guild_id,
-                        channel_id,
-                    } => {
+                    BackendCommand::ConnectVoice { guild_id, channel_id } => {
                         if let Err(err) = client
                             .connect_voice_session(VoiceConnectOptions {
                                 guild_id,
