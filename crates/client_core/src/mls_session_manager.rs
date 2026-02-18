@@ -7,7 +7,7 @@ use shared::domain::{ChannelId, GuildId};
 use storage::Storage;
 use tokio::sync::Mutex;
 
-use crate::MlsSessionManager;
+use crate::{MlsAddMemberOutcome, MlsSessionManager};
 
 type SessionKey = (GuildId, ChannelId);
 
@@ -133,7 +133,11 @@ impl MlsSessionManager for DurableMlsSessionManager {
         handle.decrypt_application(ciphertext).await
     }
 
-    async fn add_member(&self, channel_id: ChannelId, key_package_bytes: &[u8]) -> Result<Vec<u8>> {
+    async fn add_member(
+        &self,
+        channel_id: ChannelId,
+        key_package_bytes: &[u8],
+    ) -> Result<MlsAddMemberOutcome> {
         let key = self.key_for_channel(channel_id).await?;
         let mut sessions = self.sessions.lock().await;
         let handle = sessions.get_mut(&key).ok_or_else(|| {
@@ -143,8 +147,13 @@ impl MlsSessionManager for DurableMlsSessionManager {
                 key.1 .0
             )
         })?;
-        let (_commit, welcome) = handle.add_member(key_package_bytes).await?;
-        welcome.ok_or_else(|| anyhow!("MLS add_member did not return a welcome"))
+        let (commit, welcome) = handle.add_member(key_package_bytes).await?;
+        let welcome_bytes =
+            welcome.ok_or_else(|| anyhow!("MLS add_member did not return a welcome"))?;
+        Ok(MlsAddMemberOutcome {
+            commit_bytes: commit,
+            welcome_bytes,
+        })
     }
 
     async fn join_from_welcome(&self, channel_id: ChannelId, welcome_bytes: &[u8]) -> Result<()> {
