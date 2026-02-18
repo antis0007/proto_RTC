@@ -212,6 +212,15 @@ fn err_label(category: UiErrorCategory) -> &'static str {
     }
 }
 
+fn lighten_color(c: egui::Color32, t: f32) -> egui::Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let mix = |channel: u8| -> u8 {
+        let channel = channel as f32;
+        (channel + (255.0 - channel) * t).round().clamp(0.0, 255.0) as u8
+    };
+    egui::Color32::from_rgba_unmultiplied(mix(c.r()), mix(c.g()), mix(c.b()), c.a())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VoiceSessionConnectionStatus {
     Idle,
@@ -338,8 +347,6 @@ struct UiReadabilitySettings {
     compact_density: bool,
     show_timestamps: bool,
     message_bubble_backgrounds: bool,
-    navigation_padding: f32,
-    navigation_item_spacing: f32,
 }
 
 impl UiReadabilitySettings {
@@ -349,8 +356,6 @@ impl UiReadabilitySettings {
             compact_density: false,
             show_timestamps: true,
             message_bubble_backgrounds: true,
-            navigation_padding: 6.0,
-            navigation_item_spacing: 3.0,
         }
     }
 }
@@ -396,8 +401,6 @@ struct PersistedDesktopSettings {
     compact_density: bool,
     show_timestamps: bool,
     message_bubble_backgrounds: bool,
-    navigation_padding: f32,
-    navigation_item_spacing: f32,
 }
 
 impl Default for PersistedDesktopSettings {
@@ -418,8 +421,6 @@ impl Default for PersistedDesktopSettings {
             compact_density: readability.compact_density,
             show_timestamps: readability.show_timestamps,
             message_bubble_backgrounds: readability.message_bubble_backgrounds,
-            navigation_padding: readability.navigation_padding,
-            navigation_item_spacing: readability.navigation_item_spacing,
         }
     }
 }
@@ -443,8 +444,6 @@ impl PersistedDesktopSettings {
                 compact_density: self.compact_density,
                 show_timestamps: self.show_timestamps,
                 message_bubble_backgrounds: self.message_bubble_backgrounds,
-                navigation_padding: self.navigation_padding.clamp(2.0, 16.0),
-                navigation_item_spacing: self.navigation_item_spacing.clamp(0.0, 10.0),
             },
         )
     }
@@ -464,8 +463,6 @@ impl PersistedDesktopSettings {
             compact_density: readability.compact_density,
             show_timestamps: readability.show_timestamps,
             message_bubble_backgrounds: readability.message_bubble_backgrounds,
-            navigation_padding: readability.navigation_padding,
-            navigation_item_spacing: readability.navigation_item_spacing,
         }
     }
 }
@@ -774,22 +771,15 @@ impl DesktopGuiApp {
                             .iter()
                             .any(|c| c.channel_id == channel.channel_id)
                         {
+                            let channel_id = channel.channel_id;
                             self.channels.push(channel);
                             if self.selected_channel.is_none() {
-                                let preferred_channel = self
-                                    .channels
-                                    .iter()
-                                    .find(|channel| channel.kind == ChannelKind::Text)
-                                    .or_else(|| self.channels.first())
-                                    .map(|channel| channel.channel_id);
-                                if let Some(channel_id) = preferred_channel {
-                                    self.selected_channel = Some(channel_id);
-                                    queue_command(
-                                        &self.cmd_tx,
-                                        BackendCommand::SelectChannel { channel_id },
-                                        &mut self.status,
-                                    );
-                                }
+                                self.selected_channel = Some(channel_id);
+                                queue_command(
+                                    &self.cmd_tx,
+                                    BackendCommand::SelectChannel { channel_id },
+                                    &mut self.status,
+                                );
                             }
                         }
                     }
@@ -936,14 +926,6 @@ impl DesktopGuiApp {
                     &mut self.readability.message_bubble_backgrounds,
                     "Show chat message bubble backgrounds",
                 );
-                ui.add(
-                    egui::Slider::new(&mut self.readability.navigation_padding, 2.0..=16.0)
-                        .text("Guild/channel panel padding"),
-                );
-                ui.add(
-                    egui::Slider::new(&mut self.readability.navigation_item_spacing, 0.0..=10.0)
-                        .text("Guild/channel item spacing"),
-                );
 
                 if ui.button("Reset all settings to defaults").clicked() {
                     self.theme = ThemeSettings::discord_default();
@@ -988,8 +970,7 @@ impl DesktopGuiApp {
         label: &str,
         hint: &str,
         value: &mut String,
-        focus_to_set: Option<LoginFocusField>,
-        field_kind: LoginFocusField,
+        should_focus: bool,
     ) -> egui::Response {
         ui.label(egui::RichText::new(label).strong());
         let edit = egui::TextEdit::singleline(value)
@@ -1004,10 +985,8 @@ impl DesktopGuiApp {
         let response = ui.add_sized([ui.available_width(), 34.0], edit);
 
         // One-time / directed focus that doesn't flicker.
-        if let Some(focus) = focus_to_set {
-            if focus == field_kind {
-                response.request_focus();
-            }
+        if should_focus {
+            response.request_focus();
         }
 
         response
@@ -1027,8 +1006,8 @@ impl DesktopGuiApp {
 
                 let palette = theme_discord_dark_palette(self.theme);
                 let card_fill = palette
-                    .map(|p| p.app_background.gamma_multiply(1.05))
-                    .unwrap_or_else(|| ui.visuals().panel_fill.gamma_multiply(0.94));
+                    .map(|p| lighten_color(p.app_background, 0.06))
+                    .unwrap_or_else(|| lighten_color(ui.visuals().panel_fill, 0.02));
 
                 egui::Frame::none()
                     .fill(card_fill)
@@ -1073,7 +1052,7 @@ impl DesktopGuiApp {
                             .inner_margin(egui::Margin::symmetric(14.0, 12.0))
                             .show(ui, |ui| {
                                 ui.label(egui::RichText::new("Account").strong());
-                                ui.add_space(8.0);
+                                ui.add_space(6.0);
 
                                 let mut server_url_buf = self.server_url.clone();
                                 let mut username_buf = self.username.clone();
@@ -1085,11 +1064,10 @@ impl DesktopGuiApp {
                                     "Server URL",
                                     "http://127.0.0.1:8443",
                                     &mut server_url_buf,
-                                    focus_to_set,
-                                    LoginFocusField::Server,
+                                    focus_to_set == Some(LoginFocusField::Server),
                                 );
 
-                                ui.add_space(8.0);
+                                ui.add_space(6.0);
 
                                 let user_resp = self.login_text_field(
                                     ui,
@@ -1097,8 +1075,7 @@ impl DesktopGuiApp {
                                     "Username",
                                     "alice",
                                     &mut username_buf,
-                                    focus_to_set,
-                                    LoginFocusField::Username,
+                                    focus_to_set == Some(LoginFocusField::Username),
                                 );
                                 self.server_url = server_url_buf;
                                 self.username = username_buf;
@@ -1143,7 +1120,7 @@ impl DesktopGuiApp {
                             .show(ui, |ui| {
                                 ui.label(egui::RichText::new("Invite").strong());
                                 ui.weak("Paste an invite code to join a guild (after signing in).");
-                                ui.add_space(8.0);
+                                ui.add_space(6.0);
                                 let mut invite_buf = self.password_or_invite.clone();
                                 // Invite field
                                 let invite_resp = self.login_text_field(
@@ -1152,11 +1129,10 @@ impl DesktopGuiApp {
                                     "Invite code",
                                     "XXXX-XXXX",
                                     &mut invite_buf,
-                                    focus_to_set,
-                                    LoginFocusField::Invite,
+                                    focus_to_set == Some(LoginFocusField::Invite),
                                 );
 
-                                ui.add_space(8.0);
+                                ui.add_space(6.0);
 
                                 let can_join = self.auth_session_established
                                     && !self.password_or_invite.trim().is_empty();
@@ -1209,7 +1185,7 @@ impl DesktopGuiApp {
 
                         ui.add_space(10.0);
                         ui.separator();
-                        ui.add_space(8.0);
+                        ui.add_space(6.0);
 
                         ui.horizontal_wrapped(|ui| {
                             ui.small("Status:");
@@ -1500,9 +1476,9 @@ impl DesktopGuiApp {
     // ------------------- Main workspace (mostly unchanged) -------------------
 
     fn show_main_workspace(&mut self, ctx: &egui::Context) {
-        const TOOLBAR_H_PADDING: f32 = 10.0;
-        const TOOLBAR_V_PADDING: f32 = 4.0;
-        const SECTION_VERTICAL_GAP: f32 = 6.0;
+        const TOOLBAR_H_PADDING: f32 = 12.0;
+        const TOOLBAR_V_PADDING: f32 = 8.0;
+        const SECTION_VERTICAL_GAP: f32 = 8.0;
         const STATUS_VERTICAL_MARGIN: f32 = 6.0;
 
         let top_bar_bg = theme_discord_dark_palette(self.theme)
@@ -1520,9 +1496,6 @@ impl DesktopGuiApp {
             )
             .show(ctx, |ui| {
                 egui::menu::bar(ui, |ui| {
-                    ui.spacing_mut().button_padding = egui::vec2(7.0, 3.0);
-                    ui.spacing_mut().interact_size = egui::vec2(34.0, 20.0);
-
                     if ui.button("⚙ Settings").clicked() {
                         self.settings_open = true;
                     }
@@ -1545,14 +1518,6 @@ impl DesktopGuiApp {
                     if ui.button("Refresh Guilds").clicked() {
                         queue_command(&self.cmd_tx, BackendCommand::ListGuilds, &mut self.status);
                     }
-
-                    ui.add_sized(
-                        [220.0, 28.0],
-                        egui::TextEdit::singleline(&mut self.password_or_invite).hint_text(
-                            egui::RichText::new("Invite code")
-                                .color(ui.visuals().weak_text_color().gamma_multiply(0.85)),
-                        ),
-                    );
 
                     if ui.button("Join Invite").clicked() {
                         let invite_code = self.password_or_invite.trim().to_string();
@@ -1579,15 +1544,16 @@ impl DesktopGuiApp {
         let nav_bg = theme_discord_dark_palette(self.theme)
             .map(|p| p.navigation_background)
             .unwrap_or(ctx.style().visuals.panel_fill);
-        let nav_padding = self.readability.navigation_padding;
-        let nav_item_spacing = self.readability.navigation_item_spacing;
 
         egui::SidePanel::left("guilds_panel")
             .default_width(160.0)
             .frame(
                 egui::Frame::none()
                     .fill(nav_bg)
-                    .inner_margin(egui::Margin::symmetric(nav_padding, nav_padding)),
+                    .inner_margin(egui::Margin::symmetric(
+                        TOOLBAR_H_PADDING,
+                        TOOLBAR_V_PADDING,
+                    )),
             )
             .show(ctx, |ui| {
                 ui.heading("Guilds");
@@ -1740,7 +1706,7 @@ impl DesktopGuiApp {
                             );
                         }
 
-                        ui.add_space(nav_item_spacing);
+                        ui.add_space(6.0);
                     }
                 });
 
@@ -1756,7 +1722,10 @@ impl DesktopGuiApp {
             .frame(
                 egui::Frame::none()
                     .fill(nav_bg)
-                    .inner_margin(egui::Margin::symmetric(nav_padding, nav_padding)),
+                    .inner_margin(egui::Margin::symmetric(
+                        TOOLBAR_H_PADDING,
+                        TOOLBAR_V_PADDING,
+                    )),
             )
             .show(ctx, |ui| {
                 let discord_dark = theme_discord_dark_palette(self.theme);
@@ -1932,7 +1901,7 @@ impl DesktopGuiApp {
                             );
                         }
 
-                        ui.add_space(nav_item_spacing);
+                        ui.add_space(6.0);
                     }
 
                     if let Some(channel) = self.selected_voice_channel().cloned() {
@@ -1996,7 +1965,10 @@ impl DesktopGuiApp {
                     .unwrap_or(ui.visuals().panel_fill);
                 egui::Frame::none()
                     .fill(members_bg)
-                    .inner_margin(egui::Margin::symmetric(nav_padding, nav_padding))
+                    .inner_margin(egui::Margin::symmetric(
+                        TOOLBAR_H_PADDING,
+                        TOOLBAR_V_PADDING,
+                    ))
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             ui.heading("Members");
@@ -2090,8 +2062,8 @@ impl DesktopGuiApp {
         egui::TopBottomPanel::bottom("composer_panel")
             .resizable(false)
             .show(ctx, |ui| {
-                ui.add_space(nav_item_spacing);
-                let can_send = self.selected_text_channel_id().is_some();
+                ui.add_space(6.0);
+                let can_send = self.selected_channel.is_some();
                 ui.add_enabled_ui(can_send && self.auth_session_established, |ui| {
                     ui.horizontal(|ui| {
                         if ui.button("📎").on_hover_text("Attach file").clicked() {
@@ -2177,7 +2149,7 @@ impl DesktopGuiApp {
                                 });
                             }
                         }
-                        ui.add_space(nav_item_spacing);
+                        ui.add_space(6.0);
                     }
                 });
                 if !can_send {
