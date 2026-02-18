@@ -551,6 +551,7 @@ struct DesktopGuiApp {
     sender_directory: HashMap<i64, String>,
     attachment_previews: HashMap<FileId, AttachmentPreviewState>,
     expanded_preview: Option<FileId>,
+    hovered_message: Option<MessageId>,
 
     voice_ui: VoiceSessionUiState,
 
@@ -630,6 +631,7 @@ impl DesktopGuiApp {
             sender_directory: HashMap::new(),
             attachment_previews: HashMap::new(),
             expanded_preview: None,
+            hovered_message: None,
             voice_ui: VoiceSessionUiState::new(),
             settings_open: false,
             view_state: AppViewState::Login,
@@ -1436,6 +1438,51 @@ impl DesktopGuiApp {
         }
     }
 
+    fn render_left_user_panel(&mut self, ui: &mut egui::Ui) {
+        let discord_dark = theme_discord_dark_palette(self.theme);
+        egui::Frame::group(ui.style())
+            .fill(
+                discord_dark
+                    .map(|p| p.message_background)
+                    .unwrap_or(ui.visuals().panel_fill),
+            )
+            .show(ui, |ui| {
+                self.left_user_panel_height = self
+                    .left_user_panel_height
+                    .clamp(MIN_LEFT_USER_PANEL_HEIGHT, MAX_LEFT_USER_PANEL_HEIGHT);
+                ui.set_min_height(self.left_user_panel_height - 12.0);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("●").color(egui::Color32::from_rgb(67, 181, 129)),
+                    );
+                    ui.strong(&self.username);
+                    let status_label = if self.voice_ui.active_session.is_some() {
+                        "In voice"
+                    } else {
+                        "Online"
+                    };
+                    ui.small(format!("· {status_label}"));
+                });
+                ui.add_space(4.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.toggle_value(&mut self.voice_ui.muted, "Mute");
+                    ui.toggle_value(&mut self.voice_ui.deafened, "Deafen");
+                });
+                ui.add_space(6.0);
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("⚙ Settings").clicked() {
+                        self.settings_open = true;
+                    }
+                    if ui.button("⎋ Sign out").clicked() {
+                        self.auth_session_established = false;
+                        self.view_state = AppViewState::Login;
+                        self.status = "Signed out".to_string();
+                        self.status_banner = None;
+                    }
+                });
+            });
+    }
+
     // ------------------- Main workspace (mostly unchanged) -------------------
 
     fn show_main_workspace(&mut self, ctx: &egui::Context) {
@@ -1998,67 +2045,12 @@ impl DesktopGuiApp {
                             ui.add_space(4.0);
                             ui.label("Sign in to browse channels.");
                         }
-                    });
-            });
 
-        egui::TopBottomPanel::bottom("left_user_panel")
-            .resizable(true)
-            .default_height(self.left_user_panel_height)
-            .min_height(MIN_LEFT_USER_PANEL_HEIGHT)
-            .max_height(MAX_LEFT_USER_PANEL_HEIGHT)
-            .show(ctx, |ui| {
-                self.left_user_panel_height = ui
-                    .max_rect()
-                    .height()
-                    .clamp(MIN_LEFT_USER_PANEL_HEIGHT, MAX_LEFT_USER_PANEL_HEIGHT);
-                let nav_total_width = 160.0 + 260.0 + (TOOLBAR_H_PADDING * 2.0);
-                let content_width = ui.available_width().min(nav_total_width);
-                let discord_dark = theme_discord_dark_palette(self.theme);
-                ui.allocate_ui_with_layout(
-                    egui::vec2(content_width, ui.available_height()),
-                    egui::Layout::top_down(egui::Align::Min),
-                    |ui| {
-                        egui::Frame::group(ui.style())
-                            .fill(
-                                discord_dark
-                                    .map(|p| p.message_background)
-                                    .unwrap_or(ui.visuals().panel_fill),
-                            )
-                            .show(ui, |ui| {
-                                ui.set_min_height(self.left_user_panel_height - 12.0);
-                                ui.horizontal(|ui| {
-                                    ui.label(
-                                        egui::RichText::new("●")
-                                            .color(egui::Color32::from_rgb(67, 181, 129)),
-                                    );
-                                    ui.strong(&self.username);
-                                    let status_label = if self.voice_ui.active_session.is_some() {
-                                        "In voice"
-                                    } else {
-                                        "Online"
-                                    };
-                                    ui.small(format!("· {status_label}"));
-                                });
-                                ui.add_space(4.0);
-                                ui.horizontal_wrapped(|ui| {
-                                    ui.toggle_value(&mut self.voice_ui.muted, "Mute");
-                                    ui.toggle_value(&mut self.voice_ui.deafened, "Deafen");
-                                });
-                                ui.add_space(6.0);
-                                ui.horizontal_wrapped(|ui| {
-                                    if ui.button("⚙ Settings").clicked() {
-                                        self.settings_open = true;
-                                    }
-                                    if ui.button("⎋ Sign out").clicked() {
-                                        self.auth_session_established = false;
-                                        self.view_state = AppViewState::Login;
-                                        self.status = "Signed out".to_string();
-                                        self.status_banner = None;
-                                    }
-                                });
-                            });
-                    },
-                );
+                        ui.add_space(SECTION_VERTICAL_GAP);
+                        ui.separator();
+                        ui.add_space(SECTION_VERTICAL_GAP);
+                        self.render_left_user_panel(ui);
+                    });
             });
 
         egui::SidePanel::right("members_panel")
@@ -2297,6 +2289,7 @@ impl DesktopGuiApp {
 
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     ui.add_space(TOOLBAR_H_PADDING);
+                    let mut hovered_message = None;
                     if let Some(channel_id) = self.selected_channel {
                         if let Some(messages) = self.messages.get(&channel_id).cloned() {
                             for msg in &messages {
@@ -2321,8 +2314,14 @@ impl DesktopGuiApp {
                                     discord_dark.map(|p| p.message_background).unwrap_or_else(
                                         || ui.visuals().faint_bg_color.gamma_multiply(0.45),
                                     );
+                                let hover_message_bg = lighten_color(base_message_bg, 0.12);
+                                let row_bg = if self.hovered_message == Some(msg.wire.message_id) {
+                                    hover_message_bg
+                                } else {
+                                    base_message_bg
+                                };
                                 let frame = if self.readability.message_bubble_backgrounds {
-                                    egui::Frame::none().fill(base_message_bg)
+                                    egui::Frame::none().fill(row_bg)
                                 } else {
                                     egui::Frame::none()
                                 };
@@ -2331,7 +2330,7 @@ impl DesktopGuiApp {
                                         egui::vec2(ui.available_width(), 0.0),
                                         egui::Layout::top_down(egui::Align::Min),
                                         |ui| {
-                                            frame
+                                            let message_response = frame
                                                 .rounding(egui::Rounding::same(f32::from(
                                                     self.theme.panel_rounding,
                                                 )))
@@ -2383,7 +2382,10 @@ impl DesktopGuiApp {
                                                         }
                                                     }
                                                 })
-                                                .response
+                                                .response;
+                                            if message_response.hovered() {
+                                                hovered_message = Some(msg.wire.message_id);
+                                            }
                                         },
                                     );
 
@@ -2406,6 +2408,7 @@ impl DesktopGuiApp {
                             );
                         }
                     }
+                    self.hovered_message = hovered_message;
                 });
 
                 if !self.auth_session_established {
