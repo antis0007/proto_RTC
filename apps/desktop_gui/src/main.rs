@@ -2163,6 +2163,8 @@ impl DesktopGuiApp {
                             ui.add_space(4.0);
                             ui.label("Sign in to browse channels.");
                         }
+                    });
+            });
 
         egui::TopBottomPanel::bottom("left_user_panel")
             .resizable(true)
