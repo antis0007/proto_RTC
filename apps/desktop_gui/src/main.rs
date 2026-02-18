@@ -9,8 +9,8 @@ use std::{
 
 use arboard::{Clipboard, ImageData};
 use client_core::{
-    AttachmentUpload, ClientEvent, ClientHandle, DurableMlsSessionManager, PassthroughCrypto, RealtimeClient,
-    VoiceConnectOptions, VoiceParticipantState, VoiceSessionSnapshot,
+    AttachmentUpload, ClientEvent, ClientHandle, DurableMlsSessionManager, PassthroughCrypto,
+    RealtimeClient, VoiceConnectOptions, VoiceParticipantState, VoiceSessionSnapshot,
 };
 use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 use eframe::egui;
@@ -825,18 +825,12 @@ impl DesktopGuiApp {
         style.text_styles = scaled_text_styles(self.readability.text_scale);
 
         // Make text inputs reliably clickable and visible:
-        style.visuals.widgets.inactive.bg_stroke = egui::Stroke::new(
-            1.0,
-            style.visuals.widgets.noninteractive.bg_stroke.color,
-        );
-        style.visuals.widgets.hovered.bg_stroke = egui::Stroke::new(
-            1.0,
-            style.visuals.widgets.hovered.bg_stroke.color,
-        );
-        style.visuals.widgets.active.bg_stroke = egui::Stroke::new(
-            1.2,
-            style.visuals.selection.bg_fill.gamma_multiply(0.9),
-        );
+        style.visuals.widgets.inactive.bg_stroke =
+            egui::Stroke::new(1.0, style.visuals.widgets.noninteractive.bg_stroke.color);
+        style.visuals.widgets.hovered.bg_stroke =
+            egui::Stroke::new(1.0, style.visuals.widgets.hovered.bg_stroke.color);
+        style.visuals.widgets.active.bg_stroke =
+            egui::Stroke::new(1.2, style.visuals.selection.bg_fill.gamma_multiply(0.9));
 
         if self.readability.compact_density {
             style.spacing.item_spacing = egui::vec2(6.0, 4.0);
@@ -958,8 +952,7 @@ impl DesktopGuiApp {
         label: &str,
         hint: &str,
         value: &mut String,
-        focus_to_set: Option<LoginFocusField>,
-        field_kind: LoginFocusField,
+        should_focus: bool,
     ) -> egui::Response {
         ui.label(egui::RichText::new(label).strong());
         let edit = egui::TextEdit::singleline(value)
@@ -971,10 +964,8 @@ impl DesktopGuiApp {
         let response = ui.add_sized([ui.available_width(), 34.0], edit);
 
         // One-time / directed focus that doesn't flicker.
-        if let Some(focus) = focus_to_set {
-            if focus == field_kind {
-                response.request_focus();
-            }
+        if should_focus {
+            response.request_focus();
         }
 
         response
@@ -1044,7 +1035,6 @@ impl DesktopGuiApp {
 
                                 let mut server_url_buf = self.server_url.clone();
                                 let mut username_buf = self.username.clone();
-                                
 
                                 // Account fields
                                 let server_resp = self.login_text_field(
@@ -1053,8 +1043,7 @@ impl DesktopGuiApp {
                                     "Server URL",
                                     "http://127.0.0.1:8443",
                                     &mut server_url_buf,
-                                    focus_to_set,
-                                    LoginFocusField::Server,
+                                    focus_to_set == Some(LoginFocusField::Server),
                                 );
 
                                 ui.add_space(6.0);
@@ -1065,8 +1054,7 @@ impl DesktopGuiApp {
                                     "Username",
                                     "alice",
                                     &mut username_buf,
-                                    focus_to_set,
-                                    LoginFocusField::Username,
+                                    focus_to_set == Some(LoginFocusField::Username),
                                 );
                                 self.server_url = server_url_buf;
                                 self.username = username_buf;
@@ -1120,10 +1108,8 @@ impl DesktopGuiApp {
                                     "Invite code",
                                     "XXXX-XXXX",
                                     &mut invite_buf,
-                                    focus_to_set,
-                                    LoginFocusField::Invite,
+                                    focus_to_set == Some(LoginFocusField::Invite),
                                 );
-                                
 
                                 ui.add_space(8.0);
 
@@ -1150,8 +1136,9 @@ impl DesktopGuiApp {
                                                 )
                                                 .clicked()
                                             {
-                                                join_invite_request =
-                                                    Some(self.password_or_invite.trim().to_string());
+                                                join_invite_request = Some(
+                                                    self.password_or_invite.trim().to_string(),
+                                                );
                                             }
                                         },
                                     );
@@ -1189,7 +1176,6 @@ impl DesktopGuiApp {
             ui.add_space((avail.y * 0.08).clamp(12.0, 60.0));
         });
     }
-
 
     fn try_login(&mut self) {
         let username = self.username.trim().to_string();
@@ -1504,11 +1490,7 @@ impl DesktopGuiApp {
 
                 ui.horizontal_wrapped(|ui| {
                     if ui.button("Refresh Guilds").clicked() {
-                        queue_command(
-                            &self.cmd_tx,
-                            BackendCommand::ListGuilds,
-                            &mut self.status,
-                        );
+                        queue_command(&self.cmd_tx, BackendCommand::ListGuilds, &mut self.status);
                     }
 
                     if ui.button("Join Invite").clicked() {
@@ -1592,7 +1574,11 @@ impl DesktopGuiApp {
                             .map(|p| p.guild_entry_active)
                             .unwrap_or_else(|| {
                                 ui.visuals().selection.bg_fill.gamma_multiply(
-                                    if self.theme.list_row_shading { 0.35 } else { 0.22 },
+                                    if self.theme.list_row_shading {
+                                        0.35
+                                    } else {
+                                        0.22
+                                    },
                                 )
                             });
 
@@ -1771,7 +1757,11 @@ impl DesktopGuiApp {
                             .map(|p| p.guild_entry_active)
                             .unwrap_or_else(|| {
                                 ui.visuals().selection.bg_fill.gamma_multiply(
-                                    if self.theme.list_row_shading { 0.35 } else { 0.22 },
+                                    if self.theme.list_row_shading {
+                                        0.35
+                                    } else {
+                                        0.22
+                                    },
                                 )
                             });
                         let row_stroke = discord_dark
@@ -2216,7 +2206,9 @@ impl DesktopGuiApp {
                                         ui.label(&msg.plaintext);
                                         if let Some(attachment) = &msg.wire.attachment {
                                             if attachment_is_image(attachment) {
-                                                self.render_image_attachment_preview(ui, attachment);
+                                                self.render_image_attachment_preview(
+                                                    ui, attachment,
+                                                );
                                             } else {
                                                 ui.horizontal(|ui| {
                                                     ui.label(format!(
@@ -2404,7 +2396,11 @@ impl DesktopGuiApp {
         }
     }
 
-    fn render_attachment_download_row(&mut self, ui: &mut egui::Ui, attachment: &AttachmentPayload) {
+    fn render_attachment_download_row(
+        &mut self,
+        ui: &mut egui::Ui,
+        attachment: &AttachmentPayload,
+    ) {
         ui.horizontal(|ui| {
             if ui.button("Download original").clicked() {
                 queue_command(
