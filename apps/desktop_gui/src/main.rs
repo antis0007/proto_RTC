@@ -892,67 +892,186 @@ impl DesktopGuiApp {
 
     fn show_login_screen(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.vertical_centered(|ui| {
-                ui.add_space(50.0);
-                ui.heading("Realtime Chat Login");
-                ui.add_space(16.0);
+            let available_width = ui.available_width();
+            let card_width = available_width.clamp(460.0, 560.0);
+            let available_height = ui.available_height();
+            let vertical_band = (available_height * 0.12).clamp(24.0, 96.0);
+            let top_bottom_space = (available_height * 0.06).clamp(16.0, 52.0);
 
-                egui::Grid::new("login_form")
-                    .num_columns(2)
-                    .spacing([12.0, 10.0])
+            ui.add_space(top_bottom_space);
+            ui.horizontal_centered(|ui| {
+                ui.set_width(card_width);
+                egui::Frame::none()
+                    .fill(ui.visuals().panel_fill.gamma_multiply(0.92))
+                    .rounding(12.0)
+                    .inner_margin(egui::Margin::symmetric(24.0, 22.0))
                     .show(ui, |ui| {
-                        ui.label("Server:");
-                        ui.text_edit_singleline(&mut self.server_url);
-                        ui.end_row();
+                        ui.style_mut().spacing.item_spacing = egui::vec2(10.0, 12.0);
 
-                        ui.label("Username:");
-                        ui.text_edit_singleline(&mut self.username);
-                        ui.end_row();
+                        egui::Frame::none()
+                            .fill(ui.visuals().faint_bg_color)
+                            .rounding(8.0)
+                            .inner_margin(egui::Margin::symmetric(10.0, 8.0))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        egui::RichText::new("💬")
+                                            .size(22.0)
+                                            .color(ui.visuals().strong_text_color()),
+                                    );
+                                    ui.vertical(|ui| {
+                                        ui.heading("Realtime Chat");
+                                        ui.label("Sign in to continue to your shared workspace.");
+                                    });
+                                });
+                            });
+
+                        ui.add_space(6.0);
+                        egui::Frame::none()
+                            .fill(ui.visuals().extreme_bg_color.gamma_multiply(0.45))
+                            .stroke(egui::Stroke::new(
+                                1.0,
+                                ui.visuals().widgets.noninteractive.bg_stroke.color,
+                            ))
+                            .rounding(10.0)
+                            .inner_margin(egui::Margin::symmetric(14.0, 12.0))
+                            .show(ui, |ui| {
+                                ui.label(egui::RichText::new("Credentials").strong());
+                                ui.add_space(4.0);
+
+                                egui::Grid::new("login_form_credentials")
+                                    .num_columns(2)
+                                    .min_col_width(90.0)
+                                    .spacing([16.0, 14.0])
+                                    .show(ui, |ui| {
+                                        ui.add_sized([84.0, 0.0], egui::Label::new("Server"));
+                                        ui.scope(|ui| {
+                                            ui.visuals_mut().widgets.inactive.bg_fill =
+                                                ui.visuals().code_bg_color;
+                                            ui.visuals_mut().widgets.inactive.bg_stroke =
+                                                egui::Stroke::new(
+                                                    1.0,
+                                                    ui.visuals().widgets.noninteractive.fg_stroke.color,
+                                                );
+                                            ui.add_sized(
+                                                [ui.available_width(), 28.0],
+                                                egui::TextEdit::singleline(&mut self.server_url),
+                                            );
+                                        });
+                                        ui.end_row();
+
+                                        ui.add_sized([84.0, 0.0], egui::Label::new("Username"));
+                                        ui.scope(|ui| {
+                                            ui.visuals_mut().widgets.inactive.bg_fill =
+                                                ui.visuals().code_bg_color;
+                                            ui.visuals_mut().widgets.inactive.bg_stroke =
+                                                egui::Stroke::new(
+                                                    1.0,
+                                                    ui.visuals().widgets.noninteractive.fg_stroke.color,
+                                                );
+                                            ui.add_sized(
+                                                [ui.available_width(), 28.0],
+                                                egui::TextEdit::singleline(&mut self.username),
+                                            );
+                                        });
+                                        ui.end_row();
+                                    });
+                            });
+
+                        ui.add_space(4.0);
+                        ui.scope(|ui| {
+                            let cta_color = egui::Color32::from_rgb(76, 129, 255);
+                            ui.visuals_mut().widgets.inactive.bg_fill = cta_color;
+                            ui.visuals_mut().widgets.hovered.bg_fill = cta_color.gamma_multiply(1.08);
+                            ui.visuals_mut().widgets.active.bg_fill = cta_color.gamma_multiply(0.9);
+                            ui.visuals_mut().widgets.inactive.fg_stroke.color = egui::Color32::WHITE;
+                            ui.visuals_mut().widgets.hovered.fg_stroke.color = egui::Color32::WHITE;
+                            ui.visuals_mut().widgets.active.fg_stroke.color = egui::Color32::WHITE;
+
+                            if ui
+                                .add_sized([ui.available_width(), 40.0], egui::Button::new("Sign in"))
+                                .clicked()
+                            {
+                                let username = self.username.trim().to_string();
+                                if username.is_empty() {
+                                    self.status =
+                                        "Username is required for username-only sign in".to_string();
+                                } else {
+                                    self.auth_session_established = false;
+                                    queue_command(
+                                        &self.cmd_tx,
+                                        BackendCommand::Login {
+                                            server_url: self.server_url.clone(),
+                                            username,
+                                        },
+                                        &mut self.status,
+                                    );
+                                }
+                            }
+                        });
+
+                        ui.add_space(8.0);
+                        egui::Frame::none()
+                            .fill(ui.visuals().extreme_bg_color.gamma_multiply(0.35))
+                            .stroke(egui::Stroke::new(
+                                1.0,
+                                ui.visuals().widgets.noninteractive.bg_stroke.color,
+                            ))
+                            .rounding(10.0)
+                            .inner_margin(egui::Margin::symmetric(14.0, 12.0))
+                            .show(ui, |ui| {
+                                ui.label(egui::RichText::new("Invite").strong());
+                                ui.label("Already have an invite code? Paste it below to join a guild after signing in.");
+
+                                ui.add_space(2.0);
+                                egui::Grid::new("login_form_invite")
+                                    .num_columns(2)
+                                    .min_col_width(90.0)
+                                    .spacing([16.0, 12.0])
+                                    .show(ui, |ui| {
+                                        ui.add_sized([84.0, 0.0], egui::Label::new("Invite code"));
+                                        ui.scope(|ui| {
+                                            ui.visuals_mut().widgets.inactive.bg_fill =
+                                                ui.visuals().code_bg_color;
+                                            ui.visuals_mut().widgets.inactive.bg_stroke =
+                                                egui::Stroke::new(
+                                                    1.0,
+                                                    ui.visuals().widgets.noninteractive.fg_stroke.color,
+                                                );
+                                            ui.add_sized(
+                                                [ui.available_width(), 28.0],
+                                                egui::TextEdit::singleline(&mut self.password_or_invite),
+                                            );
+                                        });
+                                        ui.end_row();
+                                    });
+
+                                ui.horizontal(|ui| {
+                                    ui.add_space(84.0);
+                                    if ui
+                                        .add_sized([140.0, 30.0], egui::Button::new("Join Invite"))
+                                        .clicked()
+                                    {
+                                        let invite_code = self.password_or_invite.trim().to_string();
+                                        if invite_code.is_empty() {
+                                            self.status = "Enter an invite code first".to_string();
+                                        } else {
+                                            queue_command(
+                                                &self.cmd_tx,
+                                                BackendCommand::JoinWithInvite { invite_code },
+                                                &mut self.status,
+                                            );
+                                        }
+                                    }
+                                });
+                            });
+
+                        ui.add_space(8.0);
+                        ui.label(&self.status);
+                        self.show_status_banner(ui);
                     });
-
-                ui.add_space(12.0);
-                if ui.button("Sign in").clicked() {
-                    let username = self.username.trim().to_string();
-                    if username.is_empty() {
-                        self.status = "Username is required for username-only sign in".to_string();
-                    } else {
-                        self.auth_session_established = false;
-                        queue_command(
-                            &self.cmd_tx,
-                            BackendCommand::Login {
-                                server_url: self.server_url.clone(),
-                                username,
-                            },
-                            &mut self.status,
-                        );
-                    }
-                }
-
-                ui.add_space(8.0);
-                ui.separator();
-                ui.label("Have an invite code? Join a guild after you sign in.");
-
-                ui.horizontal(|ui| {
-                    ui.label("Invite code:");
-                    ui.text_edit_singleline(&mut self.password_or_invite);
-                    if ui.button("Join Invite").clicked() {
-                        let invite_code = self.password_or_invite.trim().to_string();
-                        if invite_code.is_empty() {
-                            self.status = "Enter an invite code first".to_string();
-                        } else {
-                            queue_command(
-                                &self.cmd_tx,
-                                BackendCommand::JoinWithInvite { invite_code },
-                                &mut self.status,
-                            );
-                        }
-                    }
-                });
-
-                ui.add_space(10.0);
-                ui.label(&self.status);
-                self.show_status_banner(ui);
             });
+            ui.add_space(vertical_band + top_bottom_space);
         });
     }
 
