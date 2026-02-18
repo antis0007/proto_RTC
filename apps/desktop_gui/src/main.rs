@@ -223,6 +223,19 @@ fn lighten_color(c: egui::Color32, t: f32) -> egui::Color32 {
     egui::Color32::from_rgba_unmultiplied(mix(c.r()), mix(c.g()), mix(c.b()), c.a())
 }
 
+fn server_environment_label(server_url: &str) -> &'static str {
+    let server = server_url.to_ascii_lowercase();
+    if server.contains("127.0.0.1") || server.contains("localhost") {
+        "Local"
+    } else if server.contains("staging") {
+        "Staging"
+    } else if server.contains("dev") {
+        "Development"
+    } else {
+        "Production"
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VoiceSessionConnectionStatus {
     Idle,
@@ -230,6 +243,23 @@ enum VoiceSessionConnectionStatus {
     Connected,
     Disconnecting,
     Error,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AccountPresence {
+    Online,
+    Away,
+    DoNotDisturb,
+}
+
+impl AccountPresence {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Online => "Online",
+            Self::Away => "Away",
+            Self::DoNotDisturb => "Do Not Disturb",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -531,6 +561,11 @@ struct DesktopGuiApp {
     username: String,
     invite_code_input: String,
     auth_session_established: bool,
+    presence_preference: AccountPresence,
+    notifications_enabled: bool,
+    desktop_notifications_enabled: bool,
+    mention_notifications_enabled: bool,
+    display_name_draft: String,
 
     composer: String,
     pending_attachment: Option<PathBuf>,
@@ -615,6 +650,11 @@ impl DesktopGuiApp {
             username: "alice".to_string(),
             invite_code_input: String::new(),
             auth_session_established: false,
+            presence_preference: AccountPresence::Online,
+            notifications_enabled: true,
+            desktop_notifications_enabled: true,
+            mention_notifications_enabled: true,
+            display_name_draft: "alice".to_string(),
             composer: String::new(),
             pending_attachment: None,
             attachment_preview_cache: HashMap::new(),
@@ -1115,6 +1155,9 @@ impl DesktopGuiApp {
                                 );
                                 self.server_url = server_url_buf;
                                 self.username = username_buf;
+                                if !self.auth_session_established {
+                                    self.display_name_draft = self.username.clone();
+                                }
 
                                 // Enter submits if username/server has focus
                                 let enter_pressed = ctx.input(|i| i.key_pressed(egui::Key::Enter));
@@ -1161,6 +1204,13 @@ impl DesktopGuiApp {
         });
     }
 
+    fn sign_out(&mut self) {
+        self.auth_session_established = false;
+        self.view_state = AppViewState::Login;
+        self.status = "Signed out".to_string();
+        self.status_banner = None;
+    }
+
     fn try_login(&mut self) {
         let username = self.username.trim().to_string();
         if username.is_empty() {
@@ -1186,6 +1236,7 @@ impl DesktopGuiApp {
 
         self.auth_session_established = false;
         self.status_banner = None;
+        self.display_name_draft = username.clone();
         queue_command(
             &self.cmd_tx,
             BackendCommand::Login {
@@ -1438,6 +1489,84 @@ impl DesktopGuiApp {
 
     // ------------------- Main workspace (mostly unchanged) -------------------
 
+    fn show_account_menu_contents(&mut self, ui: &mut egui::Ui) {
+        let auth_ready = self.auth_session_established;
+        let backend_supports_profile_edit = false;
+
+        ui.set_min_width(260.0);
+        ui.label(egui::RichText::new(&self.username).strong());
+        ui.small(format!(
+            "{} ({})",
+            self.server_url,
+            server_environment_label(&self.server_url)
+        ));
+        ui.small(format!(
+            "Session: {}",
+            if auth_ready {
+                "Authenticated"
+            } else {
+                "Signed out"
+            }
+        ));
+
+        ui.separator();
+        ui.small("Display name");
+        ui.add(
+            egui::TextEdit::singleline(&mut self.display_name_draft)
+                .hint_text("Display name")
+                .desired_width(f32::INFINITY),
+        );
+        let save_display_name = ui
+            .add_enabled(
+                auth_ready && backend_supports_profile_edit,
+                egui::Button::new("Save display name"),
+            )
+            .on_hover_text("Backend command support is required for profile updates.");
+        if save_display_name.clicked() {
+            self.status = "Display name updated".to_string();
+            ui.close_menu();
+        }
+
+        ui.separator();
+        ui.small("Presence");
+        egui::ComboBox::from_id_source("account_presence_combo")
+            .selected_text(self.presence_preference.label())
+            .show_ui(ui, |ui| {
+                ui.selectable_value(
+                    &mut self.presence_preference,
+                    AccountPresence::Online,
+                    AccountPresence::Online.label(),
+                );
+                ui.selectable_value(
+                    &mut self.presence_preference,
+                    AccountPresence::Away,
+                    AccountPresence::Away.label(),
+                );
+                ui.selectable_value(
+                    &mut self.presence_preference,
+                    AccountPresence::DoNotDisturb,
+                    AccountPresence::DoNotDisturb.label(),
+                );
+            });
+
+        ui.separator();
+        ui.small("Notifications");
+        ui.checkbox(&mut self.notifications_enabled, "Enable notifications");
+        ui.add_enabled_ui(self.notifications_enabled, |ui| {
+            ui.checkbox(&mut self.desktop_notifications_enabled, "Desktop alerts");
+            ui.checkbox(&mut self.mention_notifications_enabled, "Mentions only");
+        });
+
+        ui.separator();
+        let sign_out = ui
+            .add_enabled(auth_ready, egui::Button::new("Sign out"))
+            .on_disabled_hover_text("No active session to sign out from.");
+        if sign_out.clicked() {
+            self.sign_out();
+            ui.close_menu();
+        }
+    }
+
     fn show_main_workspace(&mut self, ctx: &egui::Context) {
         const TOOLBAR_H_PADDING: f32 = 12.0;
         const TOOLBAR_V_PADDING: f32 = 8.0;
@@ -1474,16 +1603,7 @@ impl DesktopGuiApp {
                         self.settings_open = true;
                     }
 
-                    ui.menu_button("Account", |ui| {
-                        ui.label("Signed in as current user");
-                        if ui.button("Sign out").clicked() {
-                            self.auth_session_established = false;
-                            self.view_state = AppViewState::Login;
-                            self.status = "Signed out".to_string();
-                            self.status_banner = None;
-                            ui.close_menu();
-                        }
-                    });
+                    ui.menu_button("Account", |ui| self.show_account_menu_contents(ui));
 
                     ui.separator();
                     ui.weak(format!("Workspace: {workspace_label}"));
@@ -2034,10 +2154,7 @@ impl DesktopGuiApp {
                                         self.settings_open = true;
                                     }
                                     if ui.button("⎋ Sign out").clicked() {
-                                        self.auth_session_established = false;
-                                        self.view_state = AppViewState::Login;
-                                        self.status = "Signed out".to_string();
-                                        self.status_banner = None;
+                                        self.sign_out();
                                     }
                                 });
                             });
