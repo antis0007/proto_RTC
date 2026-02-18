@@ -1458,6 +1458,7 @@ impl DesktopGuiApp {
                     .map(|guild| guild.name.clone())
             })
             .unwrap_or_else(|| "No workspace selected".to_string());
+        let show_workspace_context = self.guilds.len() > 1 && self.selected_guild.is_some();
 
         egui::TopBottomPanel::top("top_bar")
             .frame(
@@ -1484,9 +1485,6 @@ impl DesktopGuiApp {
                             ui.close_menu();
                         }
                     });
-
-                    ui.separator();
-                    ui.weak(format!("Workspace: {workspace_label}"));
                 });
             });
 
@@ -1750,6 +1748,9 @@ impl DesktopGuiApp {
                 let discord_dark = theme_discord_dark_palette(self.theme);
                 ui.horizontal(|ui| {
                     ui.heading("Channels");
+                    if show_workspace_context {
+                        ui.weak(format!("Workspace: {workspace_label}"));
+                    }
                     let refresh_label = if let Some(palette) = discord_dark {
                         egui::RichText::new("Refresh").color(palette.side_panel_button_text)
                     } else {
