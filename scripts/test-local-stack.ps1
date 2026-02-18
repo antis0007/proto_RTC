@@ -30,12 +30,14 @@ if (-not $env:APP__LIVEKIT_API_SECRET) { $env:APP__LIVEKIT_API_SECRET = $(if ($e
 if (-not $env:APP__LIVEKIT_URL -and $env:LIVEKIT_URL) { $env:APP__LIVEKIT_URL = $env:LIVEKIT_URL }
 
 $ServerLog = 'logs/test-local-server.log'
+$ServerErrLog = 'logs/test-local-server.err.log'
 $Client1Log = 'logs/test-local-client-1.log'
 $Client2Log = 'logs/test-local-client-2.log'
 $ArtifactDir = 'artifacts/local-stack'
 Get-ChildItem -Path $ArtifactDir -File -ErrorAction SilentlyContinue | Remove-Item -Force
 $RunSummary = Join-Path $ArtifactDir 'run-summary.log'
 Set-Content -Path $ServerLog -Value ''
+Set-Content -Path $ServerErrLog -Value ''
 Set-Content -Path $Client1Log -Value '[client1] local stack smoke run'
 Set-Content -Path $Client2Log -Value '[client2] local stack smoke run'
 Set-Content -Path $RunSummary -Value '[run] local stack smoke run'
@@ -107,7 +109,7 @@ function Invoke-ApiRequest {
   }
 }
 
-$serverProcess = Start-Process -FilePath 'cargo' -ArgumentList @('run', '-p', 'server') -RedirectStandardOutput $ServerLog -RedirectStandardError $ServerLog -PassThru
+$serverProcess = Start-Process -FilePath 'cargo' -ArgumentList @('run', '-p', 'server') -RedirectStandardOutput $ServerLog -RedirectStandardError $ServerErrLog -PassThru
 $success = $false
 
 try {
@@ -224,6 +226,7 @@ try {
   }
   Write-Host 'Artifacts collected:'
   Write-Host "  $ServerLog"
+  Write-Host "  $ServerErrLog"
   Write-Host "  $Client1Log"
   Write-Host "  $Client2Log"
   Write-Host "  $ArtifactDir"
