@@ -1311,6 +1311,11 @@ impl DesktopGuiApp {
     }
 
     fn show_main_workspace(&mut self, ctx: &egui::Context) {
+        const TOOLBAR_H_PADDING: f32 = 12.0;
+        const TOOLBAR_V_PADDING: f32 = 8.0;
+        const SECTION_VERTICAL_GAP: f32 = 8.0;
+        const STATUS_VERTICAL_MARGIN: f32 = 6.0;
+
         let top_bar_bg = theme_discord_dark_palette(self.theme)
             .map(|p| p.navigation_background)
             .unwrap_or(ctx.style().visuals.panel_fill);
@@ -1318,7 +1323,10 @@ impl DesktopGuiApp {
             .frame(
                 egui::Frame::none()
                     .fill(top_bar_bg)
-                    .inner_margin(egui::Margin::ZERO),
+                    .inner_margin(egui::Margin::symmetric(
+                        TOOLBAR_H_PADDING,
+                        TOOLBAR_V_PADDING,
+                    )),
             )
             .show(ctx, |ui| {
                 egui::menu::bar(ui, |ui| {
@@ -1331,18 +1339,67 @@ impl DesktopGuiApp {
                     });
                 });
 
+                ui.add_space(SECTION_VERTICAL_GAP);
+
+                let is_narrow = ui.available_width() < 560.0;
+                let field_min_width = if is_narrow { 120.0 } else { 180.0 };
+                let field_max_width = if is_narrow { 240.0 } else { 340.0 };
+                let input_row = |ui: &mut egui::Ui,
+                                 label: &str,
+                                 value: &mut String,
+                                 min_width: f32,
+                                 max_width: f32| {
+                    ui.horizontal(|ui| {
+                        ui.label(label);
+                        let width = ui.available_width().clamp(min_width, max_width);
+                        ui.add_sized([width, 0.0], egui::TextEdit::singleline(value));
+                    });
+                };
+
                 ui.horizontal_wrapped(|ui| {
-                    ui.label("Server:");
-                    ui.text_edit_singleline(&mut self.server_url);
-                    ui.label("Username:");
-                    ui.text_edit_singleline(&mut self.username);
-                    ui.label("Invite:");
-                    ui.text_edit_singleline(&mut self.password_or_invite);
+                    egui::Frame::group(ui.style())
+                        .inner_margin(egui::Margin::symmetric(10.0, 8.0))
+                        .show(ui, |ui| {
+                            ui.vertical(|ui| {
+                                ui.small("Auth");
+                                ui.horizontal_wrapped(|ui| {
+                                    input_row(
+                                        ui,
+                                        "Server:",
+                                        &mut self.server_url,
+                                        field_min_width,
+                                        field_max_width,
+                                    );
+                                    input_row(
+                                        ui,
+                                        "Username:",
+                                        &mut self.username,
+                                        field_min_width,
+                                        field_max_width,
+                                    );
+                                });
+                            });
+                        });
+
+                    egui::Frame::group(ui.style())
+                        .inner_margin(egui::Margin::symmetric(10.0, 8.0))
+                        .show(ui, |ui| {
+                            ui.vertical(|ui| {
+                                ui.small("Invite");
+                                input_row(
+                                    ui,
+                                    "Invite:",
+                                    &mut self.password_or_invite,
+                                    field_min_width,
+                                    field_max_width,
+                                );
+                            });
+                        });
                 });
 
-                ui.horizontal_wrapped(|ui| {
-                    ui.separator();
+                ui.add_space(SECTION_VERTICAL_GAP);
 
+                ui.horizontal_wrapped(|ui| {
                     if ui.button("Sign in").clicked() {
                         let username = self.username.trim().to_string();
                         if username.is_empty() {
@@ -1361,9 +1418,9 @@ impl DesktopGuiApp {
                         }
                     }
 
-                    let constrained = ui.available_width() < 220.0;
+                    let constrained = ui.available_width() < 280.0;
                     if constrained {
-                        ui.menu_button("⋯ More", |ui| {
+                        ui.menu_button("Actions", |ui| {
                             if ui.button("Refresh Guilds").clicked() {
                                 queue_command(
                                     &self.cmd_tx,
@@ -1388,7 +1445,7 @@ impl DesktopGuiApp {
                             }
                         });
                     } else {
-                        if ui.button("🔄").on_hover_text("Refresh Guilds").clicked() {
+                        if ui.button("Refresh Guilds").clicked() {
                             queue_command(
                                 &self.cmd_tx,
                                 BackendCommand::ListGuilds,
@@ -1396,7 +1453,7 @@ impl DesktopGuiApp {
                             );
                         }
 
-                        if ui.button("➕").on_hover_text("Join Invite").clicked() {
+                        if ui.button("Join Invite").clicked() {
                             let invite_code = self.password_or_invite.trim().to_string();
                             if invite_code.is_empty() {
                                 self.status = "Enter an invite code first".to_string();
@@ -1411,11 +1468,15 @@ impl DesktopGuiApp {
                     }
                 });
 
+                ui.add_space(STATUS_VERTICAL_MARGIN);
+
                 ui.colored_label(
                     egui::Color32::YELLOW,
                     "Username-only sign-in mode is active.",
                 );
+                ui.add_space(2.0);
                 ui.label(&self.status);
+                ui.add_space(STATUS_VERTICAL_MARGIN);
             });
 
         self.show_settings_window(ctx);
@@ -1428,10 +1489,14 @@ impl DesktopGuiApp {
             .frame(
                 egui::Frame::none()
                     .fill(nav_bg)
-                    .inner_margin(egui::Margin::ZERO),
+                    .inner_margin(egui::Margin::symmetric(
+                        TOOLBAR_H_PADDING,
+                        TOOLBAR_V_PADDING,
+                    )),
             )
             .show(ctx, |ui| {
                 ui.heading("Guilds");
+                ui.add_space(SECTION_VERTICAL_GAP);
                 ui.add_enabled_ui(self.auth_session_established, |ui| {
                     if let Some(guild_id) = self.selected_guild {
                         if ui.button("Create Invite").clicked() {
@@ -1542,6 +1607,7 @@ impl DesktopGuiApp {
 
                 if !self.auth_session_established {
                     ui.separator();
+                    ui.add_space(4.0);
                     ui.label("Sign in or create an account to access guilds.");
                 }
             });
@@ -1551,7 +1617,10 @@ impl DesktopGuiApp {
             .frame(
                 egui::Frame::none()
                     .fill(nav_bg)
-                    .inner_margin(egui::Margin::ZERO),
+                    .inner_margin(egui::Margin::symmetric(
+                        TOOLBAR_H_PADDING,
+                        TOOLBAR_V_PADDING,
+                    )),
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
@@ -1573,6 +1642,7 @@ impl DesktopGuiApp {
                         }
                     }
                 });
+                ui.add_space(SECTION_VERTICAL_GAP);
 
                 ui.add_enabled_ui(self.auth_session_established, |ui| {
                     for channel in &self.channels {
@@ -1716,6 +1786,7 @@ impl DesktopGuiApp {
 
                 if !self.auth_session_established {
                     ui.separator();
+                    ui.add_space(4.0);
                     ui.label("Sign in to browse channels.");
                 }
             });
@@ -1726,87 +1797,100 @@ impl DesktopGuiApp {
                 let members_bg = theme_discord_dark_palette(self.theme)
                     .map(|p| p.members_background)
                     .unwrap_or(ui.visuals().panel_fill);
-                egui::Frame::none().fill(members_bg).show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.heading("Members");
-                        if ui.button("Refresh").clicked() {
-                            if let Some(guild_id) = self.selected_guild {
-                                queue_command(
-                                    &self.cmd_tx,
-                                    BackendCommand::ListMembers { guild_id },
-                                    &mut self.status,
-                                );
-                            }
-                        }
-                    });
-
-                    if let Some(guild_id) = self.selected_guild {
-                        if let Some(members) = self.members.get(&guild_id) {
-                            if members.is_empty() {
-                                ui.label("No visible members in this guild yet.");
-                            } else {
-                                for member in members {
-                                    let role_label = match member.role {
-                                        Role::Owner => "owner",
-                                        Role::Mod => "mod",
-                                        Role::Member => "member",
-                                    };
-                                    let mute_label =
-                                        if member.muted { " · 🔇 muted" } else { "" };
-                                    ui.label(format!(
-                                        "{} ({}){}",
-                                        member.username, role_label, mute_label
-                                    ));
+                egui::Frame::none()
+                    .fill(members_bg)
+                    .inner_margin(egui::Margin::symmetric(
+                        TOOLBAR_H_PADDING,
+                        TOOLBAR_V_PADDING,
+                    ))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.heading("Members");
+                            if ui.button("Refresh").clicked() {
+                                if let Some(guild_id) = self.selected_guild {
+                                    queue_command(
+                                        &self.cmd_tx,
+                                        BackendCommand::ListMembers { guild_id },
+                                        &mut self.status,
+                                    );
                                 }
                             }
-                        } else {
-                            ui.label("Loading members for selected guild…");
-                        }
-                    } else {
-                        ui.label("Select a guild to view members.");
-                    }
-
-                    ui.separator();
-                    ui.heading("Voice");
-                    let (badge_text, badge_color) = self.voice_status_badge();
-                    ui.colored_label(badge_color, format!("Status: {badge_text}"));
-
-                    if let Some(channel) = self.selected_voice_channel() {
-                        ui.label(format!("Selected: {}", channel.name));
-                        ui.small(format!(
-                            "Occupancy: {} participant(s)",
-                            self.voice_ui.occupancy_for_channel(channel.channel_id)
-                        ));
-                    }
-
-                    if let Some(active) = &self.voice_ui.active_session {
-                        let active_name = self
-                            .channels
-                            .iter()
-                            .find(|channel| channel.channel_id == active.channel_id)
-                            .map(|channel| channel.name.as_str())
-                            .unwrap_or("Unknown voice channel");
-                        ui.label(format!("Connected channel: {active_name}"));
-                        ui.label(format!(
-                            "Participants: {}",
-                            self.voice_ui.active_participant_count()
-                        ));
-                        ui.horizontal_wrapped(|ui| {
-                            ui.toggle_value(&mut self.voice_ui.muted, "Mute");
-                            ui.toggle_value(&mut self.voice_ui.deafened, "Deafen");
-                            ui.toggle_value(
-                                &mut self.voice_ui.screen_share_enabled,
-                                "Screen share",
-                            );
                         });
-                    } else {
-                        ui.label("Not connected to voice.");
-                    }
+                        ui.add_space(SECTION_VERTICAL_GAP);
 
-                    if let Some(err) = &self.voice_ui.last_error {
-                        ui.colored_label(egui::Color32::RED, format!("Last voice error: {err}"));
-                    }
-                });
+                        if let Some(guild_id) = self.selected_guild {
+                            if let Some(members) = self.members.get(&guild_id) {
+                                if members.is_empty() {
+                                    ui.label("No visible members in this guild yet.");
+                                } else {
+                                    for member in members {
+                                        let role_label = match member.role {
+                                            Role::Owner => "owner",
+                                            Role::Mod => "mod",
+                                            Role::Member => "member",
+                                        };
+                                        let mute_label =
+                                            if member.muted { " · 🔇 muted" } else { "" };
+                                        ui.label(format!(
+                                            "{} ({}){}",
+                                            member.username, role_label, mute_label
+                                        ));
+                                    }
+                                }
+                            } else {
+                                ui.label("Loading members for selected guild…");
+                            }
+                        } else {
+                            ui.label("Select a guild to view members.");
+                        }
+
+                        ui.separator();
+                        ui.add_space(SECTION_VERTICAL_GAP);
+                        ui.heading("Voice");
+                        ui.add_space(4.0);
+                        let (badge_text, badge_color) = self.voice_status_badge();
+                        ui.colored_label(badge_color, format!("Status: {badge_text}"));
+
+                        if let Some(channel) = self.selected_voice_channel() {
+                            ui.label(format!("Selected: {}", channel.name));
+                            ui.small(format!(
+                                "Occupancy: {} participant(s)",
+                                self.voice_ui.occupancy_for_channel(channel.channel_id)
+                            ));
+                        }
+
+                        if let Some(active) = &self.voice_ui.active_session {
+                            let active_name = self
+                                .channels
+                                .iter()
+                                .find(|channel| channel.channel_id == active.channel_id)
+                                .map(|channel| channel.name.as_str())
+                                .unwrap_or("Unknown voice channel");
+                            ui.label(format!("Connected channel: {active_name}"));
+                            ui.label(format!(
+                                "Participants: {}",
+                                self.voice_ui.active_participant_count()
+                            ));
+                            ui.horizontal_wrapped(|ui| {
+                                ui.toggle_value(&mut self.voice_ui.muted, "Mute");
+                                ui.toggle_value(&mut self.voice_ui.deafened, "Deafen");
+                                ui.toggle_value(
+                                    &mut self.voice_ui.screen_share_enabled,
+                                    "Screen share",
+                                );
+                            });
+                        } else {
+                            ui.label("Not connected to voice.");
+                        }
+
+                        if let Some(err) = &self.voice_ui.last_error {
+                            ui.add_space(4.0);
+                            ui.colored_label(
+                                egui::Color32::RED,
+                                format!("Last voice error: {err}"),
+                            );
+                        }
+                    });
             });
 
         egui::TopBottomPanel::bottom("composer_panel")
@@ -1911,11 +1995,9 @@ impl DesktopGuiApp {
             .map(|p| p.message_background)
             .unwrap_or(ctx.style().visuals.panel_fill);
         egui::CentralPanel::default()
-            .frame(
-                egui::Frame::none()
-                    .fill(message_panel_bg)
-                    .inner_margin(egui::Margin::ZERO),
-            )
+            .frame(egui::Frame::none().fill(message_panel_bg).inner_margin(
+                egui::Margin::symmetric(TOOLBAR_H_PADDING, TOOLBAR_V_PADDING),
+            ))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.heading("Messages");
@@ -1931,6 +2013,7 @@ impl DesktopGuiApp {
                         }
                     }
                 });
+                ui.add_space(SECTION_VERTICAL_GAP);
                 ui.separator();
 
                 egui::ScrollArea::vertical().show(ui, |ui| {
