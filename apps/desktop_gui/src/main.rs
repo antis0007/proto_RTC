@@ -970,8 +970,7 @@ impl DesktopGuiApp {
         label: &str,
         hint: &str,
         value: &mut String,
-        focus_to_set: Option<LoginFocusField>,
-        field_kind: LoginFocusField,
+        should_focus: bool,
     ) -> egui::Response {
         ui.label(egui::RichText::new(label).strong());
         let edit = egui::TextEdit::singleline(value)
@@ -986,10 +985,8 @@ impl DesktopGuiApp {
         let response = ui.add_sized([ui.available_width(), 34.0], edit);
 
         // One-time / directed focus that doesn't flicker.
-        if let Some(focus) = focus_to_set {
-            if focus == field_kind {
-                response.request_focus();
-            }
+        if should_focus {
+            response.request_focus();
         }
 
         response
@@ -1067,8 +1064,7 @@ impl DesktopGuiApp {
                                     "Server URL",
                                     "http://127.0.0.1:8443",
                                     &mut server_url_buf,
-                                    focus_to_set,
-                                    LoginFocusField::Server,
+                                    focus_to_set == Some(LoginFocusField::Server),
                                 );
 
                                 ui.add_space(6.0);
@@ -1079,8 +1075,7 @@ impl DesktopGuiApp {
                                     "Username",
                                     "alice",
                                     &mut username_buf,
-                                    focus_to_set,
-                                    LoginFocusField::Username,
+                                    focus_to_set == Some(LoginFocusField::Username),
                                 );
                                 self.server_url = server_url_buf;
                                 self.username = username_buf;
@@ -1134,8 +1129,7 @@ impl DesktopGuiApp {
                                     "Invite code",
                                     "XXXX-XXXX",
                                     &mut invite_buf,
-                                    focus_to_set,
-                                    LoginFocusField::Invite,
+                                    focus_to_set == Some(LoginFocusField::Invite),
                                 );
 
                                 ui.add_space(6.0);
@@ -1556,7 +1550,10 @@ impl DesktopGuiApp {
             .frame(
                 egui::Frame::none()
                     .fill(nav_bg)
-                    .inner_margin(egui::Margin::symmetric(TOOLBAR_H_PADDING, TOOLBAR_V_PADDING)),
+                    .inner_margin(egui::Margin::symmetric(
+                        TOOLBAR_H_PADDING,
+                        TOOLBAR_V_PADDING,
+                    )),
             )
             .show(ctx, |ui| {
                 ui.heading("Guilds");
@@ -1725,7 +1722,10 @@ impl DesktopGuiApp {
             .frame(
                 egui::Frame::none()
                     .fill(nav_bg)
-                    .inner_margin(egui::Margin::symmetric(TOOLBAR_H_PADDING, TOOLBAR_V_PADDING)),
+                    .inner_margin(egui::Margin::symmetric(
+                        TOOLBAR_H_PADDING,
+                        TOOLBAR_V_PADDING,
+                    )),
             )
             .show(ctx, |ui| {
                 let discord_dark = theme_discord_dark_palette(self.theme);
@@ -1965,7 +1965,10 @@ impl DesktopGuiApp {
                     .unwrap_or(ui.visuals().panel_fill);
                 egui::Frame::none()
                     .fill(members_bg)
-                    .inner_margin(egui::Margin::symmetric(TOOLBAR_H_PADDING, TOOLBAR_V_PADDING))
+                    .inner_margin(egui::Margin::symmetric(
+                        TOOLBAR_H_PADDING,
+                        TOOLBAR_V_PADDING,
+                    ))
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             ui.heading("Members");
