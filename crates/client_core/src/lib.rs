@@ -14,8 +14,6 @@ use futures::StreamExt;
 use livekit_integration::{
     LiveKitRoomConnector, LiveKitRoomEvent, LiveKitRoomOptions, LiveKitRoomSession, LocalTrack,
 };
-use mls::MlsIdentity;
-use openmls_rust_crypto::OpenMlsRustCrypto;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use shared::{
@@ -82,6 +80,7 @@ pub enum LiveKitE2eeKeyError {
 
 #[async_trait]
 pub trait MlsSessionManager: Send + Sync {
+    async fn key_package_bytes(&self, guild_id: GuildId) -> Result<Vec<u8>>;
     async fn open_or_create_group(&self, guild_id: GuildId, channel_id: ChannelId) -> Result<()>;
     async fn encrypt_application(&self, channel_id: ChannelId, plaintext: &[u8])
         -> Result<Vec<u8>>;
@@ -114,6 +113,13 @@ pub struct MissingMlsSessionManager;
 
 #[async_trait]
 impl MlsSessionManager for MissingMlsSessionManager {
+    async fn key_package_bytes(&self, guild_id: GuildId) -> Result<Vec<u8>> {
+        Err(anyhow!(
+            "MLS backend unavailable for guild {}",
+            guild_id.0
+        ))
+    }
+
     async fn open_or_create_group(&self, guild_id: GuildId, channel_id: ChannelId) -> Result<()> {
         Err(anyhow!(
             "MLS backend unavailable for guild {} channel {}",
@@ -864,8 +870,7 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
 
     async fn upload_key_package_for_guild(&self, guild_id: GuildId) -> Result<i64> {
         let (server_url, user_id) = self.session().await?;
-        let identity = MlsIdentity::new_with_name(format!("user-{user_id}"))?;
-        let key_package_bytes = identity.key_package_bytes(&OpenMlsRustCrypto::default())?;
+        let key_package_bytes = self.mls_session_manager.key_package_bytes(guild_id).await?;
 
         let response: UploadKeyPackageResponse = self
             .http
@@ -1743,6 +1748,13 @@ mod tests {
 
     #[async_trait]
     impl MlsSessionManager for TestMlsSessionManager {
+        async fn key_package_bytes(&self, _guild_id: GuildId) -> Result<Vec<u8>> {
+            if let Some(err) = &self.fail_with {
+                return Err(anyhow!(err.clone()));
+            }
+            Ok(b"test-key-package".to_vec())
+        }
+
         async fn open_or_create_group(
             &self,
             _guild_id: GuildId,
