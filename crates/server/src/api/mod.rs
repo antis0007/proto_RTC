@@ -60,22 +60,6 @@ pub fn mls_welcome_route() -> &'static str {
     "/mls/welcome"
 }
 
-#[derive(Default)]
-pub struct TokenBucket {
-    tokens: usize,
-}
-
-impl TokenBucket {
-    pub fn allow(&mut self) -> bool {
-        if self.tokens < 100 {
-            self.tokens += 1;
-            true
-        } else {
-            false
-        }
-    }
-}
-
 pub async fn list_guilds(ctx: &ApiContext, user_id: UserId) -> Result<Vec<GuildSummary>, ApiError> {
     let guilds = ctx
         .storage
