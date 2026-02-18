@@ -64,7 +64,7 @@ Restore confidence that the backend is available and stable, and that end users 
 ---
 
 ## Task 4 — Text messaging functional validation
-**Files:** `crates/client_core/src/lib.rs`, `crates/server_api/src/lib.rs`, `crates/server/src/main.rs`
+**Files:** `crates/client_core/src/lib.rs`, `crates/server/src/api/mod.rs`, `crates/server/src/main.rs`
 
 1. Validate send path after sign-in + channel selection:
    - no runtime error from active context resolution
@@ -99,7 +99,7 @@ Restore confidence that the backend is available and stable, and that end users 
 ---
 
 ## Task 6 — Media/file upload and download validation
-**Files:** `crates/server/src/main.rs`, `crates/server_api/src/lib.rs`, `crates/storage/src/lib.rs`, `apps/desktop_gui/src/main.rs`
+**Files:** `crates/server/src/main.rs`, `crates/server/src/api/mod.rs`, `crates/storage/src/lib.rs`, `apps/desktop_gui/src/main.rs`
 
 1. Validate upload request path end-to-end (GUI and/or client_core):
    - accepted for authorized member

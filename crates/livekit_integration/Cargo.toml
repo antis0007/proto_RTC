@@ -7,11 +7,4 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
-chrono.workspace = true
-jsonwebtoken.workspace = true
-serde.workspace = true
-shared = { path = "../shared" }
 tokio = { workspace = true, features = ["sync"] }
-
-[dev-dependencies]
-serde_json.workspace = true

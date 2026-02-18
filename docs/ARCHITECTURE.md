@@ -32,6 +32,6 @@ The client requests a LiveKit token from the Community Server, then connects dir
 ## Layering
 
 - **Transport** (`crates/server`): HTTP + WebSocket only
-- **Logic** (`crates/server_api`): permission checks, moderation, orchestration
+- **Logic** (`crates/server/src/api`): permission checks, moderation, orchestration
 - **Storage** (`crates/storage`): SQL access + migrations
 - **Protocol/Domain** (`crates/shared`): request/event/error contracts

@@ -1,5 +1,12 @@
 use std::{net::SocketAddr, sync::Arc};
 
+use crate::api::{
+    ensure_active_membership_in_channel, ensure_active_membership_in_guild, list_channels,
+    list_guilds, list_members, list_messages, mls_key_packages_route, mls_welcome_route,
+    send_message, ApiContext, KeyPackageResponse, MlsKeyPackageQuery, MlsWelcomeQuery,
+    MlsWelcomeResponse, UploadKeyPackageResponse,
+};
+use crate::livekit::LiveKitConfig;
 use axum::{
     body::Bytes,
     extract::{Path, Query, State, WebSocketUpgrade},
@@ -12,14 +19,7 @@ use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
     Engine as _,
 };
-use livekit_integration::LiveKitConfig;
 use serde::{Deserialize, Serialize};
-use server_api::{
-    ensure_active_membership_in_channel, ensure_active_membership_in_guild, list_channels,
-    list_guilds, list_members, list_messages, mls_key_packages_route, mls_welcome_route,
-    send_message, ApiContext, KeyPackageResponse, MlsKeyPackageQuery, MlsWelcomeQuery,
-    MlsWelcomeResponse, UploadKeyPackageResponse,
-};
 use shared::{
     domain::{ChannelId, ChannelKind, FileId, GuildId, UserId},
     error::{ApiError, ErrorCode},
@@ -29,7 +29,9 @@ use storage::Storage;
 use tokio::sync::broadcast;
 use tracing::{error, info};
 
+mod api;
 mod config;
+mod livekit;
 
 use config::{load_settings, prepare_database_url};
 
@@ -44,7 +46,7 @@ struct LoginRequest {
     username: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct LoginResponse {
     user_id: i64,
 }
@@ -853,6 +855,45 @@ mod tests {
             .await
             .expect("body");
         assert_eq!(body.as_ref(), b"ok");
+    }
+
+    #[tokio::test]
+    async fn login_and_guild_channel_list_routes_work() {
+        let (app, _storage, _user_id, _guild_id, _channel_id) = test_app().await;
+
+        let login_request = Request::post("/login")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({ "username": "route-user" }).to_string(),
+            ))
+            .expect("request");
+        let login_response = app.clone().oneshot(login_request).await.expect("response");
+        assert_eq!(login_response.status(), StatusCode::OK);
+        let login_body = body::to_bytes(login_response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let dto: LoginResponse = serde_json::from_slice(&login_body).expect("json");
+
+        let guilds_request = Request::get(format!("/guilds?user_id={}", dto.user_id))
+            .body(Body::empty())
+            .expect("request");
+        let guilds_response = app.clone().oneshot(guilds_request).await.expect("response");
+        assert_eq!(guilds_response.status(), StatusCode::OK);
+        let guilds_body = body::to_bytes(guilds_response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let guilds: Vec<shared::protocol::GuildSummary> =
+            serde_json::from_slice(&guilds_body).expect("json");
+        assert!(!guilds.is_empty());
+
+        let channels_request = Request::get(format!(
+            "/guilds/{}/channels?user_id={}",
+            guilds[0].guild_id.0, dto.user_id
+        ))
+        .body(Body::empty())
+        .expect("request");
+        let channels_response = app.oneshot(channels_request).await.expect("response");
+        assert_eq!(channels_response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
