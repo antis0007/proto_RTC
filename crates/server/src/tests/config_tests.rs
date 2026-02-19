@@ -1,11 +1,9 @@
-use super::*;
+use super::{normalize_database_url, prepare_database_url};
 
 use std::{
-    env,
+    env, fs,
     time::{SystemTime, UNIX_EPOCH},
 };
-
-use super::*;
 
 #[test]
 fn normalizes_plain_file_path_to_sqlite_url() {
