@@ -1504,10 +1504,6 @@ impl DesktopGuiApp {
                     .unwrap_or(ui.visuals().panel_fill),
             )
             .show(ui, |ui| {
-                self.left_user_panel_height = self
-                    .left_user_panel_height
-                    .clamp(MIN_LEFT_USER_PANEL_HEIGHT, MAX_LEFT_USER_PANEL_HEIGHT);
-                ui.set_min_height(self.left_user_panel_height - 12.0);
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("●").color(egui::Color32::from_rgb(67, 181, 129)));
                     ui.strong(&self.username);
@@ -1624,24 +1620,542 @@ impl DesktopGuiApp {
         }
     }
 
-    fn show_main_workspace(&mut self, ctx: &egui::Context) {
-        const TOOLBAR_H_PADDING: f32 = 10.0;
-        const TOOLBAR_V_PADDING: f32 = 8.0;
-        const SECTION_VERTICAL_GAP: f32 = 8.0;
-        const TOP_BAR_H_PADDING: f32 = 0.0;
-        const TOP_BAR_V_PADDING: f32 = 0.0;
+    fn refresh_selected_guild_navigation(&mut self) {
+        if let Some(guild_id) = self.selected_guild {
+            queue_command(
+                &self.cmd_tx,
+                BackendCommand::ListChannels { guild_id },
+                &mut self.status,
+            );
+            queue_command(
+                &self.cmd_tx,
+                BackendCommand::ListMembers { guild_id },
+                &mut self.status,
+            );
+        } else {
+            self.status = "Select a guild first".to_string();
+        }
+    }
 
-        let top_bar_bg = theme_discord_dark_palette(self.theme)
+    fn show_channels_panel_header(
+        &mut self,
+        ui: &mut egui::Ui,
+        discord_dark: Option<DiscordDarkPalette>,
+    ) {
+        ui.horizontal(|ui| {
+            ui.heading("Channels");
+            let refresh_label = if let Some(palette) = discord_dark {
+                egui::RichText::new("Refresh").color(palette.side_panel_button_text)
+            } else {
+                egui::RichText::new("Refresh")
+            };
+            let refresh_button = self.sidebar_button(refresh_label, discord_dark);
+            if ui.add(refresh_button).clicked() {
+                self.refresh_selected_guild_navigation();
+            }
+        });
+    }
+
+    fn show_voice_channel_action(
+        &mut self,
+        ui: &mut egui::Ui,
+        discord_dark: Option<DiscordDarkPalette>,
+    ) {
+        if let Some(channel) = self.selected_voice_channel().cloned() {
+            ui.separator();
+            let connected_here = self.voice_ui.is_channel_connected(channel.channel_id);
+            let cta_label = if connected_here {
+                "Leave voice"
+            } else {
+                "Join voice"
+            };
+            let cta_text = if let Some(palette) = discord_dark {
+                egui::RichText::new(cta_label).color(palette.side_panel_button_text)
+            } else {
+                egui::RichText::new(cta_label)
+            };
+            let cta_button = self
+                .sidebar_button(cta_text, discord_dark)
+                .min_size(egui::vec2(ui.available_width(), 30.0));
+            if ui.add(cta_button).clicked() {
+                if connected_here {
+                    self.voice_ui.connection_status = VoiceSessionConnectionStatus::Disconnecting;
+                    queue_command(
+                        &self.cmd_tx,
+                        BackendCommand::DisconnectVoice,
+                        &mut self.status,
+                    );
+                } else {
+                    self.voice_ui.connection_status = VoiceSessionConnectionStatus::Connecting;
+                    self.voice_ui.last_error = None;
+                    queue_command(
+                        &self.cmd_tx,
+                        BackendCommand::ConnectVoice {
+                            guild_id: channel.guild_id,
+                            channel_id: channel.channel_id,
+                        },
+                        &mut self.status,
+                    );
+                }
+            }
+        }
+    }
+
+    fn main_workspace_style(&self, ctx: &egui::Context) -> MainWorkspaceStyle {
+        let mut layout = MainWorkspaceLayout::default();
+        if self.readability.compact_density {
+            layout.toolbar_h_padding = 8.0;
+            layout.toolbar_v_padding = 6.0;
+            layout.section_vertical_gap = 6.0;
+            layout.channel_row_height = 30.0;
+        }
+        let discord_dark = theme_discord_dark_palette(self.theme);
+        let colors = MainWorkspaceColors {
+            top_bar_bg: discord_dark
+                .map(|p| p.navigation_background)
+                .unwrap_or(ctx.style().visuals.panel_fill),
+            nav_bg: discord_dark
+                .map(|p| p.navigation_background)
+                .unwrap_or(ctx.style().visuals.panel_fill),
+            members_bg: discord_dark
+                .map(|p| p.members_background)
+                .unwrap_or(ctx.style().visuals.panel_fill),
+            message_bg: discord_dark
+                .map(|p| p.message_background)
+                .unwrap_or(ctx.style().visuals.panel_fill),
+        };
+
+        MainWorkspaceStyle {
+            layout,
+            colors,
+            discord_dark,
+        }
+    }
+
+    fn sidebar_button(
+        &self,
+        label: impl Into<egui::WidgetText>,
+        discord_dark: Option<DiscordDarkPalette>,
+    ) -> egui::Button<'static> {
+        let mut button = egui::Button::new(label);
+        if let Some(palette) = discord_dark {
+            button = button
+                .fill(palette.side_panel_button_fill)
+                .stroke(egui::Stroke::new(1.0, palette.guild_entry_stroke));
+        }
+        button
+    }
+
+    fn render_nav_row(
+        &self,
+        ui: &mut egui::Ui,
+        label: &str,
+        row_height: f32,
+        selected: bool,
+        discord_dark: Option<DiscordDarkPalette>,
+    ) -> egui::Response {
+        let base_bg = discord_dark
             .map(|p| p.navigation_background)
-            .unwrap_or(ctx.style().visuals.panel_fill);
+            .unwrap_or_else(|| {
+                if self.theme.list_row_shading {
+                    ui.visuals().faint_bg_color
+                } else {
+                    egui::Color32::TRANSPARENT
+                }
+            });
+        let selected_bg = discord_dark
+            .map(|p| p.guild_entry_active)
+            .unwrap_or_else(|| {
+                ui.visuals()
+                    .selection
+                    .bg_fill
+                    .gamma_multiply(if self.theme.list_row_shading {
+                        0.35
+                    } else {
+                        0.22
+                    })
+            });
+        let row_stroke = discord_dark
+            .map(|palette| {
+                egui::Stroke::new(
+                    1.0,
+                    if selected {
+                        palette.guild_entry_stroke_active
+                    } else {
+                        palette.guild_entry_stroke
+                    },
+                )
+            })
+            .unwrap_or_else(|| {
+                if selected {
+                    egui::Stroke::new(1.0, ui.visuals().selection.bg_fill.gamma_multiply(0.9))
+                } else if self.theme.list_row_shading {
+                    egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color)
+                } else {
+                    egui::Stroke::NONE
+                }
+            });
 
+        let (rect, response) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), row_height),
+            egui::Sense::click(),
+        );
+        let row_fill = if selected {
+            selected_bg
+        } else if response.hovered() {
+            discord_dark
+                .map(|p| p.guild_entry_hover)
+                .unwrap_or_else(|| ui.visuals().widgets.hovered.bg_fill)
+        } else {
+            base_bg
+        };
+
+        ui.painter().rect_filled(
+            rect,
+            egui::Rounding::same(f32::from(self.theme.panel_rounding)),
+            row_fill,
+        );
+        if row_stroke != egui::Stroke::NONE {
+            ui.painter().rect_stroke(
+                rect,
+                egui::Rounding::same(f32::from(self.theme.panel_rounding)),
+                row_stroke,
+            );
+        }
+
+        let text_color = if selected {
+            discord_dark
+                .map(|p| p.guild_text_highlighted)
+                .unwrap_or(ui.visuals().strong_text_color())
+        } else if response.hovered() {
+            discord_dark
+                .map(|p| p.guild_text_hovered)
+                .unwrap_or(ui.visuals().strong_text_color())
+        } else {
+            discord_dark
+                .map(|p| p.guild_text_unhighlighted)
+                .unwrap_or(ui.visuals().text_color())
+        };
+
+        ui.painter().text(
+            rect.left_center() + egui::vec2(10.0, 0.0),
+            egui::Align2::LEFT_CENTER,
+            label,
+            egui::TextStyle::Button.resolve(ui.style()),
+            text_color,
+        );
+
+        response
+    }
+
+    fn show_left_navigation_panel(&mut self, ctx: &egui::Context, style: MainWorkspaceStyle) {
+        let nav_width = style.layout.guilds_panel_width + style.layout.channels_panel_width + 24.0;
+        egui::SidePanel::left("left_navigation_panel")
+            .default_width(nav_width)
+            .frame(egui::Frame::none().fill(style.colors.nav_bg).inner_margin(
+                egui::Margin::symmetric(
+                    style.layout.toolbar_h_padding,
+                    style.layout.toolbar_v_padding,
+                ),
+            ))
+            .show(ctx, |ui| {
+                let discord_dark = style.discord_dark;
+
+                // Layout contract:
+                // 1) Top region holds guild + channel columns.
+                // 2) Bottom region holds user info and is never allowed to overlap top content.
+                egui::TopBottomPanel::bottom("left_nav_user_strip")
+                    .resizable(self.auth_session_established)
+                    .default_height(
+                        self.left_user_panel_height
+                            .clamp(MIN_LEFT_USER_PANEL_HEIGHT, MAX_LEFT_USER_PANEL_HEIGHT),
+                    )
+                    .min_height(MIN_LEFT_USER_PANEL_HEIGHT)
+                    .max_height(MAX_LEFT_USER_PANEL_HEIGHT)
+                    .show_inside(ui, |ui| {
+                        if self.auth_session_established {
+                            self.left_user_panel_height = ui
+                                .available_height()
+                                .clamp(MIN_LEFT_USER_PANEL_HEIGHT, MAX_LEFT_USER_PANEL_HEIGHT);
+                            self.render_left_user_panel(ui);
+                        }
+                    });
+
+                ui.add_space(style.layout.section_vertical_gap);
+
+                // Top navigation area: keep columns independent and scrollable.
+                ui.horizontal(|ui| {
+                    let guilds_width = style.layout.guilds_panel_width;
+
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(guilds_width, ui.available_height()),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            ui.heading("Guilds");
+                            ui.add_space(style.layout.section_vertical_gap);
+
+                            egui::ScrollArea::vertical()
+                                .id_source("left_nav_guilds_scroll")
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    ui.add_enabled_ui(self.auth_session_established, |ui| {
+                                        if let Some(guild_id) = self.selected_guild {
+                                            let label = if let Some(palette) = discord_dark {
+                                                egui::RichText::new("Create Invite")
+                                                    .color(palette.side_panel_button_text)
+                                            } else {
+                                                egui::RichText::new("Create Invite")
+                                            };
+                                            let invite_button = self
+                                                .sidebar_button(label, discord_dark)
+                                                .min_size(egui::vec2(ui.available_width(), 30.0));
+                                            if ui.add(invite_button).clicked() {
+                                                queue_command(
+                                                    &self.cmd_tx,
+                                                    BackendCommand::CreateInvite { guild_id },
+                                                    &mut self.status,
+                                                );
+                                            }
+                                            ui.add_space(8.0);
+                                        }
+
+                                        for guild in &self.guilds {
+                                            let selected =
+                                                self.selected_guild == Some(guild.guild_id);
+                                            let response = self.render_nav_row(
+                                                ui,
+                                                guild.name.as_str(),
+                                                style.layout.channel_row_height,
+                                                selected,
+                                                discord_dark,
+                                            );
+
+                                            if response.clicked() {
+                                                self.selected_guild = Some(guild.guild_id);
+                                                self.selected_channel = None;
+                                                self.channels.clear();
+                                                self.members.remove(&guild.guild_id);
+                                                queue_command(
+                                                    &self.cmd_tx,
+                                                    BackendCommand::ListChannels {
+                                                        guild_id: guild.guild_id,
+                                                    },
+                                                    &mut self.status,
+                                                );
+                                                queue_command(
+                                                    &self.cmd_tx,
+                                                    BackendCommand::ListMembers {
+                                                        guild_id: guild.guild_id,
+                                                    },
+                                                    &mut self.status,
+                                                );
+                                            }
+
+                                            ui.add_space(6.0);
+                                        }
+                                    });
+                                });
+
+                            if !self.auth_session_established {
+                                ui.separator();
+                                ui.add_space(4.0);
+                                ui.label("Sign in to access guilds.");
+                            }
+                        },
+                    );
+
+                    ui.separator();
+
+                    ui.allocate_ui_with_layout(
+                        ui.available_size(),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            self.show_channels_panel_header(ui, discord_dark);
+                            ui.add_space(style.layout.section_vertical_gap);
+
+                            egui::ScrollArea::vertical()
+                                .id_source("left_nav_channels_scroll")
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    ui.add_enabled_ui(self.auth_session_established, |ui| {
+                                        for index in 0..self.channels.len() {
+                                            let channel = &self.channels[index];
+                                            let channel_id = channel.channel_id;
+                                            let channel_kind = channel.kind;
+                                            let channel_name = channel.name.clone();
+                                            self.render_channel_row(
+                                                ui,
+                                                channel_id,
+                                                channel_kind,
+                                                &channel_name,
+                                                style.layout.channel_row_height,
+                                                discord_dark,
+                                            );
+                                        }
+                                        self.show_voice_channel_action(ui, discord_dark);
+                                    });
+
+                                    if !self.auth_session_established {
+                                        ui.separator();
+                                        ui.add_space(4.0);
+                                        ui.label("Sign in to browse channels.");
+                                    }
+                                });
+                        },
+                    );
+                });
+            });
+    }
+
+    fn render_channel_row(
+        &mut self,
+        ui: &mut egui::Ui,
+        channel_id: ChannelId,
+        kind: ChannelKind,
+        name: &str,
+        row_height: f32,
+        discord_dark: Option<DiscordDarkPalette>,
+    ) {
+        let icon = match kind {
+            ChannelKind::Text => "#",
+            ChannelKind::Voice => "🔊",
+        };
+        let selected = self.selected_channel == Some(channel_id);
+
+        let occupancy =
+            (kind == ChannelKind::Voice).then(|| self.voice_ui.occupancy_for_channel(channel_id));
+        let connection_hint = self
+            .voice_ui
+            .is_channel_connected(channel_id)
+            .then_some("connected");
+
+        let channel_label = match (occupancy, connection_hint) {
+            (Some(count), Some(hint)) => format!("{icon}  {name} ({count}) {hint}"),
+            (Some(count), None) => format!("{icon}  {name} ({count})"),
+            (None, _) => format!("{icon}  {name}"),
+        };
+        let response = self.render_nav_row(ui, &channel_label, row_height, selected, discord_dark);
+
+        if response.clicked() {
+            self.selected_channel = Some(channel_id);
+            if kind == ChannelKind::Voice {
+                self.voice_ui.selected_voice_channel = Some(channel_id);
+            }
+            queue_command(
+                &self.cmd_tx,
+                BackendCommand::SelectChannel { channel_id },
+                &mut self.status,
+            );
+        }
+
+        ui.add_space(6.0);
+    }
+
+    fn show_members_side_panel(&mut self, ctx: &egui::Context, style: MainWorkspaceStyle) {
+        egui::SidePanel::right("members_panel")
+            .default_width(style.layout.members_panel_width)
+            .show(ctx, |ui| {
+                egui::Frame::none()
+                    .fill(style.colors.members_bg)
+                    .inner_margin(egui::Margin::symmetric(
+                        style.layout.toolbar_h_padding,
+                        style.layout.toolbar_v_padding,
+                    ))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.heading("Members");
+                            if ui.button("Refresh").clicked() {
+                                if let Some(guild_id) = self.selected_guild {
+                                    queue_command(
+                                        &self.cmd_tx,
+                                        BackendCommand::ListMembers { guild_id },
+                                        &mut self.status,
+                                    );
+                                }
+                            }
+                        });
+                        ui.add_space(style.layout.section_vertical_gap);
+
+                        if let Some(guild_id) = self.selected_guild {
+                            if let Some(members) = self.members.get(&guild_id) {
+                                if members.is_empty() {
+                                    ui.label("No visible members in this guild yet.");
+                                } else {
+                                    for member in members {
+                                        let role_label = match member.role {
+                                            Role::Owner => "owner",
+                                            Role::Mod => "mod",
+                                            Role::Member => "member",
+                                        };
+                                        let mute_label =
+                                            if member.muted { " · 🔇 muted" } else { "" };
+                                        ui.label(format!(
+                                            "{} ({}){}",
+                                            member.username, role_label, mute_label
+                                        ));
+                                    }
+                                }
+                            } else {
+                                ui.label("Loading members for selected guild…");
+                            }
+                        } else {
+                            ui.label("Select a guild to view members.");
+                        }
+
+                        ui.separator();
+                        ui.add_space(style.layout.section_vertical_gap);
+                        ui.heading("Voice");
+                        ui.add_space(4.0);
+                        let (badge_text, badge_color) = self.voice_status_badge();
+                        ui.colored_label(badge_color, format!("Status: {badge_text}"));
+
+                        if let Some(channel) = self.selected_voice_channel() {
+                            ui.label(format!("Selected: {}", channel.name));
+                            ui.small(format!(
+                                "Occupancy: {} participant(s)",
+                                self.voice_ui.occupancy_for_channel(channel.channel_id)
+                            ));
+                        }
+
+                        if let Some(active) = &self.voice_ui.active_session {
+                            let active_name = self
+                                .channels
+                                .iter()
+                                .find(|channel| channel.channel_id == active.channel_id)
+                                .map(|channel| channel.name.as_str())
+                                .unwrap_or("Unknown voice channel");
+                            ui.label(format!("Connected channel: {active_name}"));
+                            ui.label(format!(
+                                "Participants: {}",
+                                self.voice_ui.active_participant_count()
+                            ));
+                            ui.horizontal_wrapped(|ui| {
+                                ui.toggle_value(&mut self.voice_ui.muted, "Mute");
+                                ui.toggle_value(&mut self.voice_ui.deafened, "Deafen");
+                            });
+                        } else {
+                            ui.label("Not connected to voice.");
+                        }
+
+                        if let Some(err) = &self.voice_ui.last_error {
+                            ui.add_space(4.0);
+                            ui.colored_label(
+                                egui::Color32::RED,
+                                format!("Last voice error: {err}"),
+                            );
+                        }
+                    });
+            });
+    }
+
+    fn show_top_bar(&mut self, ctx: &egui::Context, style: MainWorkspaceStyle) {
         egui::TopBottomPanel::top("top_bar")
             .frame(
                 egui::Frame::none()
-                    .fill(top_bar_bg)
+                    .fill(style.colors.top_bar_bg)
                     .inner_margin(egui::Margin::symmetric(
-                        TOP_BAR_H_PADDING,
-                        TOP_BAR_V_PADDING,
+                        style.layout.top_bar_h_padding,
+                        style.layout.top_bar_v_padding,
                     )),
             )
             .show(ctx, |ui| {
@@ -1745,537 +2259,18 @@ impl DesktopGuiApp {
                 ui.label(&self.status);
                 self.show_status_banner(ui);
             });
+    }
+
+    fn show_main_workspace(&mut self, ctx: &egui::Context) {
+        let style = self.main_workspace_style(ctx);
+
+        self.show_top_bar(ctx, style);
 
         self.show_settings_window(ctx);
 
-        let nav_bg = theme_discord_dark_palette(self.theme)
-            .map(|p| p.navigation_background)
-            .unwrap_or(ctx.style().visuals.panel_fill);
+        self.show_left_navigation_panel(ctx, style);
 
-        egui::SidePanel::left("guilds_panel")
-            .default_width(160.0)
-            .frame(
-                egui::Frame::none()
-                    .fill(nav_bg)
-                    .inner_margin(egui::Margin::symmetric(
-                        TOOLBAR_H_PADDING,
-                        TOOLBAR_V_PADDING,
-                    )),
-            )
-            .show(ctx, |ui| {
-                ui.heading("Guilds");
-                let discord_dark = theme_discord_dark_palette(self.theme);
-                ui.add_space(SECTION_VERTICAL_GAP);
-
-                ui.add_enabled_ui(self.auth_session_established, |ui| {
-                    if let Some(guild_id) = self.selected_guild {
-                        let label = if let Some(palette) = discord_dark {
-                            egui::RichText::new("Create Invite")
-                                .color(palette.side_panel_button_text)
-                        } else {
-                            egui::RichText::new("Create Invite")
-                        };
-                        let mut invite_button = egui::Button::new(label)
-                            .min_size(egui::vec2(ui.available_width(), 30.0));
-                        if let Some(palette) = discord_dark {
-                            invite_button = invite_button
-                                .fill(palette.side_panel_button_fill)
-                                .stroke(egui::Stroke::new(1.0, palette.guild_entry_stroke));
-                        }
-                        if ui.add(invite_button).clicked() {
-                            queue_command(
-                                &self.cmd_tx,
-                                BackendCommand::CreateInvite { guild_id },
-                                &mut self.status,
-                            );
-                        }
-                        ui.add_space(8.0);
-                    }
-
-                    for guild in &self.guilds {
-                        let selected = self.selected_guild == Some(guild.guild_id);
-                        let base_bg = discord_dark
-                            .map(|p| p.navigation_background)
-                            .unwrap_or_else(|| {
-                                if self.theme.list_row_shading {
-                                    ui.visuals().faint_bg_color
-                                } else {
-                                    egui::Color32::TRANSPARENT
-                                }
-                            });
-                        let selected_bg = discord_dark
-                            .map(|p| p.guild_entry_active)
-                            .unwrap_or_else(|| {
-                                ui.visuals().selection.bg_fill.gamma_multiply(
-                                    if self.theme.list_row_shading {
-                                        0.35
-                                    } else {
-                                        0.22
-                                    },
-                                )
-                            });
-
-                        let row_stroke = discord_dark
-                            .map(|palette| {
-                                egui::Stroke::new(
-                                    1.0,
-                                    if selected {
-                                        palette.guild_entry_stroke_active
-                                    } else {
-                                        palette.guild_entry_stroke
-                                    },
-                                )
-                            })
-                            .unwrap_or_else(|| {
-                                if selected {
-                                    egui::Stroke::new(
-                                        1.0,
-                                        ui.visuals().selection.bg_fill.gamma_multiply(0.9),
-                                    )
-                                } else if self.theme.list_row_shading {
-                                    egui::Stroke::new(
-                                        1.0,
-                                        ui.visuals().widgets.noninteractive.bg_stroke.color,
-                                    )
-                                } else {
-                                    egui::Stroke::NONE
-                                }
-                            });
-
-                        let (rect, response) = ui.allocate_exact_size(
-                            egui::vec2(ui.available_width(), 34.0),
-                            egui::Sense::click(),
-                        );
-
-                        let row_fill = if selected {
-                            selected_bg
-                        } else if response.hovered() {
-                            discord_dark
-                                .map(|p| p.guild_entry_hover)
-                                .unwrap_or_else(|| ui.visuals().widgets.hovered.bg_fill)
-                        } else {
-                            base_bg
-                        };
-
-                        ui.painter().rect_filled(
-                            rect,
-                            egui::Rounding::same(f32::from(self.theme.panel_rounding)),
-                            row_fill,
-                        );
-                        if row_stroke != egui::Stroke::NONE {
-                            ui.painter().rect_stroke(
-                                rect,
-                                egui::Rounding::same(f32::from(self.theme.panel_rounding)),
-                                row_stroke,
-                            );
-                        }
-
-                        let text_color = if selected {
-                            discord_dark
-                                .map(|p| p.guild_text_highlighted)
-                                .unwrap_or(ui.visuals().strong_text_color())
-                        } else if response.hovered() {
-                            discord_dark
-                                .map(|p| p.guild_text_hovered)
-                                .unwrap_or(ui.visuals().strong_text_color())
-                        } else {
-                            discord_dark
-                                .map(|p| p.guild_text_unhighlighted)
-                                .unwrap_or(ui.visuals().text_color())
-                        };
-
-                        ui.painter().text(
-                            rect.left_center() + egui::vec2(10.0, 0.0),
-                            egui::Align2::LEFT_CENTER,
-                            guild.name.as_str(),
-                            egui::TextStyle::Button.resolve(ui.style()),
-                            text_color,
-                        );
-
-                        if response.clicked() {
-                            self.selected_guild = Some(guild.guild_id);
-                            self.selected_channel = None;
-                            self.channels.clear();
-                            self.members.remove(&guild.guild_id);
-                            queue_command(
-                                &self.cmd_tx,
-                                BackendCommand::ListChannels {
-                                    guild_id: guild.guild_id,
-                                },
-                                &mut self.status,
-                            );
-                            queue_command(
-                                &self.cmd_tx,
-                                BackendCommand::ListMembers {
-                                    guild_id: guild.guild_id,
-                                },
-                                &mut self.status,
-                            );
-                        }
-
-                        ui.add_space(6.0);
-                    }
-                });
-
-                if !self.auth_session_established {
-                    ui.separator();
-                    ui.add_space(4.0);
-                    ui.label("Sign in to access guilds.");
-                }
-            });
-
-        egui::SidePanel::left("channels_panel")
-            .default_width(260.0)
-            .frame(
-                egui::Frame::none()
-                    .fill(nav_bg)
-                    .inner_margin(egui::Margin::symmetric(
-                        TOOLBAR_H_PADDING,
-                        TOOLBAR_V_PADDING,
-                    )),
-            )
-            .show(ctx, |ui| {
-                let discord_dark = theme_discord_dark_palette(self.theme);
-                ui.horizontal(|ui| {
-                    ui.heading("Channels");
-                    let refresh_label = if let Some(palette) = discord_dark {
-                        egui::RichText::new("Refresh").color(palette.side_panel_button_text)
-                    } else {
-                        egui::RichText::new("Refresh")
-                    };
-                    let mut refresh_button = egui::Button::new(refresh_label);
-                    if let Some(palette) = discord_dark {
-                        refresh_button = refresh_button
-                            .fill(palette.side_panel_button_fill)
-                            .stroke(egui::Stroke::new(1.0, palette.guild_entry_stroke));
-                    }
-                    if ui.add(refresh_button).clicked() {
-                        if let Some(guild_id) = self.selected_guild {
-                            queue_command(
-                                &self.cmd_tx,
-                                BackendCommand::ListChannels { guild_id },
-                                &mut self.status,
-                            );
-                            queue_command(
-                                &self.cmd_tx,
-                                BackendCommand::ListMembers { guild_id },
-                                &mut self.status,
-                            );
-                        } else {
-                            self.status = "Select a guild first".to_string();
-                        }
-                    }
-                });
-                ui.add_space(SECTION_VERTICAL_GAP);
-
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        ui.add_enabled_ui(self.auth_session_established, |ui| {
-                            for channel in &self.channels {
-                                let icon = match channel.kind {
-                                    ChannelKind::Text => "#",
-                                    ChannelKind::Voice => "🔊",
-                                };
-                                let selected = self.selected_channel == Some(channel.channel_id);
-                                let discord_dark = theme_discord_dark_palette(self.theme);
-
-                                let base_bg = discord_dark
-                                    .map(|p| p.navigation_background)
-                                    .unwrap_or_else(|| {
-                                        if self.theme.list_row_shading {
-                                            ui.visuals().faint_bg_color
-                                        } else {
-                                            egui::Color32::TRANSPARENT
-                                        }
-                                    });
-                                let selected_bg = discord_dark
-                                    .map(|p| p.guild_entry_active)
-                                    .unwrap_or_else(|| {
-                                        ui.visuals().selection.bg_fill.gamma_multiply(
-                                            if self.theme.list_row_shading {
-                                                0.35
-                                            } else {
-                                                0.22
-                                            },
-                                        )
-                                    });
-                                let row_stroke = discord_dark
-                                    .map(|palette| {
-                                        egui::Stroke::new(
-                                            1.0,
-                                            if selected {
-                                                palette.guild_entry_stroke_active
-                                            } else {
-                                                palette.guild_entry_stroke
-                                            },
-                                        )
-                                    })
-                                    .unwrap_or_else(|| {
-                                        if selected {
-                                            egui::Stroke::new(
-                                                1.0,
-                                                ui.visuals().selection.bg_fill.gamma_multiply(0.9),
-                                            )
-                                        } else if self.theme.list_row_shading {
-                                            egui::Stroke::new(
-                                                1.0,
-                                                ui.visuals().widgets.noninteractive.bg_stroke.color,
-                                            )
-                                        } else {
-                                            egui::Stroke::NONE
-                                        }
-                                    });
-
-                                let occupancy = if channel.kind == ChannelKind::Voice {
-                                    Some(self.voice_ui.occupancy_for_channel(channel.channel_id))
-                                } else {
-                                    None
-                                };
-                                let connection_hint =
-                                    if self.voice_ui.is_channel_connected(channel.channel_id) {
-                                        Some("connected")
-                                    } else {
-                                        None
-                                    };
-
-                                let (rect, response) = ui.allocate_exact_size(
-                                    egui::vec2(ui.available_width(), 36.0),
-                                    egui::Sense::click(),
-                                );
-
-                                let row_fill = if selected {
-                                    selected_bg
-                                } else if response.hovered() {
-                                    discord_dark
-                                        .map(|p| p.guild_entry_hover)
-                                        .unwrap_or_else(|| ui.visuals().widgets.hovered.bg_fill)
-                                } else {
-                                    base_bg
-                                };
-
-                                ui.painter().rect_filled(
-                                    rect,
-                                    egui::Rounding::same(f32::from(self.theme.panel_rounding)),
-                                    row_fill,
-                                );
-                                if row_stroke != egui::Stroke::NONE {
-                                    ui.painter().rect_stroke(
-                                        rect,
-                                        egui::Rounding::same(f32::from(self.theme.panel_rounding)),
-                                        row_stroke,
-                                    );
-                                }
-
-                                let text_color = if selected {
-                                    discord_dark
-                                        .map(|p| p.guild_text_highlighted)
-                                        .unwrap_or(ui.visuals().strong_text_color())
-                                } else if response.hovered() {
-                                    discord_dark
-                                        .map(|p| p.guild_text_hovered)
-                                        .unwrap_or(ui.visuals().strong_text_color())
-                                } else {
-                                    discord_dark
-                                        .map(|p| p.guild_text_unhighlighted)
-                                        .unwrap_or(ui.visuals().text_color())
-                                };
-
-                                let channel_label = match (occupancy, connection_hint) {
-                                    (Some(count), Some(hint)) => {
-                                        format!("{icon}  {} ({count}) {hint}", channel.name)
-                                    }
-                                    (Some(count), None) => {
-                                        format!("{icon}  {} ({count})", channel.name)
-                                    }
-                                    (None, _) => format!("{icon}  {}", channel.name),
-                                };
-
-                                ui.painter().text(
-                                    rect.left_center() + egui::vec2(10.0, 0.0),
-                                    egui::Align2::LEFT_CENTER,
-                                    channel_label,
-                                    egui::TextStyle::Button.resolve(ui.style()),
-                                    text_color,
-                                );
-
-                                if response.clicked() {
-                                    self.selected_channel = Some(channel.channel_id);
-                                    if channel.kind == ChannelKind::Voice {
-                                        self.voice_ui.selected_voice_channel =
-                                            Some(channel.channel_id);
-                                    }
-                                    queue_command(
-                                        &self.cmd_tx,
-                                        BackendCommand::SelectChannel {
-                                            channel_id: channel.channel_id,
-                                        },
-                                        &mut self.status,
-                                    );
-                                }
-
-                                ui.add_space(6.0);
-                            }
-
-                            if let Some(channel) = self.selected_voice_channel().cloned() {
-                                ui.separator();
-                                let connected_here =
-                                    self.voice_ui.is_channel_connected(channel.channel_id);
-                                let cta_label = if connected_here {
-                                    "Leave voice"
-                                } else {
-                                    "Join voice"
-                                };
-                                let cta_text = if let Some(palette) = discord_dark {
-                                    egui::RichText::new(cta_label)
-                                        .color(palette.side_panel_button_text)
-                                } else {
-                                    egui::RichText::new(cta_label)
-                                };
-                                let mut cta_button = egui::Button::new(cta_text)
-                                    .min_size(egui::vec2(ui.available_width(), 30.0));
-                                if let Some(palette) = discord_dark {
-                                    cta_button = cta_button
-                                        .fill(palette.side_panel_button_fill)
-                                        .stroke(egui::Stroke::new(1.0, palette.guild_entry_stroke));
-                                }
-                                if ui.add(cta_button).clicked() {
-                                    if connected_here {
-                                        self.voice_ui.connection_status =
-                                            VoiceSessionConnectionStatus::Disconnecting;
-                                        queue_command(
-                                            &self.cmd_tx,
-                                            BackendCommand::DisconnectVoice,
-                                            &mut self.status,
-                                        );
-                                    } else {
-                                        self.voice_ui.connection_status =
-                                            VoiceSessionConnectionStatus::Connecting;
-                                        self.voice_ui.last_error = None;
-                                        queue_command(
-                                            &self.cmd_tx,
-                                            BackendCommand::ConnectVoice {
-                                                guild_id: channel.guild_id,
-                                                channel_id: channel.channel_id,
-                                            },
-                                            &mut self.status,
-                                        );
-                                    }
-                                }
-                            }
-                        });
-
-                        if !self.auth_session_established {
-                            ui.separator();
-                            ui.add_space(4.0);
-                            ui.label("Sign in to browse channels.");
-                        }
-                    });
-
-                if self.auth_session_established {
-                    ui.separator();
-                    ui.add_space(SECTION_VERTICAL_GAP);
-                    self.render_left_user_panel(ui);
-                }
-            });
-
-        egui::SidePanel::right("members_panel")
-            .default_width(260.0)
-            .show(ctx, |ui| {
-                let members_bg = theme_discord_dark_palette(self.theme)
-                    .map(|p| p.members_background)
-                    .unwrap_or(ui.visuals().panel_fill);
-                egui::Frame::none()
-                    .fill(members_bg)
-                    .inner_margin(egui::Margin::symmetric(
-                        TOOLBAR_H_PADDING,
-                        TOOLBAR_V_PADDING,
-                    ))
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.heading("Members");
-                            if ui.button("Refresh").clicked() {
-                                if let Some(guild_id) = self.selected_guild {
-                                    queue_command(
-                                        &self.cmd_tx,
-                                        BackendCommand::ListMembers { guild_id },
-                                        &mut self.status,
-                                    );
-                                }
-                            }
-                        });
-                        ui.add_space(SECTION_VERTICAL_GAP);
-
-                        if let Some(guild_id) = self.selected_guild {
-                            if let Some(members) = self.members.get(&guild_id) {
-                                if members.is_empty() {
-                                    ui.label("No visible members in this guild yet.");
-                                } else {
-                                    for member in members {
-                                        let role_label = match member.role {
-                                            Role::Owner => "owner",
-                                            Role::Mod => "mod",
-                                            Role::Member => "member",
-                                        };
-                                        let mute_label =
-                                            if member.muted { " · 🔇 muted" } else { "" };
-                                        ui.label(format!(
-                                            "{} ({}){}",
-                                            member.username, role_label, mute_label
-                                        ));
-                                    }
-                                }
-                            } else {
-                                ui.label("Loading members for selected guild…");
-                            }
-                        } else {
-                            ui.label("Select a guild to view members.");
-                        }
-
-                        ui.separator();
-                        ui.add_space(SECTION_VERTICAL_GAP);
-                        ui.heading("Voice");
-                        ui.add_space(4.0);
-                        let (badge_text, badge_color) = self.voice_status_badge();
-                        ui.colored_label(badge_color, format!("Status: {badge_text}"));
-
-                        if let Some(channel) = self.selected_voice_channel() {
-                            ui.label(format!("Selected: {}", channel.name));
-                            ui.small(format!(
-                                "Occupancy: {} participant(s)",
-                                self.voice_ui.occupancy_for_channel(channel.channel_id)
-                            ));
-                        }
-
-                        if let Some(active) = &self.voice_ui.active_session {
-                            let active_name = self
-                                .channels
-                                .iter()
-                                .find(|channel| channel.channel_id == active.channel_id)
-                                .map(|channel| channel.name.as_str())
-                                .unwrap_or("Unknown voice channel");
-                            ui.label(format!("Connected channel: {active_name}"));
-                            ui.label(format!(
-                                "Participants: {}",
-                                self.voice_ui.active_participant_count()
-                            ));
-                            ui.horizontal_wrapped(|ui| {
-                                ui.toggle_value(&mut self.voice_ui.muted, "Mute");
-                                ui.toggle_value(&mut self.voice_ui.deafened, "Deafen");
-                            });
-                        } else {
-                            ui.label("Not connected to voice.");
-                        }
-
-                        if let Some(err) = &self.voice_ui.last_error {
-                            ui.add_space(4.0);
-                            ui.colored_label(
-                                egui::Color32::RED,
-                                format!("Last voice error: {err}"),
-                            );
-                        }
-                    });
-            });
+        self.show_members_side_panel(ctx, style);
 
         egui::TopBottomPanel::bottom("composer_panel")
             .resizable(true)
@@ -2283,8 +2278,7 @@ impl DesktopGuiApp {
             .min_height(MIN_COMPOSER_PANEL_HEIGHT)
             .show(ctx, |ui| {
                 self.composer_panel_height = ui
-                    .max_rect()
-                    .height()
+                    .available_height()
                     .clamp(MIN_COMPOSER_PANEL_HEIGHT, MAX_COMPOSER_PANEL_HEIGHT);
 
                 ui.add_space(6.0);
@@ -2403,15 +2397,12 @@ impl DesktopGuiApp {
                 ui.add_space(4.0);
             });
 
-        let message_panel_bg = theme_discord_dark_palette(self.theme)
-            .map(|p| p.message_background)
-            .unwrap_or(ctx.style().visuals.panel_fill);
         egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(message_panel_bg).inner_margin(
-                egui::Margin::symmetric(0.0, TOOLBAR_V_PADDING),
+            .frame(egui::Frame::none().fill(style.colors.message_bg).inner_margin(
+                egui::Margin::symmetric(0.0, style.layout.toolbar_v_padding),
             ))
             .show(ctx, |ui| {
-                ui.add_space(TOOLBAR_H_PADDING);
+                ui.add_space(style.layout.toolbar_h_padding);
                 ui.horizontal(|ui| {
                     ui.heading("Messages");
                     if let Some(channel_id) = self.selected_channel {
@@ -2426,12 +2417,12 @@ impl DesktopGuiApp {
                         }
                     }
                 });
-                ui.add_space(SECTION_VERTICAL_GAP);
+                ui.add_space(style.layout.section_vertical_gap);
                 ui.separator();
                 ui.add_space(2.0);
 
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    ui.add_space(TOOLBAR_H_PADDING);
+                    ui.add_space(style.layout.toolbar_h_padding);
                     let mut hovered_message = None;
                     if let Some(channel_id) = self.selected_channel {
                         if let Some(messages) = self.messages.get(&channel_id).cloned() {
@@ -2874,6 +2865,50 @@ struct DiscordDarkPalette {
     side_panel_button_text: egui::Color32,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct MainWorkspaceLayout {
+    guilds_panel_width: f32,
+    channels_panel_width: f32,
+    members_panel_width: f32,
+    channel_row_height: f32,
+    toolbar_h_padding: f32,
+    toolbar_v_padding: f32,
+    section_vertical_gap: f32,
+    top_bar_h_padding: f32,
+    top_bar_v_padding: f32,
+}
+
+impl Default for MainWorkspaceLayout {
+    fn default() -> Self {
+        Self {
+            guilds_panel_width: 72.0,
+            channels_panel_width: 240.0,
+            members_panel_width: 240.0,
+            channel_row_height: 34.0,
+            toolbar_h_padding: 10.0,
+            toolbar_v_padding: 8.0,
+            section_vertical_gap: 8.0,
+            top_bar_h_padding: 0.0,
+            top_bar_v_padding: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MainWorkspaceColors {
+    top_bar_bg: egui::Color32,
+    nav_bg: egui::Color32,
+    members_bg: egui::Color32,
+    message_bg: egui::Color32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MainWorkspaceStyle {
+    layout: MainWorkspaceLayout,
+    colors: MainWorkspaceColors,
+    discord_dark: Option<DiscordDarkPalette>,
+}
+
 fn theme_discord_dark_palette(theme: ThemeSettings) -> Option<DiscordDarkPalette> {
     (theme.preset == ThemePreset::DiscordDark).then_some({
         DiscordDarkPalette {
@@ -2971,7 +3006,11 @@ impl eframe::App for DesktopGuiApp {
             AppViewState::Main => self.show_main_workspace(ctx),
         }
 
-        ctx.request_repaint();
+        if self.voice_ui.active_session.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        } else {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
