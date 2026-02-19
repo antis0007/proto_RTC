@@ -846,6 +846,16 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
                                 if let Err(err) = client.emit_decrypted_message(message).await {
                                     let _ = client.events.send(ClientEvent::Error(err.to_string()));
                                 }
+                            } else if let ServerEvent::GuildMembersUpdated { guild_id, .. } =
+                                event.clone()
+                            {
+                                if let Err(err) = client.reconcile_mls_state_for_guild(guild_id).await {
+                                    let _ = client.events.send(ClientEvent::Error(format!(
+                                        "failed to reconcile MLS state for guild {} after membership update: {err}",
+                                        guild_id.0
+                                    )));
+                                }
+                                let _ = client.events.send(ClientEvent::Server(event));
                             } else {
                                 let _ = client.events.send(ClientEvent::Server(event));
                             }
@@ -1554,6 +1564,30 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
 
         Ok(())
     }
+
+    async fn reconcile_mls_state_for_guild(&self, guild_id: GuildId) -> Result<()> {
+        let (server_url, user_id) = self.session().await?;
+        let channels: Vec<ChannelSummary> = self
+            .http
+            .get(format!("{server_url}/guilds/{}/channels", guild_id.0))
+            .query(&[("user_id", user_id)])
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+
+        {
+            let mut guard = self.inner.lock().await;
+            for channel in &channels {
+                guard
+                    .channel_guilds
+                    .insert(channel.channel_id, channel.guild_id);
+            }
+        }
+
+        self.prewarm_mls_for_guild_channels(guild_id, &channels).await
+    }
 }
 
 #[async_trait]
@@ -1805,6 +1839,7 @@ impl<C: CryptoProvider + 'static> ClientHandle for Arc<RealtimeClient<C>> {
 
         if let Some(guild_id) = RealtimeClient::<C>::guild_id_from_invite(invite_code) {
             self.upload_key_package_for_guild(guild_id).await?;
+            let _ = self.reconcile_mls_state_for_guild(guild_id).await;
         }
 
         Ok(())
