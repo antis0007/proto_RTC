@@ -211,9 +211,29 @@ impl MlsSessionManager for DurableMlsSessionManager {
         })
     }
 
-    async fn join_from_welcome(&self, channel_id: ChannelId, welcome_bytes: &[u8]) -> Result<()> {
-        let key = self.key_for_channel(channel_id).await?;
+    async fn join_from_welcome(
+        &self,
+        guild_id: GuildId,
+        channel_id: ChannelId,
+        welcome_bytes: &[u8],
+    ) -> Result<()> {
+        self.channel_index.lock().await.insert(channel_id, guild_id);
+        let key = (guild_id, channel_id);
         let mut sessions = self.sessions.lock().await;
+        if !sessions.contains_key(&key) {
+            let identity = self.load_or_create_identity().await?;
+            let handle = MlsGroupHandle::new(
+                self.store.clone(),
+                self.user_id,
+                self.device_id.clone(),
+                guild_id,
+                channel_id,
+                identity,
+            )
+            .await?;
+            sessions.insert(key, handle);
+        }
+
         let handle = sessions.get_mut(&key).ok_or_else(|| {
             anyhow!(
                 "MLS session missing for guild {} channel {}",
@@ -221,6 +241,7 @@ impl MlsSessionManager for DurableMlsSessionManager {
                 key.1 .0
             )
         })?;
+        let _ = handle.key_package_bytes()?;
         handle.join_group_from_welcome(welcome_bytes).await
     }
 

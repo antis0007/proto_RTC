@@ -103,7 +103,12 @@ pub trait MlsSessionManager: Send + Sync {
         channel_id: ChannelId,
         key_package_bytes: &[u8],
     ) -> Result<MlsAddMemberOutcome>;
-    async fn join_from_welcome(&self, channel_id: ChannelId, welcome_bytes: &[u8]) -> Result<()>;
+    async fn join_from_welcome(
+        &self,
+        guild_id: GuildId,
+        channel_id: ChannelId,
+        welcome_bytes: &[u8],
+    ) -> Result<()>;
     async fn export_secret(
         &self,
         channel_id: ChannelId,
@@ -179,7 +184,12 @@ impl MlsSessionManager for MissingMlsSessionManager {
         ))
     }
 
-    async fn join_from_welcome(&self, channel_id: ChannelId, _welcome_bytes: &[u8]) -> Result<()> {
+    async fn join_from_welcome(
+        &self,
+        _guild_id: GuildId,
+        channel_id: ChannelId,
+        _welcome_bytes: &[u8],
+    ) -> Result<()> {
         Err(anyhow!(
             "no active MLS group available for channel {}",
             channel_id.0
@@ -1039,7 +1049,7 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
             .open_or_create_group(guild_id, channel_id)
             .await?;
         self.mls_session_manager
-            .join_from_welcome(channel_id, &welcome_bytes)
+            .join_from_welcome(guild_id, channel_id, &welcome_bytes)
             .await?;
         self.inner
             .lock()
