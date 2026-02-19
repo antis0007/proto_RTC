@@ -1688,14 +1688,12 @@ impl<C: CryptoProvider + 'static> ClientHandle for Arc<RealtimeClient<C>> {
         let initialized = self
             .ensure_mls_channel_initialized(guild_id, channel_id)
             .await?;
-        if !initialized {
-            if !user_is_moderator {
-                return Err(anyhow!(
-                    "MLS state for guild {} channel {} is uninitialized; wait for a moderator bootstrap or retry after welcome sync",
-                    guild_id.0,
-                    channel_id.0
-                ));
-            }
+        if !initialized && !user_is_moderator {
+            return Err(anyhow!(
+                "MLS state for guild {} channel {} is uninitialized; wait for a moderator bootstrap or retry after welcome sync",
+                guild_id.0,
+                channel_id.0
+            ));
         }
 
         self.fetch_messages(channel_id, 100, None).await?;
