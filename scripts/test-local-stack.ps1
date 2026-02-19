@@ -136,12 +136,12 @@ try {
   $client2 = if ($env:CLIENT2_USERNAME) { $env:CLIENT2_USERNAME } else { 'local-user-2' }
 
   $login1File = Join-Path $ArtifactDir 'client1-login.json'
-  $login1 = Invoke-ApiRequest -Method 'POST' -Uri "$($env:SERVER_PUBLIC_URL)/login" -ExpectedStatus 200 -OutFile $login1File -Body (@{ username = $client1 } | ConvertTo-Json -Compress) -ContentType 'application/json'
+  Invoke-ApiRequest -Method 'POST' -Uri "$($env:SERVER_PUBLIC_URL)/login" -ExpectedStatus 200 -OutFile $login1File -Body (@{ username = $client1 } | ConvertTo-Json -Compress) -ContentType 'application/json' | Out-Null
   $user1Id = ((Get-Content $login1File -Raw) | ConvertFrom-Json).user_id
   Write-ClientLog -Path $Client1Log -Message "[OK] client1 login user_id=$user1Id"
 
   $login2File = Join-Path $ArtifactDir 'client2-login.json'
-  $login2 = Invoke-ApiRequest -Method 'POST' -Uri "$($env:SERVER_PUBLIC_URL)/login" -ExpectedStatus 200 -OutFile $login2File -Body (@{ username = $client2 } | ConvertTo-Json -Compress) -ContentType 'application/json'
+  Invoke-ApiRequest -Method 'POST' -Uri "$($env:SERVER_PUBLIC_URL)/login" -ExpectedStatus 200 -OutFile $login2File -Body (@{ username = $client2 } | ConvertTo-Json -Compress) -ContentType 'application/json' | Out-Null
   $user2Id = ((Get-Content $login2File -Raw) | ConvertFrom-Json).user_id
   Write-ClientLog -Path $Client2Log -Message "[OK] client2 login user_id=$user2Id"
   Write-RunOk -Step 'two-user login'
