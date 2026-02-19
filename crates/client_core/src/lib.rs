@@ -1236,24 +1236,30 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
             .ensure_mls_channel_initialized(guild_id, channel_id)
             .await?
         {
-            return Err(anyhow!(
-                "MLS state for guild {} channel {} is uninitialized; wait for welcome sync before sending",
-                guild_id.0,
-                channel_id.0
-            ));
-        }
-
-        if let Ok(members) = self.fetch_members_for_guild(guild_id).await {
-            let current_role = members
-                .iter()
-                .find(|member| member.user_id.0 == user_id)
-                .map(|member| member.role);
+            let current_role = match self.fetch_members_for_guild(guild_id).await {
+                Ok(members) => members
+                    .iter()
+                    .find(|member| member.user_id.0 == user_id)
+                    .map(|member| member.role),
+                Err(_) => None,
+            };
             if matches!(
                 current_role,
                 Some(shared::domain::Role::Owner | shared::domain::Role::Mod)
             ) {
                 self.maybe_add_existing_members_to_channel_group(guild_id, channel_id)
                     .await?;
+            }
+
+            if !self
+                .ensure_mls_channel_initialized(guild_id, channel_id)
+                .await?
+            {
+                return Err(anyhow!(
+                    "MLS state for guild {} channel {} is uninitialized; wait for welcome sync before sending",
+                    guild_id.0,
+                    channel_id.0
+                ));
             }
         }
 
