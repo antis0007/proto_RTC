@@ -1848,26 +1848,15 @@ impl DesktopGuiApp {
         response
     }
 
-    fn show_channels_side_panel(
-        &mut self,
-        ctx: &egui::Context,
-        nav_bg: egui::Color32,
-        panel_width: f32,
-        channel_row_height: f32,
-        toolbar_h_padding: f32,
-        toolbar_v_padding: f32,
-        section_vertical_gap: f32,
-    ) {
+    fn show_channels_side_panel(&mut self, ctx: &egui::Context, style: MainWorkspaceStyle) {
         egui::SidePanel::left("channels_panel")
-            .default_width(panel_width)
-            .frame(
-                egui::Frame::none()
-                    .fill(nav_bg)
-                    .inner_margin(egui::Margin::symmetric(
-                        toolbar_h_padding,
-                        toolbar_v_padding,
-                    )),
-            )
+            .default_width(style.layout.channels_panel_width)
+            .frame(egui::Frame::none().fill(style.colors.nav_bg).inner_margin(
+                egui::Margin::symmetric(
+                    style.layout.toolbar_h_padding,
+                    style.layout.toolbar_v_padding,
+                ),
+            ))
             .show(ctx, |ui| {
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
                     if self.auth_session_established {
@@ -1887,12 +1876,12 @@ impl DesktopGuiApp {
                         self.left_user_panel_height = user_panel_height
                             .clamp(MIN_LEFT_USER_PANEL_HEIGHT, MAX_LEFT_USER_PANEL_HEIGHT);
                         ui.separator();
-                        ui.add_space(section_vertical_gap);
+                        ui.add_space(style.layout.section_vertical_gap);
                     }
 
                     let discord_dark = theme_discord_dark_palette(self.theme);
                     self.show_channels_panel_header(ui, discord_dark);
-                    ui.add_space(section_vertical_gap);
+                    ui.add_space(style.layout.section_vertical_gap);
 
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, false])
@@ -1908,7 +1897,7 @@ impl DesktopGuiApp {
                                         channel_id,
                                         channel_kind,
                                         &channel_name,
-                                        channel_row_height,
+                                        style.layout.channel_row_height,
                                         discord_dark,
                                     );
                                 }
@@ -2266,15 +2255,7 @@ impl DesktopGuiApp {
 
         self.show_guilds_side_panel(ctx, style);
 
-        self.show_channels_side_panel(
-            ctx,
-            style.colors.nav_bg,
-            style.layout.channels_panel_width,
-            style.layout.channel_row_height,
-            style.layout.toolbar_h_padding,
-            style.layout.toolbar_v_padding,
-            style.layout.section_vertical_gap,
-        );
+        self.show_channels_side_panel(ctx, style);
 
         self.show_members_side_panel(ctx, style);
 
