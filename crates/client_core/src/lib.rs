@@ -1857,9 +1857,9 @@ impl<C: CryptoProvider + 'static> ClientHandle for Arc<RealtimeClient<C>> {
             let _ = self.reconcile_mls_state_for_guild(guild_id).await;
             let client = Arc::clone(self);
             tokio::spawn(async move {
-                for _ in 0..20 {
+                for _ in 0..6 {
                     let _ = client.reconcile_mls_state_for_guild(guild_id).await;
-                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    tokio::time::sleep(Duration::from_millis(350)).await;
                 }
             });
         }
