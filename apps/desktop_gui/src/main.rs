@@ -8,6 +8,11 @@ use std::{
     time::SystemTime,
 };
 
+mod backend_bridge;
+mod controller;
+mod media;
+mod ui;
+
 use arboard::{Clipboard, ImageData};
 use client_core::{
     AttachmentUpload, ClientEvent, ClientHandle, DurableMlsSessionManager, PassthroughCrypto,
@@ -1489,6 +1494,7 @@ impl DesktopGuiApp {
         }
     }
 
+    #[allow(dead_code)]
     fn render_left_user_panel(&mut self, ui: &mut egui::Ui) {
         let discord_dark = theme_discord_dark_palette(self.theme);
         egui::Frame::group(ui.style())
@@ -1660,7 +1666,7 @@ impl DesktopGuiApp {
                             }
                         });
 
-                    ui.menu_button("Account", |ui| self.show_account_menu_contents(ui));
+                        ui.menu_button("Account", |ui| self.show_account_menu_contents(ui));
 
                         ui.separator();
                         ui.weak(format!("Workspace: {workspace_label}"));
