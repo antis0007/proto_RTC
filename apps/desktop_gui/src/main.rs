@@ -1859,37 +1859,42 @@ impl DesktopGuiApp {
                 ),
             ))
             .show(ctx, |ui| {
-                ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
-                    if self.auth_session_established {
-                        let user_panel_height = egui::Resize::default()
-                            .id_source("left_nav_user_panel_resize")
-                            .resizable(true)
-                            .default_height(
-                                self.left_user_panel_height
-                                    .clamp(MIN_LEFT_USER_PANEL_HEIGHT, MAX_LEFT_USER_PANEL_HEIGHT),
-                            )
-                            .min_height(MIN_LEFT_USER_PANEL_HEIGHT)
-                            .max_height(MAX_LEFT_USER_PANEL_HEIGHT)
-                            .show(ui, |ui| {
-                                self.render_left_user_panel(ui);
-                                ui.min_rect().height()
-                            });
-                        self.left_user_panel_height = user_panel_height
-                            .clamp(MIN_LEFT_USER_PANEL_HEIGHT, MAX_LEFT_USER_PANEL_HEIGHT);
-                        ui.separator();
-                        ui.add_space(style.layout.section_vertical_gap);
-                    }
+                let discord_dark = style.discord_dark;
 
-                    let discord_dark = style.discord_dark;
-                    ui.horizontal(|ui| {
-                        let guilds_width = style.layout.guilds_panel_width;
-                        ui.allocate_ui_with_layout(
-                            egui::vec2(guilds_width, ui.available_height()),
-                            egui::Layout::top_down(egui::Align::Min),
-                            |ui| {
-                                ui.heading("Guilds");
-                                ui.add_space(style.layout.section_vertical_gap);
+                // Layout contract:
+                // 1) Top region holds guild + channel columns.
+                // 2) Bottom region holds user info and is never allowed to overlap top content.
+                egui::TopBottomPanel::bottom("left_nav_user_strip")
+                    .resizable(self.auth_session_established)
+                    .default_height(
+                        self.left_user_panel_height
+                            .clamp(MIN_LEFT_USER_PANEL_HEIGHT, MAX_LEFT_USER_PANEL_HEIGHT),
+                    )
+                    .min_height(MIN_LEFT_USER_PANEL_HEIGHT)
+                    .max_height(MAX_LEFT_USER_PANEL_HEIGHT)
+                    .show_inside(ui, |ui| {
+                        if self.auth_session_established {
+                            self.left_user_panel_height = ui
+                                .available_height()
+                                .clamp(MIN_LEFT_USER_PANEL_HEIGHT, MAX_LEFT_USER_PANEL_HEIGHT);
+                            self.render_left_user_panel(ui);
+                        }
+                    });
 
+                ui.add_space(style.layout.section_vertical_gap);
+
+                // Top navigation area: keep columns independent and scrollable.
+                ui.horizontal(|ui| {
+                    let guilds_width = style.layout.guilds_panel_width;
+
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(guilds_width, ui.available_height()),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            ui.heading("Guilds");
+                            ui.add_space(style.layout.section_vertical_gap);
+
+                            egui::ScrollArea::vertical().show(ui, |ui| {
                                 ui.add_enabled_ui(self.auth_session_established, |ui| {
                                     if let Some(guild_id) = self.selected_guild {
                                         let label = if let Some(palette) = discord_dark {
@@ -1945,54 +1950,54 @@ impl DesktopGuiApp {
                                         ui.add_space(6.0);
                                     }
                                 });
+                            });
 
-                                if !self.auth_session_established {
-                                    ui.separator();
-                                    ui.add_space(4.0);
-                                    ui.label("Sign in to access guilds.");
-                                }
-                            },
-                        );
+                            if !self.auth_session_established {
+                                ui.separator();
+                                ui.add_space(4.0);
+                                ui.label("Sign in to access guilds.");
+                            }
+                        },
+                    );
 
-                        ui.separator();
+                    ui.separator();
 
-                        ui.allocate_ui_with_layout(
-                            ui.available_size(),
-                            egui::Layout::top_down(egui::Align::Min),
-                            |ui| {
-                                self.show_channels_panel_header(ui, discord_dark);
-                                ui.add_space(style.layout.section_vertical_gap);
+                    ui.allocate_ui_with_layout(
+                        ui.available_size(),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            self.show_channels_panel_header(ui, discord_dark);
+                            ui.add_space(style.layout.section_vertical_gap);
 
-                                egui::ScrollArea::vertical()
-                                    .auto_shrink([false, false])
-                                    .show(ui, |ui| {
-                                        ui.add_enabled_ui(self.auth_session_established, |ui| {
-                                            for index in 0..self.channels.len() {
-                                                let channel = &self.channels[index];
-                                                let channel_id = channel.channel_id;
-                                                let channel_kind = channel.kind;
-                                                let channel_name = channel.name.clone();
-                                                self.render_channel_row(
-                                                    ui,
-                                                    channel_id,
-                                                    channel_kind,
-                                                    &channel_name,
-                                                    style.layout.channel_row_height,
-                                                    discord_dark,
-                                                );
-                                            }
-                                            self.show_voice_channel_action(ui, discord_dark);
-                                        });
-
-                                        if !self.auth_session_established {
-                                            ui.separator();
-                                            ui.add_space(4.0);
-                                            ui.label("Sign in to browse channels.");
+                            egui::ScrollArea::vertical()
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    ui.add_enabled_ui(self.auth_session_established, |ui| {
+                                        for index in 0..self.channels.len() {
+                                            let channel = &self.channels[index];
+                                            let channel_id = channel.channel_id;
+                                            let channel_kind = channel.kind;
+                                            let channel_name = channel.name.clone();
+                                            self.render_channel_row(
+                                                ui,
+                                                channel_id,
+                                                channel_kind,
+                                                &channel_name,
+                                                style.layout.channel_row_height,
+                                                discord_dark,
+                                            );
                                         }
+                                        self.show_voice_channel_action(ui, discord_dark);
                                     });
-                            },
-                        );
-                    });
+
+                                    if !self.auth_session_established {
+                                        ui.separator();
+                                        ui.add_space(4.0);
+                                        ui.label("Sign in to browse channels.");
+                                    }
+                                });
+                        },
+                    );
                 });
             });
     }
