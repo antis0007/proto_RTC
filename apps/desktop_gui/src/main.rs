@@ -2171,6 +2171,12 @@ impl DesktopGuiApp {
                             ui.label("Sign in to browse channels.");
                         }
                     });
+
+                if self.auth_session_established {
+                    ui.separator();
+                    ui.add_space(SECTION_VERTICAL_GAP);
+                    self.render_left_user_panel(ui);
+                }
             });
 
         egui::SidePanel::right("members_panel")
@@ -2280,28 +2286,12 @@ impl DesktopGuiApp {
                     .max_rect()
                     .height()
                     .clamp(MIN_COMPOSER_PANEL_HEIGHT, MAX_COMPOSER_PANEL_HEIGHT);
-                self.left_user_panel_height = self
-                    .composer_panel_height
-                    .clamp(MIN_LEFT_USER_PANEL_HEIGHT, MAX_LEFT_USER_PANEL_HEIGHT);
 
                 ui.add_space(6.0);
-                let nav_total_width = 160.0 + 260.0 + (TOOLBAR_H_PADDING * 2.0);
                 let can_send = self.selected_channel.is_some();
 
-                ui.horizontal_top(|ui| {
-                    let user_panel_width = nav_total_width.min(ui.available_width());
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(user_panel_width, ui.available_height()),
-                        egui::Layout::top_down(egui::Align::Min),
-                        |ui| {
-                            self.render_left_user_panel(ui);
-                        },
-                    );
-
-                    ui.add_space(8.0);
-
-                    ui.vertical(|ui| {
-                        ui.add_enabled_ui(can_send && self.auth_session_established, |ui| {
+                ui.vertical(|ui| {
+                    ui.add_enabled_ui(can_send && self.auth_session_established, |ui| {
                             let row_height = (self.composer_panel_height - 18.0)
                                 .clamp(36.0, MAX_COMPOSER_PANEL_HEIGHT - 12.0);
                             let send_width = (88.0 + (row_height - 36.0) * 0.28).clamp(88.0, 124.0);
@@ -2402,7 +2392,6 @@ impl DesktopGuiApp {
                                 }
                                 ui.add_space(6.0);
                             }
-                        });
                     });
                 });
 
