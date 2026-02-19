@@ -280,10 +280,11 @@ async fn login(
         })?;
 
     if guilds.is_empty() {
+        let guild_name = format!("{}'s guild", req.username.trim());
         let guild_id = state
             .api
             .storage
-            .create_guild("General", user_id)
+            .create_guild(&guild_name, user_id)
             .await
             .map_err(|e| {
                 (

@@ -34,6 +34,7 @@ if ($PSBoundParameters.ContainsKey('BindIp') -or $PSBoundParameters.ContainsKey(
 }
 
 if (-not $env:SERVER_BIND) { $env:SERVER_BIND = '127.0.0.1:8443' }
+if (-not $env:SERVER_PUBLIC_URL) { $env:SERVER_PUBLIC_URL = "http://$($env:SERVER_BIND)" }
 if (-not $env:DATABASE_URL) { $env:DATABASE_URL = 'sqlite://./data/server.db' }
 if ($env:SERVER_BIND) { $env:APP__BIND_ADDR = $env:SERVER_BIND }
 elseif (-not $env:APP__BIND_ADDR) { $env:APP__BIND_ADDR = '127.0.0.1:8443' }

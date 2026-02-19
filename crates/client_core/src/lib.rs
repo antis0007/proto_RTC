@@ -45,8 +45,8 @@ const LIVEKIT_E2EE_CACHE_TTL: Duration = Duration::from_secs(90);
 const LIVEKIT_E2EE_INFO_PREFIX: &[u8] = b"proto-rtc/livekit-e2ee/v1";
 /// Deterministic application salt for LiveKit E2EE key derivation.
 const LIVEKIT_E2EE_APP_SALT: &[u8] = b"proto-rtc/livekit-e2ee-app-salt";
-const WELCOME_SYNC_RETRY_ATTEMPTS: usize = 4;
-const WELCOME_SYNC_RETRY_DELAY: Duration = Duration::from_millis(300);
+const WELCOME_SYNC_RETRY_ATTEMPTS: usize = 12;
+const WELCOME_SYNC_RETRY_DELAY: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct VoiceConnectionKey {
@@ -1528,6 +1528,34 @@ fn is_missing_mls_group_error(message: &str) -> bool {
         || message.contains("MLS session missing")
 }
 
+impl<C: CryptoProvider + 'static> RealtimeClient<C> {
+    async fn prewarm_mls_for_guild_channels(
+        &self,
+        guild_id: GuildId,
+        channels: &[ChannelSummary],
+    ) -> Result<()> {
+        let (_, user_id) = self.session().await?;
+        for channel in channels {
+            if channel.kind != shared::domain::ChannelKind::Text {
+                continue;
+            }
+
+            let channel_id = channel.channel_id;
+            let _ = self
+                .maybe_bootstrap_existing_members_if_moderator(guild_id, channel_id, user_id)
+                .await;
+            let _ = self
+                .maybe_join_from_pending_welcome_with_retry(guild_id, channel_id)
+                .await;
+            let _ = self
+                .try_restore_mls_channel_from_local_state(guild_id, channel_id)
+                .await;
+        }
+
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl<C: CryptoProvider + 'static> ClientHandle for Arc<RealtimeClient<C>> {
     async fn login(
@@ -1646,10 +1674,22 @@ impl<C: CryptoProvider + 'static> ClientHandle for Arc<RealtimeClient<C>> {
             }
         }
 
-        for channel in channels {
+        for channel in &channels {
             let _ = self
                 .events
-                .send(ClientEvent::Server(ServerEvent::ChannelUpdated { channel }));
+                .send(ClientEvent::Server(ServerEvent::ChannelUpdated {
+                    channel: channel.clone(),
+                }));
+        }
+
+        if let Err(err) = self
+            .prewarm_mls_for_guild_channels(guild_id, &channels)
+            .await
+        {
+            let _ = self.events.send(ClientEvent::Error(format!(
+                "failed to prewarm MLS state for guild {}: {err}",
+                guild_id.0
+            )));
         }
 
         self.list_members(guild_id).await?;

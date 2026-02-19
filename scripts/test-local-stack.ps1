@@ -170,6 +170,41 @@ try {
   Write-ClientLog -Path $Client2Log -Message "[OK] client2 channel selected channel_id=$channelId"
   Write-RunOk -Step 'channel selection'
 
+  $keyPkg1 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes("kp-client1-$user1Id"))
+  $keyPkg2 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes("kp-client2-$user2Id"))
+  $kp1Bytes = [Convert]::FromBase64String($keyPkg1)
+  $kp2Bytes = [Convert]::FromBase64String($keyPkg2)
+  $kp1Path = Join-Path $ArtifactDir 'client1-key-package.bin'
+  $kp2Path = Join-Path $ArtifactDir 'client2-key-package.bin'
+  [IO.File]::WriteAllBytes($kp1Path, $kp1Bytes)
+  [IO.File]::WriteAllBytes($kp2Path, $kp2Bytes)
+
+  $kp1Upload = Join-Path $ArtifactDir 'client1-upload-key-package.json'
+  Invoke-ApiRequest -Method 'POST' -Uri "$($env:SERVER_PUBLIC_URL)/mls/key_packages?user_id=$user1Id&guild_id=$guildId" -ExpectedStatus 200 -OutFile $kp1Upload -UseInFile -InFile $kp1Path | Out-Null
+  $kp2Upload = Join-Path $ArtifactDir 'client2-upload-key-package.json'
+  Invoke-ApiRequest -Method 'POST' -Uri "$($env:SERVER_PUBLIC_URL)/mls/key_packages?user_id=$user2Id&guild_id=$guildId" -ExpectedStatus 200 -OutFile $kp2Upload -UseInFile -InFile $kp2Path | Out-Null
+
+  $kpFetch = Join-Path $ArtifactDir 'client1-fetch-client2-key-package.json'
+  Invoke-ApiRequest -Method 'GET' -Uri "$($env:SERVER_PUBLIC_URL)/mls/key_packages?user_id=$user2Id&guild_id=$guildId" -ExpectedStatus 200 -OutFile $kpFetch | Out-Null
+  $kpFetchedB64 = ((Get-Content $kpFetch -Raw) | ConvertFrom-Json).key_package_b64
+  if ($kpFetchedB64 -ne $keyPkg2) {
+    throw 'MLS key package verification failed.'
+  }
+  Write-RunOk -Step 'mls key package upload/fetch'
+
+  $welcomePayload = [Text.Encoding]::UTF8.GetBytes("welcome-$user1Id-to-$user2Id")
+  $welcomePath = Join-Path $ArtifactDir 'pending-welcome.bin'
+  [IO.File]::WriteAllBytes($welcomePath, $welcomePayload)
+  Invoke-ApiRequest -Method 'POST' -Uri "$($env:SERVER_PUBLIC_URL)/mls/welcome?user_id=$user1Id&guild_id=$guildId&channel_id=$channelId&target_user_id=$user2Id" -ExpectedStatus 204 -UseInFile -InFile $welcomePath | Out-Null
+  $welcomeFetch = Join-Path $ArtifactDir 'client2-fetch-welcome.json'
+  Invoke-ApiRequest -Method 'GET' -Uri "$($env:SERVER_PUBLIC_URL)/mls/welcome?user_id=$user2Id&guild_id=$guildId&channel_id=$channelId" -ExpectedStatus 200 -OutFile $welcomeFetch | Out-Null
+  $welcomeFetchedB64 = ((Get-Content $welcomeFetch -Raw) | ConvertFrom-Json).welcome_b64
+  $expectedWelcomeB64 = [Convert]::ToBase64String($welcomePayload).TrimEnd('=') -replace '\+','-' -replace '/','_'
+  if ($welcomeFetchedB64 -ne $expectedWelcomeB64) {
+    throw 'MLS welcome fetch verification failed.'
+  }
+  Write-RunOk -Step 'mls welcome store/fetch'
+
   $messageB64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes('pre-e2ee-local-smoke-message'))
   $sendFile = Join-Path $ArtifactDir 'client1-send-message.json'
   Invoke-ApiRequest -Method 'POST' -Uri "$($env:SERVER_PUBLIC_URL)/messages" -ExpectedStatus 200 -OutFile $sendFile -Body (@{ user_id = [int64]$user1Id; guild_id = [int64]$guildId; channel_id = [int64]$channelId; ciphertext_b64 = $messageB64 } | ConvertTo-Json -Compress) -ContentType 'application/json' | Out-Null
