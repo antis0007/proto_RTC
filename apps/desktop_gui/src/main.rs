@@ -8,6 +8,11 @@ use std::{
     time::SystemTime,
 };
 
+mod backend_bridge;
+mod controller;
+mod media;
+mod ui;
+
 use arboard::{Clipboard, ImageData};
 use client_core::{
     AttachmentUpload, ClientEvent, ClientHandle, DurableMlsSessionManager, PassthroughCrypto,
@@ -1660,7 +1665,7 @@ impl DesktopGuiApp {
                             }
                         });
 
-                    ui.menu_button("Account", |ui| self.show_account_menu_contents(ui));
+                        ui.menu_button("Account", |ui| self.show_account_menu_contents(ui));
 
                         ui.separator();
                         ui.weak(format!("Workspace: {workspace_label}"));
