@@ -2173,63 +2173,6 @@ impl DesktopGuiApp {
                     });
             });
 
-        egui::TopBottomPanel::bottom("left_user_panel")
-            .resizable(true)
-            .default_height(self.left_user_panel_height)
-            .min_height(MIN_LEFT_USER_PANEL_HEIGHT)
-            .max_height(MAX_LEFT_USER_PANEL_HEIGHT)
-            .show(ctx, |ui| {
-                self.left_user_panel_height = ui
-                    .max_rect()
-                    .height()
-                    .clamp(MIN_LEFT_USER_PANEL_HEIGHT, MAX_LEFT_USER_PANEL_HEIGHT);
-                let nav_total_width = 160.0 + 260.0 + (TOOLBAR_H_PADDING * 2.0);
-                let content_width = ui.available_width().min(nav_total_width);
-                let discord_dark = theme_discord_dark_palette(self.theme);
-                ui.allocate_ui_with_layout(
-                    egui::vec2(content_width, ui.available_height()),
-                    egui::Layout::top_down(egui::Align::Min),
-                    |ui| {
-                        egui::Frame::group(ui.style())
-                            .fill(
-                                discord_dark
-                                    .map(|p| p.message_background)
-                                    .unwrap_or(ui.visuals().panel_fill),
-                            )
-                            .show(ui, |ui| {
-                                ui.set_min_height(self.left_user_panel_height - 12.0);
-                                ui.horizontal(|ui| {
-                                    ui.label(
-                                        egui::RichText::new("●")
-                                            .color(egui::Color32::from_rgb(67, 181, 129)),
-                                    );
-                                    ui.strong(&self.username);
-                                    let status_label = if self.voice_ui.active_session.is_some() {
-                                        "In voice"
-                                    } else {
-                                        "Online"
-                                    };
-                                    ui.small(format!("· {status_label}"));
-                                });
-                                ui.add_space(4.0);
-                                ui.horizontal_wrapped(|ui| {
-                                    ui.toggle_value(&mut self.voice_ui.muted, "Mute");
-                                    ui.toggle_value(&mut self.voice_ui.deafened, "Deafen");
-                                });
-                                ui.add_space(6.0);
-                                ui.horizontal_wrapped(|ui| {
-                                    if ui.button("⚙ Settings").clicked() {
-                                        self.settings_open = true;
-                                    }
-                                    if ui.button("⎋ Sign out").clicked() {
-                                        self.sign_out();
-                                    }
-                                });
-                            });
-                    },
-                );
-            });
-
         egui::SidePanel::right("members_panel")
             .default_width(260.0)
             .show(ctx, |ui| {
@@ -2333,102 +2276,136 @@ impl DesktopGuiApp {
             .default_height(self.composer_panel_height)
             .min_height(MIN_COMPOSER_PANEL_HEIGHT)
             .show(ctx, |ui| {
-                self.composer_panel_height = ui.max_rect().height()
+                self.composer_panel_height = ui
+                    .max_rect()
+                    .height()
                     .clamp(MIN_COMPOSER_PANEL_HEIGHT, MAX_COMPOSER_PANEL_HEIGHT);
-                ui.add_space(6.0);
-                let can_send = self.selected_channel.is_some();
-                ui.add_enabled_ui(can_send && self.auth_session_established, |ui| {
-                    let row_height = (self.composer_panel_height - 18.0)
-                        .clamp(36.0, MAX_COMPOSER_PANEL_HEIGHT - 12.0);
-                    let send_width = (88.0 + (row_height - 36.0) * 0.28).clamp(88.0, 124.0);
-                    let attachment_width = (38.0 + (row_height - 36.0) * 0.12).clamp(38.0, 48.0);
-                    ui.horizontal(|ui| {
-                        if ui.button("📎").on_hover_text("Attach file").clicked() {
-                            self.pending_attachment = rfd::FileDialog::new().pick_file();
-                        }
-                        let response = ui
-                            .scope(|ui| {
-                                if let Some(palette) = theme_discord_dark_palette(self.theme) {
-                                    ui.visuals_mut().extreme_bg_color = palette.message_background;
-                                }
-                                ui.add_sized(
-                                    [ui.available_width() - send_width - attachment_width, row_height],
-                                    egui::TextEdit::multiline(&mut self.composer)
-                                        .id_source("composer_text")
-                                        .hint_text(
-                                            "Message #channel (Enter to send, Shift+Enter for newline)",
-                                        ),
-                                )
-                            })
-                            .inner;
-                        let send_shortcut = response.has_focus()
-                            && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
-                        let clicked_send = ui
-                            .add_sized([send_width, row_height], egui::Button::new("⬆ Send"))
-                            .clicked();
-                        if send_shortcut || clicked_send {
-                            self.try_send_current_composer(&response);
-                        }
-                    });
+                self.left_user_panel_height = self
+                    .composer_panel_height
+                    .clamp(MIN_LEFT_USER_PANEL_HEIGHT, MAX_LEFT_USER_PANEL_HEIGHT);
 
-                    if let Some(path) = self.pending_attachment.clone() {
-                        ui.horizontal_wrapped(|ui| {
-                            ui.small(format!("Attached: {}", path.display()));
-                            if ui.button("✕ Remove").clicked() {
-                                self.pending_attachment = None;
+                ui.add_space(6.0);
+                let nav_total_width = 160.0 + 260.0 + (TOOLBAR_H_PADDING * 2.0);
+                let can_send = self.selected_channel.is_some();
+
+                ui.horizontal_top(|ui| {
+                    let user_panel_width = nav_total_width.min(ui.available_width());
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(user_panel_width, ui.available_height()),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            self.render_left_user_panel(ui);
+                        },
+                    );
+
+                    ui.add_space(8.0);
+
+                    ui.vertical(|ui| {
+                        ui.add_enabled_ui(can_send && self.auth_session_established, |ui| {
+                            let row_height = (self.composer_panel_height - 18.0)
+                                .clamp(36.0, MAX_COMPOSER_PANEL_HEIGHT - 12.0);
+                            let send_width = (88.0 + (row_height - 36.0) * 0.28).clamp(88.0, 124.0);
+                            let attachment_width =
+                                (38.0 + (row_height - 36.0) * 0.12).clamp(38.0, 48.0);
+
+                            ui.horizontal(|ui| {
+                                if ui.button("📎").on_hover_text("Attach file").clicked() {
+                                    self.pending_attachment = rfd::FileDialog::new().pick_file();
+                                }
+                                let response = ui
+                                    .scope(|ui| {
+                                        if let Some(palette) = theme_discord_dark_palette(self.theme)
+                                        {
+                                            ui.visuals_mut().extreme_bg_color =
+                                                palette.message_background;
+                                        }
+                                        ui.add_sized(
+                                            [
+                                                ui.available_width() - send_width - attachment_width,
+                                                row_height,
+                                            ],
+                                            egui::TextEdit::multiline(&mut self.composer)
+                                                .id_source("composer_text")
+                                                .hint_text(
+                                                    "Message #channel (Enter to send, Shift+Enter for newline)",
+                                                ),
+                                        )
+                                    })
+                                    .inner;
+                                let send_shortcut = response.has_focus()
+                                    && ui.input(|i| {
+                                        i.key_pressed(egui::Key::Enter) && !i.modifiers.shift
+                                    });
+                                let clicked_send = ui
+                                    .add_sized([send_width, row_height], egui::Button::new("⬆ Send"))
+                                    .clicked();
+                                if send_shortcut || clicked_send {
+                                    self.try_send_current_composer(&response);
+                                }
+                            });
+
+                            if let Some(path) = self.pending_attachment.clone() {
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.small(format!("Attached: {}", path.display()));
+                                    if ui.button("✕ Remove").clicked() {
+                                        self.pending_attachment = None;
+                                    }
+                                });
+
+                                let file_name = path
+                                    .file_name()
+                                    .and_then(|name| name.to_str())
+                                    .unwrap_or("attachment");
+                                let size_text = Self::attachment_size_text(&path);
+                                match self.load_attachment_preview(ctx, &path) {
+                                    Some(AttachmentPreview::Image {
+                                        texture,
+                                        size,
+                                        preview_png,
+                                    }) => {
+                                        egui::Frame::group(ui.style()).show(ui, |ui| {
+                                            ui.horizontal(|ui| {
+                                                ui.label(format!("🖼 {file_name}"));
+                                                ui.small(size_text.clone());
+                                            });
+                                            let response = ui.add(
+                                                egui::Image::new((texture.id(), size))
+                                                    .max_size(egui::vec2(240.0, 240.0)),
+                                            );
+                                            let metadata =
+                                                format!("name: {file_name}\nsize: {size_text}");
+                                            response.context_menu(|ui| {
+                                                self.render_image_context_menu(
+                                                    ui,
+                                                    file_name,
+                                                    fs::read(&path).ok().as_deref(),
+                                                    Some(preview_png.as_slice()),
+                                                    Some(path.as_path()),
+                                                    Some(&metadata),
+                                                );
+                                            });
+                                        });
+                                    }
+                                    Some(AttachmentPreview::DecodeFailed) => {
+                                        egui::Frame::group(ui.style()).show(ui, |ui| {
+                                            ui.label(format!("⚠ {file_name}"));
+                                            ui.small(size_text.clone());
+                                            ui.small("Image preview unavailable (decode failed)");
+                                        });
+                                    }
+                                    None => {
+                                        egui::Frame::group(ui.style()).show(ui, |ui| {
+                                            ui.label(format!("📎 {file_name}"));
+                                            ui.small(size_text);
+                                        });
+                                    }
+                                }
+                                ui.add_space(6.0);
                             }
                         });
-
-                        let file_name = path
-                            .file_name()
-                            .and_then(|name| name.to_str())
-                            .unwrap_or("attachment");
-                        let size_text = Self::attachment_size_text(&path);
-                        match self.load_attachment_preview(ctx, &path) {
-                            Some(AttachmentPreview::Image {
-                                texture,
-                                size,
-                                preview_png,
-                            }) => {
-                                egui::Frame::group(ui.style()).show(ui, |ui| {
-                                    ui.horizontal(|ui| {
-                                        ui.label(format!("🖼 {file_name}"));
-                                        ui.small(size_text.clone());
-                                    });
-                                    let response = ui.add(
-                                        egui::Image::new((texture.id(), size))
-                                            .max_size(egui::vec2(240.0, 240.0)),
-                                    );
-                                    let metadata = format!("name: {file_name}\nsize: {size_text}");
-                                    response.context_menu(|ui| {
-                                        self.render_image_context_menu(
-                                            ui,
-                                            file_name,
-                                            fs::read(&path).ok().as_deref(),
-                                            Some(preview_png.as_slice()),
-                                            Some(path.as_path()),
-                                            Some(&metadata),
-                                        );
-                                    });
-                                });
-                            }
-                            Some(AttachmentPreview::DecodeFailed) => {
-                                egui::Frame::group(ui.style()).show(ui, |ui| {
-                                    ui.label(format!("⚠ {file_name}"));
-                                    ui.small(size_text.clone());
-                                    ui.small("Image preview unavailable (decode failed)");
-                                });
-                            }
-                            None => {
-                                egui::Frame::group(ui.style()).show(ui, |ui| {
-                                    ui.label(format!("📎 {file_name}"));
-                                    ui.small(size_text);
-                                });
-                            }
-                        }
-                        ui.add_space(6.0);
-                    }
+                    });
                 });
+
                 if !can_send {
                     ui.centered_and_justified(|ui| {
                         ui.weak("Pick a channel to start chatting.");
