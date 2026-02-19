@@ -1092,23 +1092,35 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
                 Err(_) => continue,
             };
 
-            let _ = self
-                .post_ciphertext_message(
-                    guild_id,
-                    channel_id,
-                    STANDARD.encode(add_member_outcome.commit_bytes),
-                    None,
-                )
-                .await;
+            let commit_bytes_b64 = STANDARD.encode(&add_member_outcome.commit_bytes);
+            if let Err(err) = self
+                .post_ciphertext_message(guild_id, channel_id, commit_bytes_b64, None)
+                .await
+            {
+                let message = format!(
+                    "failed to post MLS add-member commit for user {} in guild {} channel {}: {err}",
+                    member.user_id.0, guild_id.0, channel_id.0
+                );
+                let _ = self.events.send(ClientEvent::Error(message));
+                continue;
+            }
 
-            let _ = self
+            if let Err(err) = self
                 .store_pending_welcome(
                     guild_id,
                     channel_id,
                     member.user_id.0,
                     &add_member_outcome.welcome_bytes,
                 )
-                .await;
+                .await
+            {
+                let message = format!(
+                    "failed to store pending MLS welcome for user {} in guild {} channel {}: {err}",
+                    member.user_id.0, guild_id.0, channel_id.0
+                );
+                let _ = self.events.send(ClientEvent::Error(message));
+                continue;
+            }
 
             self.inner
                 .lock()
