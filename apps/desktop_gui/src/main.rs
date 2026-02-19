@@ -1894,63 +1894,68 @@ impl DesktopGuiApp {
                             ui.heading("Guilds");
                             ui.add_space(style.layout.section_vertical_gap);
 
-                            egui::ScrollArea::vertical().show(ui, |ui| {
-                                ui.add_enabled_ui(self.auth_session_established, |ui| {
-                                    if let Some(guild_id) = self.selected_guild {
-                                        let label = if let Some(palette) = discord_dark {
-                                            egui::RichText::new("Create Invite")
-                                                .color(palette.side_panel_button_text)
-                                        } else {
-                                            egui::RichText::new("Create Invite")
-                                        };
-                                        let invite_button = self
-                                            .sidebar_button(label, discord_dark)
-                                            .min_size(egui::vec2(ui.available_width(), 30.0));
-                                        if ui.add(invite_button).clicked() {
-                                            queue_command(
-                                                &self.cmd_tx,
-                                                BackendCommand::CreateInvite { guild_id },
-                                                &mut self.status,
-                                            );
-                                        }
-                                        ui.add_space(8.0);
-                                    }
-
-                                    for guild in &self.guilds {
-                                        let selected = self.selected_guild == Some(guild.guild_id);
-                                        let response = self.render_nav_row(
-                                            ui,
-                                            guild.name.as_str(),
-                                            style.layout.channel_row_height,
-                                            selected,
-                                            discord_dark,
-                                        );
-
-                                        if response.clicked() {
-                                            self.selected_guild = Some(guild.guild_id);
-                                            self.selected_channel = None;
-                                            self.channels.clear();
-                                            self.members.remove(&guild.guild_id);
-                                            queue_command(
-                                                &self.cmd_tx,
-                                                BackendCommand::ListChannels {
-                                                    guild_id: guild.guild_id,
-                                                },
-                                                &mut self.status,
-                                            );
-                                            queue_command(
-                                                &self.cmd_tx,
-                                                BackendCommand::ListMembers {
-                                                    guild_id: guild.guild_id,
-                                                },
-                                                &mut self.status,
-                                            );
+                            egui::ScrollArea::vertical()
+                                .id_source("left_nav_guilds_scroll")
+                                .auto_shrink([false, false])
+                                .max_height(ui.available_height())
+                                .show(ui, |ui| {
+                                    ui.add_enabled_ui(self.auth_session_established, |ui| {
+                                        if let Some(guild_id) = self.selected_guild {
+                                            let label = if let Some(palette) = discord_dark {
+                                                egui::RichText::new("Create Invite")
+                                                    .color(palette.side_panel_button_text)
+                                            } else {
+                                                egui::RichText::new("Create Invite")
+                                            };
+                                            let invite_button = self
+                                                .sidebar_button(label, discord_dark)
+                                                .min_size(egui::vec2(ui.available_width(), 30.0));
+                                            if ui.add(invite_button).clicked() {
+                                                queue_command(
+                                                    &self.cmd_tx,
+                                                    BackendCommand::CreateInvite { guild_id },
+                                                    &mut self.status,
+                                                );
+                                            }
+                                            ui.add_space(8.0);
                                         }
 
-                                        ui.add_space(6.0);
-                                    }
+                                        for guild in &self.guilds {
+                                            let selected =
+                                                self.selected_guild == Some(guild.guild_id);
+                                            let response = self.render_nav_row(
+                                                ui,
+                                                guild.name.as_str(),
+                                                style.layout.channel_row_height,
+                                                selected,
+                                                discord_dark,
+                                            );
+
+                                            if response.clicked() {
+                                                self.selected_guild = Some(guild.guild_id);
+                                                self.selected_channel = None;
+                                                self.channels.clear();
+                                                self.members.remove(&guild.guild_id);
+                                                queue_command(
+                                                    &self.cmd_tx,
+                                                    BackendCommand::ListChannels {
+                                                        guild_id: guild.guild_id,
+                                                    },
+                                                    &mut self.status,
+                                                );
+                                                queue_command(
+                                                    &self.cmd_tx,
+                                                    BackendCommand::ListMembers {
+                                                        guild_id: guild.guild_id,
+                                                    },
+                                                    &mut self.status,
+                                                );
+                                            }
+
+                                            ui.add_space(6.0);
+                                        }
+                                    });
                                 });
-                            });
 
                             if !self.auth_session_established {
                                 ui.separator();
@@ -1970,7 +1975,9 @@ impl DesktopGuiApp {
                             ui.add_space(style.layout.section_vertical_gap);
 
                             egui::ScrollArea::vertical()
+                                .id_source("left_nav_channels_scroll")
                                 .auto_shrink([false, false])
+                                .max_height(ui.available_height())
                                 .show(ui, |ui| {
                                     ui.add_enabled_ui(self.auth_session_established, |ui| {
                                         for index in 0..self.channels.len() {
