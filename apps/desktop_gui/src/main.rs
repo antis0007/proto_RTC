@@ -1628,6 +1628,7 @@ impl DesktopGuiApp {
         const TOOLBAR_H_PADDING: f32 = 10.0;
         const TOOLBAR_V_PADDING: f32 = 8.0;
         const SECTION_VERTICAL_GAP: f32 = 8.0;
+        const TOP_BAR_H_PADDING: f32 = 0.0;
         const TOP_BAR_V_PADDING: f32 = 0.0;
 
         let top_bar_bg = theme_discord_dark_palette(self.theme)
@@ -1639,7 +1640,7 @@ impl DesktopGuiApp {
                 egui::Frame::none()
                     .fill(top_bar_bg)
                     .inner_margin(egui::Margin::symmetric(
-                        TOOLBAR_H_PADDING,
+                        TOP_BAR_H_PADDING,
                         TOP_BAR_V_PADDING,
                     )),
             )
