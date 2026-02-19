@@ -1494,6 +1494,7 @@ impl DesktopGuiApp {
         }
     }
 
+    #[allow(dead_code)]
     fn render_left_user_panel(&mut self, ui: &mut egui::Ui) {
         let discord_dark = theme_discord_dark_palette(self.theme);
         egui::Frame::group(ui.style())
