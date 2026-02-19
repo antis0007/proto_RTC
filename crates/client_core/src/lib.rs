@@ -1324,6 +1324,7 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
             let _ = self
                 .maybe_bootstrap_existing_members_if_moderator(guild_id, channel_id, user_id)
                 .await?;
+            let _ = self.reconcile_mls_state_for_guild(guild_id).await;
 
             if !self
                 .ensure_mls_channel_initialized(guild_id, channel_id)
@@ -1767,19 +1768,21 @@ impl<C: CryptoProvider + 'static> ClientHandle for Arc<RealtimeClient<C>> {
         .ok_or_else(|| anyhow!("no guild selected"))?;
 
         let (_, current_user_id) = self.session().await?;
-        let user_is_moderator = self
+        let _ = self
             .maybe_bootstrap_existing_members_if_moderator(guild_id, channel_id, current_user_id)
             .await?;
 
         let initialized = self
             .ensure_mls_channel_initialized(guild_id, channel_id)
             .await?;
-        if !initialized && !user_is_moderator {
-            return Err(anyhow!(
-                "MLS state for guild {} channel {} is uninitialized; wait for a moderator bootstrap or retry after welcome sync",
-                guild_id.0,
-                channel_id.0
-            ));
+        if !initialized {
+            let client = Arc::clone(self);
+            tokio::spawn(async move {
+                let _ = client.reconcile_mls_state_for_guild(guild_id).await;
+                let _ = client
+                    .maybe_join_from_pending_welcome_with_retry(guild_id, channel_id)
+                    .await;
+            });
         }
 
         self.fetch_messages(channel_id, 100, None).await?;
@@ -1852,6 +1855,13 @@ impl<C: CryptoProvider + 'static> ClientHandle for Arc<RealtimeClient<C>> {
         if let Some(guild_id) = RealtimeClient::<C>::guild_id_from_invite(invite_code) {
             self.upload_key_package_for_guild(guild_id).await?;
             let _ = self.reconcile_mls_state_for_guild(guild_id).await;
+            let client = Arc::clone(self);
+            tokio::spawn(async move {
+                for _ in 0..20 {
+                    let _ = client.reconcile_mls_state_for_guild(guild_id).await;
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+            });
         }
 
         Ok(())
