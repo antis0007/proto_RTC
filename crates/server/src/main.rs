@@ -482,10 +482,12 @@ async fn upload_key_package(
         .await
         .map_err(|error| (api_error_status(&error), Json(error)))?;
 
+    let guild_id = GuildId(q.guild_id);
+    let user_id = UserId(q.user_id);
     let key_package_id = state
         .api
         .storage
-        .insert_key_package(GuildId(q.guild_id), UserId(q.user_id), &body)
+        .insert_key_package(guild_id, user_id, &body)
         .await
         .map_err(|e| {
             (
@@ -493,6 +495,12 @@ async fn upload_key_package(
                 Json(ApiError::new(ErrorCode::Internal, e.to_string())),
             )
         })?;
+
+    if let Ok(members) = list_members(&state.api, user_id, guild_id).await {
+        let _ = state
+            .events
+            .send(ServerEvent::GuildMembersUpdated { guild_id, members });
+    }
 
     Ok(Json(UploadKeyPackageResponse { key_package_id }))
 }
@@ -642,7 +650,7 @@ async fn ws_handler(
 async fn ws_connection(
     state: Arc<AppState>,
     socket: axum::extract::ws::WebSocket,
-    _user_id: UserId,
+    user_id: UserId,
 ) {
     use axum::extract::ws::Message;
     use futures::{SinkExt, StreamExt};
@@ -650,8 +658,17 @@ async fn ws_connection(
     let (mut sender, mut receiver) = socket.split();
     let mut events_rx = state.events.subscribe();
 
+    let send_state = Arc::clone(&state);
     let send_task = tokio::spawn(async move {
-        while let Ok(event) = events_rx.recv().await {
+        loop {
+            let event = match events_rx.recv().await {
+                Ok(event) => event,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            };
+            if !is_event_visible_to_user(&send_state, user_id, &event).await {
+                continue;
+            }
             let text = match serde_json::to_string(&event) {
                 Ok(v) => v,
                 Err(_) => continue,
@@ -665,6 +682,52 @@ async fn ws_connection(
     while let Some(Ok(_msg)) = receiver.next().await {}
 
     send_task.abort();
+}
+
+async fn is_event_visible_to_user(
+    state: &Arc<AppState>,
+    user_id: UserId,
+    event: &ServerEvent,
+) -> bool {
+    let is_member = |guild_id: GuildId| async move {
+        matches!(
+            state.api.storage.membership_status(guild_id, user_id).await,
+            Ok(Some((_role, banned, _muted))) if !banned
+        )
+    };
+
+    match event {
+        ServerEvent::GuildUpdated { guild } => is_member(guild.guild_id).await,
+        ServerEvent::ChannelUpdated { channel } => is_member(channel.guild_id).await,
+        ServerEvent::GuildMembersUpdated { guild_id, .. } => is_member(*guild_id).await,
+        ServerEvent::MessageReceived { message } => {
+            let guild_id = match state
+                .api
+                .storage
+                .guild_for_channel(message.channel_id)
+                .await
+            {
+                Ok(Some(guild_id)) => guild_id,
+                _ => return false,
+            };
+            is_member(guild_id).await
+        }
+        ServerEvent::UserKicked {
+            guild_id,
+            target_user_id,
+        }
+        | ServerEvent::UserBanned {
+            guild_id,
+            target_user_id,
+        }
+        | ServerEvent::UserMuted {
+            guild_id,
+            target_user_id,
+        } => *target_user_id == user_id || is_member(*guild_id).await,
+        ServerEvent::LiveKitTokenIssued { guild_id, .. }
+        | ServerEvent::MlsWelcomeAvailable { guild_id, .. } => is_member(*guild_id).await,
+        ServerEvent::FileStored { .. } | ServerEvent::Error(_) => true,
+    }
 }
 
 async fn http_list_guilds(

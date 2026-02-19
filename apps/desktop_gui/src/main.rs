@@ -2269,7 +2269,11 @@ impl DesktopGuiApp {
                     });
                 });
 
-                ui.label(&self.status);
+                let status_row_height = 18.0;
+                ui.add_sized(
+                    [ui.available_width(), status_row_height],
+                    egui::Label::new(egui::RichText::new(&self.status).small()),
+                );
                 self.show_status_banner(ui);
             });
     }
