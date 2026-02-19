@@ -877,6 +877,31 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
                                         )));
                                     }
                                 });
+                            } else if let ServerEvent::MlsWelcomeAvailable {
+                                guild_id,
+                                channel_id,
+                            } = event
+                            {
+                                {
+                                    let mut guard = client.inner.lock().await;
+                                    guard.channel_guilds.insert(channel_id, guild_id);
+                                }
+                                let client_clone = Arc::clone(&client);
+                                tokio::spawn(async move {
+                                    if let Err(err) = client_clone
+                                        .maybe_join_from_pending_welcome_with_retry(
+                                            guild_id, channel_id,
+                                        )
+                                        .await
+                                    {
+                                        let _ = client_clone.events.send(ClientEvent::Error(
+                                            format!(
+                                                "failed MLS welcome sync for guild {} channel {}: {err}",
+                                                guild_id.0, channel_id.0
+                                            ),
+                                        ));
+                                    }
+                                });
                             } else {
                                 let _ = client.events.send(ClientEvent::Server(event));
                             }

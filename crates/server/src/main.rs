@@ -636,6 +636,11 @@ async fn store_pending_welcome(
             )
         })?;
 
+    let _ = state.events.send(ServerEvent::MlsWelcomeAvailable {
+        guild_id: GuildId(q.guild_id),
+        channel_id: ChannelId(q.channel_id),
+    });
+
     Ok(StatusCode::NO_CONTENT)
 }
 

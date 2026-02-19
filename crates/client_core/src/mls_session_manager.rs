@@ -220,7 +220,7 @@ impl MlsSessionManager for DurableMlsSessionManager {
         self.channel_index.lock().await.insert(channel_id, guild_id);
         let key = (guild_id, channel_id);
         let mut sessions = self.sessions.lock().await;
-        if !sessions.contains_key(&key) {
+        if let std::collections::hash_map::Entry::Vacant(entry) = sessions.entry(key) {
             let identity = self.load_or_create_identity().await?;
             let handle = MlsGroupHandle::new(
                 self.store.clone(),
@@ -231,7 +231,7 @@ impl MlsSessionManager for DurableMlsSessionManager {
                 identity,
             )
             .await?;
-            sessions.insert(key, handle);
+            entry.insert(handle);
         }
 
         let handle = sessions.get_mut(&key).ok_or_else(|| {
