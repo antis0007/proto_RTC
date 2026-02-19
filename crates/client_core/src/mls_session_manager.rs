@@ -108,6 +108,18 @@ impl MlsSessionManager for DurableMlsSessionManager {
         handle.key_package_bytes()
     }
 
+    async fn has_persisted_group_state(
+        &self,
+        guild_id: GuildId,
+        channel_id: ChannelId,
+    ) -> Result<bool> {
+        Ok(self
+            .store
+            .load_group_state(self.user_id, &self.device_id, guild_id, channel_id)
+            .await?
+            .is_some())
+    }
+
     async fn open_or_create_group(&self, guild_id: GuildId, channel_id: ChannelId) -> Result<()> {
         {
             let mut index = self.channel_index.lock().await;

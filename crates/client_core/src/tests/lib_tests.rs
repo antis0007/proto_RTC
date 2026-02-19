@@ -21,6 +21,7 @@ struct TestMlsSessionManager {
     exported_secret: Vec<u8>,
     joined_welcomes: Arc<Mutex<Vec<Vec<u8>>>>,
     decrypted_ciphertexts: Arc<Mutex<Vec<Vec<u8>>>>,
+    has_persisted_group_state: bool,
 }
 
 impl TestMlsSessionManager {
@@ -34,6 +35,7 @@ impl TestMlsSessionManager {
             exported_secret: b"mls-export-secret".to_vec(),
             joined_welcomes: Arc::new(Mutex::new(Vec::new())),
             decrypted_ciphertexts: Arc::new(Mutex::new(Vec::new())),
+            has_persisted_group_state: false,
         }
     }
 
@@ -47,6 +49,7 @@ impl TestMlsSessionManager {
             exported_secret: Vec::new(),
             joined_welcomes: Arc::new(Mutex::new(Vec::new())),
             decrypted_ciphertexts: Arc::new(Mutex::new(Vec::new())),
+            has_persisted_group_state: false,
         }
     }
 
@@ -54,6 +57,10 @@ impl TestMlsSessionManager {
         let mut manager = Self::ok(Vec::new(), Vec::new());
         manager.exported_secret = secret;
         manager
+    }
+    fn with_persisted_group_state(mut self, has_persisted_group_state: bool) -> Self {
+        self.has_persisted_group_state = has_persisted_group_state;
+        self
     }
 }
 
@@ -64,6 +71,14 @@ impl MlsSessionManager for TestMlsSessionManager {
             return Err(anyhow!(err.clone()));
         }
         Ok(b"test-key-package".to_vec())
+    }
+
+    async fn has_persisted_group_state(
+        &self,
+        _guild_id: GuildId,
+        _channel_id: ChannelId,
+    ) -> Result<bool> {
+        Ok(self.has_persisted_group_state)
     }
 
     async fn open_or_create_group(&self, _guild_id: GuildId, _channel_id: ChannelId) -> Result<()> {
@@ -223,6 +238,33 @@ async fn send_message_requires_active_mls_state() {
         .await
         .expect_err("must fail");
     assert!(err.to_string().contains("uninitialized"));
+}
+
+#[tokio::test]
+async fn send_message_restores_persisted_mls_state_automatically() {
+    let (server_url, payload_rx) = spawn_message_server().await.expect("spawn server");
+    let manager = TestMlsSessionManager::ok(b"mls-ciphertext".to_vec(), Vec::new())
+        .with_persisted_group_state(true);
+    let client = RealtimeClient::new_with_mls_session_manager(PassthroughCrypto, Arc::new(manager));
+
+    {
+        let mut inner = client.inner.lock().await;
+        inner.server_url = Some(server_url);
+        inner.user_id = Some(7);
+        inner.selected_guild = Some(GuildId(11));
+        inner.selected_channel = Some(ChannelId(13));
+    }
+
+    client
+        .send_message("plaintext-message")
+        .await
+        .expect("send");
+
+    let payload = payload_rx.await.expect("payload");
+    assert_eq!(
+        payload.ciphertext_b64,
+        STANDARD.encode("mls-ciphertext".as_bytes())
+    );
 }
 
 fn sample_message() -> MessagePayload {
@@ -467,25 +509,29 @@ struct OnboardingServerState {
     welcome_ready_after_fetches: Arc<Mutex<u32>>,
     add_member_posts: Arc<Mutex<Vec<(i64, i64, i64)>>>,
     stored_ciphertexts: Arc<Mutex<Vec<String>>>,
+    include_target_member: Arc<Mutex<bool>>,
 }
 
-async fn onboarding_list_members() -> Json<Vec<MemberSummary>> {
-    Json(vec![
-        MemberSummary {
-            guild_id: GuildId(11),
-            user_id: shared::domain::UserId(7),
-            username: "adder".to_string(),
-            role: shared::domain::Role::Owner,
-            muted: false,
-        },
-        MemberSummary {
+async fn onboarding_list_members(
+    State(state): State<OnboardingServerState>,
+) -> Json<Vec<MemberSummary>> {
+    let mut members = vec![MemberSummary {
+        guild_id: GuildId(11),
+        user_id: shared::domain::UserId(7),
+        username: "adder".to_string(),
+        role: shared::domain::Role::Owner,
+        muted: false,
+    }];
+    if *state.include_target_member.lock().await {
+        members.push(MemberSummary {
             guild_id: GuildId(11),
             user_id: shared::domain::UserId(42),
             username: "target".to_string(),
             role: shared::domain::Role::Member,
             muted: false,
-        },
-    ])
+        });
+    }
+    Json(members)
 }
 
 async fn onboarding_fetch_key_package() -> Json<KeyPackageResponse> {
@@ -598,6 +644,7 @@ async fn spawn_onboarding_server() -> Result<(String, OnboardingServerState)> {
         welcome_ready_after_fetches: Arc::new(Mutex::new(0)),
         add_member_posts: Arc::new(Mutex::new(Vec::new())),
         stored_ciphertexts: Arc::new(Mutex::new(Vec::new())),
+        include_target_member: Arc::new(Mutex::new(true)),
     };
     let app = Router::new()
         .route(
@@ -927,6 +974,65 @@ async fn onboarding_flow_encrypts_fetches_once_and_renders_plaintext() {
         .await
         .expect("second fetch request");
     assert_eq!(second_welcome_fetch.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn moderator_retries_member_bootstrap_after_new_member_joins() {
+    let (server_url, server_state) = spawn_onboarding_server().await.expect("spawn server");
+    *server_state.include_target_member.lock().await = false;
+
+    let adder = RealtimeClient::new_with_mls_session_manager(
+        PassthroughCrypto,
+        Arc::new(TestMlsSessionManager::ok(
+            b"ciphertext-from-a".to_vec(),
+            Vec::new(),
+        )),
+    );
+    {
+        let mut inner = adder.inner.lock().await;
+        inner.server_url = Some(server_url.clone());
+        inner.user_id = Some(7);
+        inner.selected_guild = Some(GuildId(11));
+        inner.selected_channel = Some(ChannelId(13));
+        inner.channel_guilds.insert(ChannelId(13), GuildId(11));
+    }
+
+    adder
+        .select_channel(ChannelId(13))
+        .await
+        .expect("adder select");
+    assert!(server_state.add_member_posts.lock().await.is_empty());
+
+    *server_state.include_target_member.lock().await = true;
+    adder
+        .send_message("hello after target joined")
+        .await
+        .expect("send triggers add-member retry");
+
+    let posts = server_state.add_member_posts.lock().await.clone();
+    assert_eq!(posts, vec![(11, 13, 42)]);
+
+    let target_mls = TestMlsSessionManager::ok(Vec::new(), b"hello after target joined".to_vec());
+    let joined_welcomes = target_mls.joined_welcomes.clone();
+    let target =
+        RealtimeClient::new_with_mls_session_manager(PassthroughCrypto, Arc::new(target_mls));
+    {
+        let mut inner = target.inner.lock().await;
+        inner.server_url = Some(server_url);
+        inner.user_id = Some(42);
+        inner.selected_guild = Some(GuildId(11));
+        inner.selected_channel = Some(ChannelId(13));
+        inner.channel_guilds.insert(ChannelId(13), GuildId(11));
+    }
+
+    target
+        .select_channel(ChannelId(13))
+        .await
+        .expect("target receives deferred welcome");
+    assert_eq!(
+        joined_welcomes.lock().await.clone(),
+        vec![b"welcome-generated".to_vec()]
+    );
 }
 
 #[tokio::test]

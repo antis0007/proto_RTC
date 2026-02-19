@@ -85,6 +85,11 @@ pub enum LiveKitE2eeKeyError {
 #[async_trait]
 pub trait MlsSessionManager: Send + Sync {
     async fn key_package_bytes(&self, guild_id: GuildId) -> Result<Vec<u8>>;
+    async fn has_persisted_group_state(
+        &self,
+        guild_id: GuildId,
+        channel_id: ChannelId,
+    ) -> Result<bool>;
     async fn open_or_create_group(&self, guild_id: GuildId, channel_id: ChannelId) -> Result<()>;
     async fn encrypt_application(&self, channel_id: ChannelId, plaintext: &[u8])
         -> Result<Vec<u8>>;
@@ -119,6 +124,18 @@ pub struct MissingMlsSessionManager;
 impl MlsSessionManager for MissingMlsSessionManager {
     async fn key_package_bytes(&self, guild_id: GuildId) -> Result<Vec<u8>> {
         Err(anyhow!("MLS backend unavailable for guild {}", guild_id.0))
+    }
+
+    async fn has_persisted_group_state(
+        &self,
+        guild_id: GuildId,
+        channel_id: ChannelId,
+    ) -> Result<bool> {
+        Err(anyhow!(
+            "MLS backend unavailable for guild {} channel {}",
+            guild_id.0,
+            channel_id.0
+        ))
     }
 
     async fn open_or_create_group(&self, guild_id: GuildId, channel_id: ChannelId) -> Result<()> {
@@ -1132,6 +1149,31 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
         Ok(())
     }
 
+    async fn maybe_bootstrap_existing_members_if_moderator(
+        &self,
+        guild_id: GuildId,
+        channel_id: ChannelId,
+        current_user_id: i64,
+    ) -> Result<bool> {
+        let members = match self.fetch_members_for_guild(guild_id).await {
+            Ok(members) => members,
+            Err(_) => return Ok(false),
+        };
+        let current_role = members
+            .iter()
+            .find(|member| member.user_id.0 == current_user_id)
+            .map(|member| member.role);
+        if matches!(
+            current_role,
+            Some(shared::domain::Role::Owner | shared::domain::Role::Mod)
+        ) {
+            self.maybe_add_existing_members_to_channel_group(guild_id, channel_id)
+                .await?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
     async fn active_context(&self) -> Result<(String, i64, GuildId, ChannelId)> {
         let guard = self.inner.lock().await;
         let server_url = guard
@@ -1244,24 +1286,23 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
         attachment: Option<AttachmentPayload>,
     ) -> Result<()> {
         let (_server_url, user_id, guild_id, channel_id) = self.active_context().await?;
+        if let Err(err) = self
+            .maybe_bootstrap_existing_members_if_moderator(guild_id, channel_id, user_id)
+            .await
+        {
+            let _ = self.events.send(ClientEvent::Error(format!(
+                "failed to bootstrap MLS membership for guild {} channel {}: {err}",
+                guild_id.0, channel_id.0
+            )));
+        }
+
         if !self
             .ensure_mls_channel_initialized(guild_id, channel_id)
             .await?
         {
-            let current_role = match self.fetch_members_for_guild(guild_id).await {
-                Ok(members) => members
-                    .iter()
-                    .find(|member| member.user_id.0 == user_id)
-                    .map(|member| member.role),
-                Err(_) => None,
-            };
-            if matches!(
-                current_role,
-                Some(shared::domain::Role::Owner | shared::domain::Role::Mod)
-            ) {
-                self.maybe_add_existing_members_to_channel_group(guild_id, channel_id)
-                    .await?;
-            }
+            let _ = self
+                .maybe_bootstrap_existing_members_if_moderator(guild_id, channel_id, user_id)
+                .await?;
 
             if !self
                 .ensure_mls_channel_initialized(guild_id, channel_id)
@@ -1344,6 +1385,13 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
         }
 
         if self
+            .try_restore_mls_channel_from_local_state(guild_id, channel_id)
+            .await?
+        {
+            return Ok(true);
+        }
+
+        if self
             .maybe_join_from_pending_welcome_with_retry(guild_id, channel_id)
             .await?
         {
@@ -1351,6 +1399,30 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
         }
 
         Ok(false)
+    }
+
+    async fn try_restore_mls_channel_from_local_state(
+        &self,
+        guild_id: GuildId,
+        channel_id: ChannelId,
+    ) -> Result<bool> {
+        if !self
+            .mls_session_manager
+            .has_persisted_group_state(guild_id, channel_id)
+            .await?
+        {
+            return Ok(false);
+        }
+
+        self.mls_session_manager
+            .open_or_create_group(guild_id, channel_id)
+            .await?;
+        self.inner
+            .lock()
+            .await
+            .initialized_mls_channels
+            .insert((guild_id, channel_id));
+        Ok(true)
     }
 
     async fn fetch_messages_impl(
@@ -1608,24 +1680,16 @@ impl<C: CryptoProvider + 'static> ClientHandle for Arc<RealtimeClient<C>> {
         }
         .ok_or_else(|| anyhow!("no guild selected"))?;
 
-        let joined_from_welcome = self
-            .maybe_join_from_pending_welcome_with_retry(guild_id, channel_id)
+        let (_, current_user_id) = self.session().await?;
+        let user_is_moderator = self
+            .maybe_bootstrap_existing_members_if_moderator(guild_id, channel_id, current_user_id)
             .await?;
-        if !joined_from_welcome {
-            let members = self.fetch_members_for_guild(guild_id).await?;
-            let (_, current_user_id) = self.session().await?;
-            let current_role = members
-                .iter()
-                .find(|member| member.user_id.0 == current_user_id)
-                .map(|member| member.role);
-            if matches!(
-                current_role,
-                Some(shared::domain::Role::Owner | shared::domain::Role::Mod)
-            ) {
-                // MVP trigger: perform add-member fanout on first channel interaction for moderators.
-                self.maybe_add_existing_members_to_channel_group(guild_id, channel_id)
-                    .await?;
-            } else {
+
+        let initialized = self
+            .ensure_mls_channel_initialized(guild_id, channel_id)
+            .await?;
+        if !initialized {
+            if !user_is_moderator {
                 return Err(anyhow!(
                     "MLS state for guild {} channel {} is uninitialized; wait for a moderator bootstrap or retry after welcome sync",
                     guild_id.0,
