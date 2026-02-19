@@ -1544,6 +1544,12 @@ impl DesktopGuiApp {
         let auth_ready = self.auth_session_established;
         let backend_supports_profile_edit = false;
 
+        ui.style_mut().spacing.button_padding = egui::vec2(4.0, 1.0);
+        ui.style_mut().visuals.widgets.inactive.rounding = egui::Rounding::same(0.0);
+        ui.style_mut().visuals.widgets.hovered.rounding = egui::Rounding::same(0.0);
+        ui.style_mut().visuals.widgets.active.rounding = egui::Rounding::same(0.0);
+        ui.style_mut().visuals.widgets.open.rounding = egui::Rounding::same(0.0);
+
         ui.set_min_width(260.0);
         ui.label(egui::RichText::new(&self.username).strong());
         ui.small(format!(
@@ -1619,26 +1625,14 @@ impl DesktopGuiApp {
     }
 
     fn show_main_workspace(&mut self, ctx: &egui::Context) {
-        const TOOLBAR_H_PADDING: f32 = 12.0;
+        const TOOLBAR_H_PADDING: f32 = 10.0;
         const TOOLBAR_V_PADDING: f32 = 8.0;
         const SECTION_VERTICAL_GAP: f32 = 8.0;
-        const TOP_BAR_V_PADDING: f32 = 4.0;
-        const ACTION_BAR_V_PADDING: f32 = 6.0;
+        const TOP_BAR_V_PADDING: f32 = 0.0;
 
         let top_bar_bg = theme_discord_dark_palette(self.theme)
             .map(|p| p.navigation_background)
             .unwrap_or(ctx.style().visuals.panel_fill);
-
-        let workspace_label = self
-            .selected_guild
-            .and_then(|guild_id| {
-                self.guilds
-                    .iter()
-                    .find(|guild| guild.guild_id == guild_id)
-                    .map(|guild| guild.name.clone())
-            })
-            .unwrap_or_else(|| "No workspace selected".to_string());
-        let show_workspace_context = self.guilds.len() > 1 && self.selected_guild.is_some();
 
         egui::TopBottomPanel::top("top_bar")
             .frame(
@@ -1652,7 +1646,9 @@ impl DesktopGuiApp {
             .show(ctx, |ui| {
                 ui.scope(|ui| {
                     let style = ui.style_mut();
-                    style.spacing.button_padding.y = 2.0;
+                    style.spacing.button_padding = egui::vec2(4.0, 0.0);
+                    style.spacing.item_spacing.x = 0.0;
+                    style.spacing.interact_size.y = 18.0;
                     style.visuals.widgets.inactive.rounding = egui::Rounding::same(0.0);
                     style.visuals.widgets.hovered.rounding = egui::Rounding::same(0.0);
                     style.visuals.widgets.active.rounding = egui::Rounding::same(0.0);
@@ -1660,7 +1656,26 @@ impl DesktopGuiApp {
 
                     egui::menu::bar(ui, |ui| {
                         ui.menu_button("⚙ Settings", |ui| {
-                            if ui.button("Open").clicked() {
+                            ui.style_mut().spacing.button_padding = egui::vec2(4.0, 0.0);
+                            ui.style_mut().visuals.widgets.inactive.rounding =
+                                egui::Rounding::same(0.0);
+                            ui.style_mut().visuals.widgets.hovered.rounding =
+                                egui::Rounding::same(0.0);
+                            ui.style_mut().visuals.widgets.active.rounding =
+                                egui::Rounding::same(0.0);
+                            ui.style_mut().visuals.widgets.open.rounding =
+                                egui::Rounding::same(0.0);
+
+                            ui.label(egui::RichText::new("Quick settings").weak());
+                            ui.checkbox(&mut self.readability.compact_density, "Compact density");
+                            ui.checkbox(
+                                &mut self.readability.show_timestamps,
+                                "Message timestamps",
+                            );
+                            ui.checkbox(&mut self.notifications_enabled, "Enable notifications");
+                            ui.separator();
+
+                            if ui.button("Advanced settings…").clicked() {
                                 self.settings_open = true;
                                 ui.close_menu();
                             }
@@ -1668,76 +1683,64 @@ impl DesktopGuiApp {
 
                         ui.menu_button("Account", |ui| self.show_account_menu_contents(ui));
 
+                        if ui.button("Refresh Guilds").clicked() {
+                            queue_command(
+                                &self.cmd_tx,
+                                BackendCommand::ListGuilds,
+                                &mut self.status,
+                            );
+                        }
+
                         ui.separator();
-                        ui.weak(format!("Workspace: {workspace_label}"));
-                    });
-                });
-            });
+                        ui.label("Invite:");
 
-        egui::TopBottomPanel::top("workspace_actions_bar")
-            .frame(
-                egui::Frame::none()
-                    .fill(top_bar_bg)
-                    .inner_margin(egui::Margin::symmetric(
-                        TOOLBAR_H_PADDING,
-                        ACTION_BAR_V_PADDING,
-                    )),
-            )
-            .show(ctx, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    if ui.button("Refresh Guilds").clicked() {
-                        queue_command(&self.cmd_tx, BackendCommand::ListGuilds, &mut self.status);
-                    }
+                        let invite_width = ui.available_width().clamp(120.0, 220.0);
+                        let invite_input = ui
+                            .scope(|ui| {
+                                if theme_discord_dark_palette(self.theme).is_some() {
+                                    ui.visuals_mut().override_text_color = None;
+                                }
+                                ui.add_sized(
+                                    [invite_width, ui.spacing().interact_size.y],
+                                    egui::TextEdit::singleline(&mut self.invite_code_input)
+                                        .id_source("main_invite_input")
+                                        .hint_text("Enter invite code"),
+                                )
+                            })
+                            .inner;
 
-                    ui.separator();
-                    ui.label("Invite");
+                        let join_enabled = self.auth_session_established
+                            && !self.invite_code_input.trim().is_empty();
+                        let join_clicked = ui
+                            .add_enabled(join_enabled, egui::Button::new("Join Invite"))
+                            .clicked();
+                        let join_with_enter = invite_input.has_focus()
+                            && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                            && join_enabled;
+                        if join_clicked || join_with_enter {
+                            let invite_code = self.invite_code_input.trim().to_string();
+                            queue_command(
+                                &self.cmd_tx,
+                                BackendCommand::JoinWithInvite { invite_code },
+                                &mut self.status,
+                            );
+                        }
 
-                    let invite_width = (ui.available_width() - 290.0).max(180.0);
-                    let invite_input = ui
-                        .scope(|ui| {
-                            if theme_discord_dark_palette(self.theme).is_some() {
-                                ui.visuals_mut().override_text_color = None;
-                            }
-                            ui.add_sized(
-                                [invite_width, ui.spacing().interact_size.y],
-                                egui::TextEdit::singleline(&mut self.invite_code_input)
-                                    .id_source("main_invite_input")
-                                    .hint_text("Enter invite code"),
-                            )
-                        })
-                        .inner;
-
-                    if ui.button("Paste").clicked() {
-                        if let Ok(mut clipboard) = Clipboard::new() {
-                            if let Ok(text) = clipboard.get_text() {
-                                self.invite_code_input = text;
+                        if ui.button("Create Invite").clicked() {
+                            if let Some(guild_id) = self.selected_guild {
+                                queue_command(
+                                    &self.cmd_tx,
+                                    BackendCommand::CreateInvite { guild_id },
+                                    &mut self.status,
+                                );
+                            } else {
+                                self.status =
+                                    "Select a workspace before creating an invite".to_string();
                             }
                         }
-                    }
-
-                    if ui.button("Clear").clicked() {
-                        self.invite_code_input.clear();
-                    }
-
-                    let join_enabled =
-                        self.auth_session_established && !self.invite_code_input.trim().is_empty();
-                    let join_clicked = ui
-                        .add_enabled(join_enabled, egui::Button::new("Join"))
-                        .clicked();
-                    let join_with_enter = invite_input.has_focus()
-                        && ui.input(|i| i.key_pressed(egui::Key::Enter))
-                        && join_enabled;
-                    if join_clicked || join_with_enter {
-                        let invite_code = self.invite_code_input.trim().to_string();
-                        queue_command(
-                            &self.cmd_tx,
-                            BackendCommand::JoinWithInvite { invite_code },
-                            &mut self.status,
-                        );
-                    }
+                    });
                 });
 
-                ui.add_space(4.0);
                 ui.label(&self.status);
                 self.show_status_banner(ui);
             });
@@ -1934,9 +1937,6 @@ impl DesktopGuiApp {
                 let discord_dark = theme_discord_dark_palette(self.theme);
                 ui.horizontal(|ui| {
                     ui.heading("Channels");
-                    if show_workspace_context {
-                        ui.weak(format!("Workspace: {workspace_label}"));
-                    }
                     let refresh_label = if let Some(palette) = discord_dark {
                         egui::RichText::new("Refresh").color(palette.side_panel_button_text)
                     } else {
