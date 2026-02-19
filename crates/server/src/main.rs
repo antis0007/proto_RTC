@@ -482,10 +482,12 @@ async fn upload_key_package(
         .await
         .map_err(|error| (api_error_status(&error), Json(error)))?;
 
+    let guild_id = GuildId(q.guild_id);
+    let user_id = UserId(q.user_id);
     let key_package_id = state
         .api
         .storage
-        .insert_key_package(GuildId(q.guild_id), UserId(q.user_id), &body)
+        .insert_key_package(guild_id, user_id, &body)
         .await
         .map_err(|e| {
             (
@@ -493,6 +495,12 @@ async fn upload_key_package(
                 Json(ApiError::new(ErrorCode::Internal, e.to_string())),
             )
         })?;
+
+    if let Ok(members) = list_members(&state.api, user_id, guild_id).await {
+        let _ = state
+            .events
+            .send(ServerEvent::GuildMembersUpdated { guild_id, members });
+    }
 
     Ok(Json(UploadKeyPackageResponse { key_package_id }))
 }

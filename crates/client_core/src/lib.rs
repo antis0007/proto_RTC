@@ -846,16 +846,27 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
                                 if let Err(err) = client.emit_decrypted_message(message).await {
                                     let _ = client.events.send(ClientEvent::Error(err.to_string()));
                                 }
-                            } else if let ServerEvent::GuildMembersUpdated { guild_id, .. } =
-                                event.clone()
+                            } else if let ServerEvent::GuildMembersUpdated { guild_id, members } =
+                                &event
                             {
-                                if let Err(err) = client.reconcile_mls_state_for_guild(guild_id).await {
-                                    let _ = client.events.send(ClientEvent::Error(format!(
-                                        "failed to reconcile MLS state for guild {} after membership update: {err}",
-                                        guild_id.0
-                                    )));
-                                }
-                                let _ = client.events.send(ClientEvent::Server(event));
+                                let _ = client.events.send(ClientEvent::Server(
+                                    ServerEvent::GuildMembersUpdated {
+                                        guild_id: *guild_id,
+                                        members: members.clone(),
+                                    },
+                                ));
+                                let guild_id = *guild_id;
+                                let client_clone = Arc::clone(&client);
+                                tokio::spawn(async move {
+                                    if let Err(err) =
+                                        client_clone.reconcile_mls_state_for_guild(guild_id).await
+                                    {
+                                        let _ = client_clone.events.send(ClientEvent::Error(format!(
+                                            "failed to reconcile MLS state for guild {} after membership update: {err}",
+                                            guild_id.0
+                                        )));
+                                    }
+                                });
                             } else {
                                 let _ = client.events.send(ClientEvent::Server(event));
                             }
@@ -1586,7 +1597,8 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
             }
         }
 
-        self.prewarm_mls_for_guild_channels(guild_id, &channels).await
+        self.prewarm_mls_for_guild_channels(guild_id, &channels)
+            .await
     }
 }
 
