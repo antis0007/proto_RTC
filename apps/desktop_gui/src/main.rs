@@ -1890,9 +1890,10 @@ impl DesktopGuiApp {
                     egui::Layout::left_to_right(egui::Align::Min),
                     |ui| {
                         let guilds_width = style.layout.guilds_panel_width;
+                        let top_region_height = ui.max_rect().height();
 
                         ui.allocate_ui_with_layout(
-                            egui::vec2(guilds_width, ui.available_height()),
+                            egui::vec2(guilds_width, top_region_height),
                             egui::Layout::top_down(egui::Align::Min),
                             |ui| {
                                 ui.heading("Guilds");
@@ -1974,8 +1975,10 @@ impl DesktopGuiApp {
 
                         ui.separator();
 
+                        let channels_width =
+                            (ui.available_width() - ui.spacing().item_spacing.x).max(0.0);
                         ui.allocate_ui_with_layout(
-                            ui.available_size(),
+                            egui::vec2(channels_width, top_region_height),
                             egui::Layout::top_down(egui::Align::Min),
                             |ui| {
                                 self.show_channels_panel_header(ui, discord_dark);
