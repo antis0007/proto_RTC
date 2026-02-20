@@ -25,8 +25,9 @@ impl DurableMlsSessionManager {
         user_id: i64,
         device_id: impl Into<String>,
     ) -> Result<Arc<Self>> {
-        Self::ensure_sqlite_parent_dirs(database_url)
-            .with_context(|| format!("failed to prepare parent directories for '{database_url}'"))?;
+        Self::ensure_sqlite_parent_dirs(database_url).with_context(|| {
+            format!("failed to prepare parent directories for '{database_url}'")
+        })?;
 
         let store = Storage::new(database_url)
             .await
@@ -170,11 +171,12 @@ impl DurableMlsSessionManager {
 impl MlsSessionManager for DurableMlsSessionManager {
     async fn key_package_bytes(&self, guild_id: GuildId) -> Result<Vec<u8>> {
         let mut sessions = self.sessions.lock().await;
-        if let Some(existing_handle) = sessions
-            .iter_mut()
-            .find_map(|((session_guild_id, _), handle)| {
-                (*session_guild_id == guild_id).then_some(handle)
-            })
+        if let Some(existing_handle) =
+            sessions
+                .iter_mut()
+                .find_map(|((session_guild_id, _), handle)| {
+                    (*session_guild_id == guild_id).then_some(handle)
+                })
         {
             return existing_handle.key_package_bytes().await;
         }

@@ -204,7 +204,6 @@ impl MlsSessionManager for TestMlsSessionManager {
     }
 }
 
-
 async fn handle_send_message(
     State(state): State<ServerState>,
     Json(payload): Json<SendMessageHttpRequest>,

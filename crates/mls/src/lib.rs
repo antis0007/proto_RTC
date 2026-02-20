@@ -112,11 +112,7 @@ pub trait MlsStore: Send + Sync {
         identity_bytes: &[u8],
     ) -> Result<()>;
 
-    async fn load_identity_keys(
-        &self,
-        user_id: i64,
-        device_id: &str,
-    ) -> Result<Option<Vec<u8>>>;
+    async fn load_identity_keys(&self, user_id: i64, device_id: &str) -> Result<Option<Vec<u8>>>;
 
     async fn save_group_state(
         &self,
@@ -451,7 +447,6 @@ impl<S: MlsStore> MlsGroupHandle<S> {
         }
     }
 
-
     pub fn export_secret(&self, label: &str, len: usize) -> Result<Vec<u8>> {
         let group = self
             .group
@@ -783,7 +778,10 @@ mod tests {
         .await
         .expect("bob handle");
 
-        let bob_kp = bob.key_package_bytes().await.expect("bob key package bytes");
+        let bob_kp = bob
+            .key_package_bytes()
+            .await
+            .expect("bob key package bytes");
         alice.create_group(channel_id).await.expect("create group");
 
         let (_commit, welcome) = alice.add_member(&bob_kp).await.expect("add member");
@@ -840,7 +838,10 @@ mod tests {
         )
         .await
         .expect("alice handle");
-        alice.create_group(channel_id).await.expect("create alice group");
+        alice
+            .create_group(channel_id)
+            .await
+            .expect("create alice group");
 
         let mut bob_gen = MlsGroupHandle::new(
             store.clone(),
