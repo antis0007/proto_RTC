@@ -902,6 +902,33 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
                                         ));
                                     }
                                 });
+                            } else if let ServerEvent::MlsBootstrapRequested {
+                                guild_id,
+                                channel_id,
+                                requesting_user_id,
+                            } = event
+                            {
+                                let client_clone = Arc::clone(&client);
+                                tokio::spawn(async move {
+                                    let Ok((_, current_user_id)) = client_clone.session().await
+                                    else {
+                                        return;
+                                    };
+                                    info!(
+                                        guild_id = guild_id.0,
+                                        channel_id = channel_id.0,
+                                        requesting_user_id = requesting_user_id.0,
+                                        current_user_id,
+                                        "mls: received bootstrap request event"
+                                    );
+                                    let _ = client_clone
+                                        .maybe_bootstrap_existing_members_if_moderator(
+                                            guild_id,
+                                            channel_id,
+                                            current_user_id,
+                                        )
+                                        .await;
+                                });
                             } else {
                                 let _ = client.events.send(ClientEvent::Server(event));
                             }
@@ -1057,6 +1084,27 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
         Ok(())
     }
 
+    async fn request_mls_bootstrap(&self, guild_id: GuildId, channel_id: ChannelId) -> Result<()> {
+        let (server_url, user_id) = self.session().await?;
+        self.http
+            .post(format!("{server_url}/mls/bootstrap/request"))
+            .query(&[
+                ("user_id", user_id),
+                ("guild_id", guild_id.0),
+                ("channel_id", channel_id.0),
+            ])
+            .send()
+            .await?
+            .error_for_status()?;
+        info!(
+            guild_id = guild_id.0,
+            channel_id = channel_id.0,
+            requester_user_id = user_id,
+            "mls: bootstrap request posted"
+        );
+        Ok(())
+    }
+
     async fn maybe_join_from_pending_welcome(
         &self,
         guild_id: GuildId,
@@ -1137,6 +1185,8 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
                 tokio::time::sleep(WELCOME_SYNC_RETRY_DELAY).await;
             }
         }
+
+        let _ = self.request_mls_bootstrap(guild_id, channel_id).await;
 
         Ok(false)
     }

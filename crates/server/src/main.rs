@@ -2,9 +2,9 @@ use std::{net::SocketAddr, sync::Arc};
 
 use crate::api::{
     ensure_active_membership_in_channel, ensure_active_membership_in_guild, list_channels,
-    list_guilds, list_members, list_messages, mls_key_packages_route, mls_welcome_route,
-    request_livekit_token, send_message, ApiContext, KeyPackageResponse, MlsKeyPackageQuery,
-    MlsWelcomeQuery, MlsWelcomeResponse, UploadKeyPackageResponse,
+    list_guilds, list_members, list_messages, mls_bootstrap_request_route, mls_key_packages_route,
+    mls_welcome_route, request_livekit_token, send_message, ApiContext, KeyPackageResponse,
+    MlsKeyPackageQuery, MlsWelcomeQuery, MlsWelcomeResponse, UploadKeyPackageResponse,
 };
 use crate::livekit::LiveKitConfig;
 use axum::{
@@ -121,6 +121,13 @@ struct StorePendingWelcomeQuery {
     target_user_id: i64,
 }
 
+#[derive(Debug, Deserialize)]
+struct MlsBootstrapRequestQuery {
+    user_id: i64,
+    guild_id: i64,
+    channel_id: i64,
+}
+
 const MAX_ATTACHMENT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_FILENAME_BYTES: usize = 180;
 
@@ -221,6 +228,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route(mls_key_packages_route(), get(fetch_key_package))
         .route(mls_welcome_route(), post(store_pending_welcome))
         .route(mls_welcome_route(), get(fetch_pending_welcome))
+        .route(mls_bootstrap_request_route(), post(request_mls_bootstrap))
         .route("/ws", get(ws_handler))
         .with_state(state)
 }
@@ -671,6 +679,35 @@ async fn store_pending_welcome(
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn request_mls_bootstrap(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<MlsBootstrapRequestQuery>,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    ensure_active_membership_in_channel(
+        &state.api,
+        UserId(q.user_id),
+        GuildId(q.guild_id),
+        ChannelId(q.channel_id),
+    )
+    .await
+    .map_err(|error| (api_error_status(&error), Json(error)))?;
+
+    let _ = state.events.send(ServerEvent::MlsBootstrapRequested {
+        guild_id: GuildId(q.guild_id),
+        channel_id: ChannelId(q.channel_id),
+        requesting_user_id: UserId(q.user_id),
+    });
+
+    info!(
+        guild_id = q.guild_id,
+        channel_id = q.channel_id,
+        requesting_user_id = q.user_id,
+        "mls: bootstrap requested"
+    );
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
@@ -757,7 +794,8 @@ async fn is_event_visible_to_user(
             target_user_id,
         } => *target_user_id == user_id || is_member(*guild_id).await,
         ServerEvent::LiveKitTokenIssued { guild_id, .. }
-        | ServerEvent::MlsWelcomeAvailable { guild_id, .. } => is_member(*guild_id).await,
+        | ServerEvent::MlsWelcomeAvailable { guild_id, .. }
+        | ServerEvent::MlsBootstrapRequested { guild_id, .. } => is_member(*guild_id).await,
         ServerEvent::FileStored { .. } | ServerEvent::Error(_) => true,
     }
 }
