@@ -1341,6 +1341,7 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn emit_mls_failure_event(
         &self,
         category: MlsFailureCategory,
@@ -1621,7 +1622,7 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
                     member.user_id.0,
                 ))
             };
-            if already_added && !target_user_id.is_some_and(|target| target == member.user_id.0) {
+            if already_added && target_user_id.is_none_or(|target| target != member.user_id.0) {
                 continue;
             }
 
