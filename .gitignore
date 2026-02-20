@@ -6,3 +6,5 @@ Cargo.lock
 *.db
 *.db-*
 .DS_Store
+/data/
+/logs/

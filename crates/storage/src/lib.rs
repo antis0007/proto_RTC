@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use mls::{MlsStore, PersistedGroupSnapshot};
 use sqlx::{
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
-    Pool, Sqlite,
+    Pool, Row, Sqlite,
 };
 use std::{
     fs,
@@ -89,6 +89,64 @@ impl Storage {
             .fetch_one(&self.pool)
             .await
             .context("sqlite ping failed")?;
+        Ok(())
+    }
+
+
+    async fn ensure_pending_join_table(&self) -> Result<()> {
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS mls_pending_join_state (
+                user_id           INTEGER NOT NULL,
+                device_id         TEXT NOT NULL,
+                guild_id          INTEGER NOT NULL,
+                schema_version    INTEGER NOT NULL,
+                group_state_blob  BLOB NOT NULL,
+                key_material_blob BLOB NOT NULL,
+                created_at        TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at        TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (user_id, device_id, guild_id)
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to ensure mls_pending_join_state table exists")?;
+
+        let pragma_rows = sqlx::query("PRAGMA table_info(mls_pending_join_state)")
+            .fetch_all(&self.pool)
+            .await
+            .context("failed to inspect mls_pending_join_state schema")?;
+
+        let mut has_created_at = false;
+        let mut has_updated_at = false;
+        for row in pragma_rows {
+            let col_name: String = row.try_get("name")?;
+            if col_name == "created_at" {
+                has_created_at = true;
+            } else if col_name == "updated_at" {
+                has_updated_at = true;
+            }
+        }
+
+        if !has_created_at {
+            sqlx::query(
+                "ALTER TABLE mls_pending_join_state ADD COLUMN created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP",
+            )
+            .execute(&self.pool)
+            .await
+            .context("failed adding created_at column to mls_pending_join_state")?;
+        }
+
+        if !has_updated_at {
+            sqlx::query(
+                "ALTER TABLE mls_pending_join_state ADD COLUMN updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP",
+            )
+            .execute(&self.pool)
+            .await
+            .context("failed adding updated_at column to mls_pending_join_state")?;
+        }
+
         Ok(())
     }
 
@@ -521,6 +579,82 @@ impl Storage {
             consumed_at: r.get::<DateTime<Utc>, _>(1),
         }))
     }
+
+
+    /// Deletes the persisted MLS group snapshot for a single channel on this device.
+    ///
+    /// This is the main self-heal primitive for stale local MLS roster state (e.g. the
+    /// client believes a member is in the roster, but the server has no welcome history
+    /// after a dev/test DB reset). Identity keys are intentionally preserved.
+    pub async fn clear_mls_group_state(
+        &self,
+        user_id: i64,
+        device_id: &str,
+        guild_id: GuildId,
+        channel_id: ChannelId,
+    ) -> Result<bool> {
+        let result = sqlx::query(
+            "DELETE FROM mls_group_states WHERE user_id = ? AND device_id = ? AND guild_id = ? AND channel_id = ?",
+        )
+        .bind(user_id)
+        .bind(device_id)
+        .bind(guild_id.0)
+        .bind(channel_id.0)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Deletes all persisted MLS group snapshots for a user/device pair while keeping
+    /// identity keys intact. Useful when the server database has been reset in local dev.
+    pub async fn clear_all_mls_group_states_for_device(
+        &self,
+        user_id: i64,
+        device_id: &str,
+    ) -> Result<u64> {
+        let result = sqlx::query(
+            "DELETE FROM mls_group_states WHERE user_id = ? AND device_id = ?",
+        )
+        .bind(user_id)
+        .bind(device_id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected())
+    }
+
+    /// Full local MLS reset for a user/device: clears group snapshots and identity keys.
+    /// Prefer `clear_mls_group_state` or `clear_all_mls_group_states_for_device` first;
+    /// this is a stronger fallback if local cryptographic material is corrupted.
+    pub async fn clear_all_mls_state_for_device(
+        &self,
+        user_id: i64,
+        device_id: &str,
+    ) -> Result<(u64, u64)> {
+        let mut tx = self.pool.begin().await?;
+
+        let groups = sqlx::query(
+            "DELETE FROM mls_group_states WHERE user_id = ? AND device_id = ?",
+        )
+        .bind(user_id)
+        .bind(device_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+
+        let identities = sqlx::query(
+            "DELETE FROM mls_identity_keys WHERE user_id = ? AND device_id = ?",
+        )
+        .bind(user_id)
+        .bind(device_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+
+        tx.commit().await?;
+        Ok((groups, identities))
+    }
 }
 
 fn ensure_sqlite_parent_dir_exists(database_url: &str) -> Result<()> {
@@ -560,8 +694,6 @@ fn sqlite_path(database_url: &str) -> Option<PathBuf> {
 
     Some(Path::new(path).to_path_buf())
 }
-
-use sqlx::Row;
 
 #[async_trait]
 impl MlsStore for Storage {
@@ -672,6 +804,91 @@ impl MlsStore for Storage {
             }
         }))
     }
+
+    async fn save_pending_join_state(
+        &self,
+        user_id: i64,
+        device_id: &str,
+        guild_id: GuildId,
+        snapshot: PersistedGroupSnapshot,
+    ) -> Result<()> {
+        self.ensure_pending_join_table().await?;
+        sqlx::query(
+            r#"
+            INSERT INTO mls_pending_join_state (
+                user_id,
+                device_id,
+                guild_id,
+                schema_version,
+                group_state_blob,
+                key_material_blob,
+                created_at,
+                updated_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            ON CONFLICT(user_id, device_id, guild_id) DO UPDATE SET
+                schema_version = excluded.schema_version,
+                group_state_blob = excluded.group_state_blob,
+                key_material_blob = excluded.key_material_blob,
+                updated_at = CURRENT_TIMESTAMP
+            "#,
+        )
+        .bind(user_id)
+        .bind(device_id)
+        .bind(guild_id.0)
+        .bind(snapshot.schema_version)
+        .bind(snapshot.group_state_blob)
+        .bind(snapshot.key_material_blob)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn load_pending_join_state(
+        &self,
+        user_id: i64,
+        device_id: &str,
+        guild_id: GuildId,
+    ) -> Result<Option<PersistedGroupSnapshot>> {
+        self.ensure_pending_join_table().await?;
+        let row = sqlx::query(
+            r#"
+            SELECT schema_version, group_state_blob, key_material_blob
+            FROM mls_pending_join_state
+            WHERE user_id = ?1 AND device_id = ?2 AND guild_id = ?3
+            "#,
+        )
+        .bind(user_id)
+        .bind(device_id)
+        .bind(guild_id.0)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(|row| PersistedGroupSnapshot {
+            schema_version: row.get::<i32, _>("schema_version"),
+            group_state_blob: row.get::<Vec<u8>, _>("group_state_blob"),
+            key_material_blob: row.get::<Vec<u8>, _>("key_material_blob"),
+        }))
+    }
+
+    async fn clear_pending_join_state(
+        &self,
+        user_id: i64,
+        device_id: &str,
+        guild_id: GuildId,
+    ) -> Result<()> {
+        self.ensure_pending_join_table().await?;
+        sqlx::query(
+            "DELETE FROM mls_pending_join_state WHERE user_id = ?1 AND device_id = ?2 AND guild_id = ?3",
+        )
+        .bind(user_id)
+        .bind(device_id)
+        .bind(guild_id.0)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
 }
 
 #[cfg(test)]

@@ -795,10 +795,10 @@ async fn issue_recovery_welcome(
         })?
         .ok_or_else(|| {
             (
-                StatusCode::NOT_FOUND,
+                StatusCode::CONFLICT,
                 Json(ApiError::new(
-                    ErrorCode::NotFound,
-                    "no welcome material available for recovery",
+                    ErrorCode::Validation,
+                    "no welcome material available for recovery (server has no persisted welcome history for target)",
                 )),
             )
         })?;

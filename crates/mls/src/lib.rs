@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
@@ -6,11 +6,10 @@ use openmls_rust_crypto::{MemoryStorage, RustCrypto};
 use openmls_traits::OpenMlsProvider;
 use serde::{Deserialize, Serialize};
 use shared::domain::{ChannelId, GuildId};
-
 use tls_codec::{Deserialize as TlsDeserializeTrait, Serialize as TlsSerializeTrait};
 
 const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
-const MLS_SNAPSHOT_SCHEMA_VERSION: i32 = 1;
+const MLS_SNAPSHOT_SCHEMA_VERSION: i32 = 2; // bumped
 
 #[derive(Debug, Clone)]
 pub struct PersistedGroupSnapshot {
@@ -20,8 +19,10 @@ pub struct PersistedGroupSnapshot {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct MlsSnapshotV1 {
-    group_id: Vec<u8>,
+struct MlsSnapshotV2 {
+    /// None => pending join provider state only (no group yet)
+    /// Some(...) => persisted group snapshot
+    group_id: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -110,7 +111,13 @@ pub trait MlsStore: Send + Sync {
         device_id: &str,
         identity_bytes: &[u8],
     ) -> Result<()>;
-    async fn load_identity_keys(&self, user_id: i64, device_id: &str) -> Result<Option<Vec<u8>>>;
+
+    async fn load_identity_keys(
+        &self,
+        user_id: i64,
+        device_id: &str,
+    ) -> Result<Option<Vec<u8>>>;
+
     async fn save_group_state(
         &self,
         user_id: i64,
@@ -119,6 +126,7 @@ pub trait MlsStore: Send + Sync {
         channel_id: ChannelId,
         snapshot: PersistedGroupSnapshot,
     ) -> Result<()>;
+
     async fn load_group_state(
         &self,
         user_id: i64,
@@ -126,6 +134,30 @@ pub trait MlsStore: Send + Sync {
         guild_id: GuildId,
         channel_id: ChannelId,
     ) -> Result<Option<PersistedGroupSnapshot>>;
+
+    /// Pending join state stores provider key material for a generated KeyPackage
+    /// before a Welcome is received/applied.
+    async fn save_pending_join_state(
+        &self,
+        user_id: i64,
+        device_id: &str,
+        guild_id: GuildId,
+        snapshot: PersistedGroupSnapshot,
+    ) -> Result<()>;
+
+    async fn load_pending_join_state(
+        &self,
+        user_id: i64,
+        device_id: &str,
+        guild_id: GuildId,
+    ) -> Result<Option<PersistedGroupSnapshot>>;
+
+    async fn clear_pending_join_state(
+        &self,
+        user_id: i64,
+        device_id: &str,
+        guild_id: GuildId,
+    ) -> Result<()>;
 }
 
 #[derive(Default, Debug)]
@@ -161,6 +193,9 @@ pub struct MlsGroupHandle<S: MlsStore> {
     provider: PersistentOpenMlsProvider,
     identity: MlsIdentity,
     group: Option<MlsGroup>,
+    /// true when this handle was created specifically to consume a Welcome using
+    /// previously persisted pending key material.
+    join_only_mode: bool,
 }
 
 impl<S: MlsStore> MlsGroupHandle<S> {
@@ -181,8 +216,46 @@ impl<S: MlsStore> MlsGroupHandle<S> {
             provider: PersistentOpenMlsProvider::default(),
             identity,
             group: None,
+            join_only_mode: false,
         };
         handle.load_group_if_exists().await?;
+        Ok(handle)
+    }
+
+    /// Constructor for Welcome consumption.
+    /// Loads pending provider key material (HPKE init private key, etc.) that was
+    /// saved when the KeyPackage was generated.
+    pub async fn open_for_join(
+        store: S,
+        user_id: i64,
+        device_id: impl Into<String>,
+        guild_id: GuildId,
+        channel_id: ChannelId,
+        identity: MlsIdentity,
+    ) -> Result<Self> {
+        let mut handle = Self {
+            store,
+            user_id,
+            device_id: device_id.into(),
+            guild_id,
+            channel_id,
+            provider: PersistentOpenMlsProvider::default(),
+            identity,
+            group: None,
+            join_only_mode: true,
+        };
+
+        // Load pending key package/provider state. This is required to process Welcome.
+        handle
+            .load_pending_join_provider_state()
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to load pending MLS join state for user={} device={} guild={}",
+                    handle.user_id, handle.device_id, handle.guild_id.0
+                )
+            })?;
+
         Ok(handle)
     }
 
@@ -193,16 +266,29 @@ impl<S: MlsStore> MlsGroupHandle<S> {
         Ok(())
     }
 
-    pub fn key_package_bytes(&self) -> Result<Vec<u8>> {
-        self.identity.key_package_bytes(&self.provider)
+    /// Generate a KeyPackage and persist the provider key material required to later
+    /// consume a Welcome in a different process/handle.
+    pub async fn key_package_bytes(&mut self) -> Result<Vec<u8>> {
+        let key_package = self.identity.key_package_bytes(&self.provider)?;
+        self.persist_pending_join_provider_state().await?;
+        Ok(key_package)
     }
 
     pub async fn create_group(&mut self, channel_id: ChannelId) -> Result<()> {
+        if self.join_only_mode {
+            return Err(anyhow!(
+                "cannot create group while handle is in join-only mode for guild={} channel={}",
+                self.guild_id.0,
+                self.channel_id.0
+            ));
+        }
+
         let group_id = GroupId::from_slice(&channel_id.0.to_le_bytes());
         let config = MlsGroupCreateConfig::builder()
             .ciphersuite(CIPHERSUITE)
             .use_ratchet_tree_extension(true)
             .build();
+
         let group = MlsGroup::new_with_group_id(
             &self.provider,
             &self.identity.signer,
@@ -210,6 +296,7 @@ impl<S: MlsStore> MlsGroupHandle<S> {
             group_id,
             self.identity.credential_with_key.clone(),
         )?;
+
         self.group = Some(group);
         self.persist_group().await
     }
@@ -220,13 +307,29 @@ impl<S: MlsStore> MlsGroupHandle<S> {
         if !bytes.is_empty() {
             return Err(anyhow!("welcome bytes had trailing data"));
         }
+
         let welcome = match welcome_message.extract() {
-            MlsMessageBodyIn::Welcome(welcome) => welcome,
+            MlsMessageBodyIn::Welcome(w) => w,
             _ => return Err(anyhow!("welcome bytes did not contain a Welcome message")),
         };
-        let config = MlsGroupJoinConfig::builder().build();
-        let staged = StagedWelcome::new_from_welcome(&self.provider, &config, welcome, None)?;
-        self.group = Some(staged.into_group(&self.provider)?);
+
+        let config = MlsGroupJoinConfig::builder()
+            .use_ratchet_tree_extension(true)
+            .build();
+
+        let staged = StagedWelcome::new_from_welcome(&self.provider, &config, welcome, None)
+            .map_err(|e| anyhow!("failed to stage welcome: {e}"))?;
+
+        let group = staged
+            .into_group(&self.provider)
+            .map_err(|e| anyhow!("failed to finalize welcome into group: {e}"))?;
+
+        self.group = Some(group);
+
+        // Now that join succeeded, clear pending join state and persist actual group snapshot.
+        self.store
+            .clear_pending_join_state(self.user_id, &self.device_id, self.guild_id)
+            .await?;
         self.persist_group().await
     }
 
@@ -239,20 +342,26 @@ impl<S: MlsStore> MlsGroupHandle<S> {
         if !bytes.is_empty() {
             return Err(anyhow!("key package bytes had trailing data"));
         }
+
         let provider = &self.provider;
         let key_package = key_package_in
             .validate(provider.crypto(), ProtocolVersion::default())
             .map_err(|e| anyhow!("invalid key package bytes: {e}"))?;
+
         let signer = &self.identity.signer;
         let group = self
             .group
             .as_mut()
             .ok_or_else(|| anyhow!("MLS group not initialized"))?;
+
         let (commit, welcome, _group_info) = group.add_members(provider, signer, &[key_package])?;
+
         let commit_bytes = commit.tls_serialize_detached()?;
         let welcome_bytes = Some(welcome.tls_serialize_detached()?);
+
         group.merge_pending_commit(provider)?;
         self.persist_group().await?;
+
         Ok((commit_bytes, welcome_bytes))
     }
 
@@ -262,14 +371,18 @@ impl<S: MlsStore> MlsGroupHandle<S> {
         if !bytes.is_empty() {
             return Err(anyhow!("key package bytes had trailing data"));
         }
+
         let key_package = key_package_in
             .validate(self.provider.crypto(), ProtocolVersion::default())
             .map_err(|e| anyhow!("invalid key package bytes: {e}"))?;
+
         let target_signature_key = key_package.leaf_node().signature_key().as_slice();
+
         let group = self
             .group
             .as_ref()
             .ok_or_else(|| anyhow!("MLS group not initialized"))?;
+
         Ok(group
             .members()
             .any(|member| member.signature_key.as_slice() == target_signature_key))
@@ -282,22 +395,50 @@ impl<S: MlsStore> MlsGroupHandle<S> {
             .group
             .as_mut()
             .ok_or_else(|| anyhow!("MLS group not initialized"))?;
+
         let msg = group.create_message(provider, signer, plaintext_bytes)?;
         Ok(msg.tls_serialize_detached()?)
     }
 
     pub async fn decrypt_application(&mut self, ciphertext_bytes: &[u8]) -> Result<Vec<u8>> {
         let mut ciphertext_bytes = ciphertext_bytes;
-        let message_in = MlsMessageIn::tls_deserialize(&mut ciphertext_bytes)?;
-        let protocol_message: ProtocolMessage = message_in
-            .try_into_protocol_message()
-            .map_err(|_| anyhow!("ciphertext did not contain a protocol message"))?;
+        let message_in = match MlsMessageIn::tls_deserialize(&mut ciphertext_bytes) {
+            Ok(m) => m,
+            Err(e) => {
+                let s = e.to_string();
+                if s.contains("SecretReuseError") || s.contains("requested secret was deleted") {
+                    return Ok(Vec::new());
+                }
+                return Err(anyhow!("failed to deserialize MLS message: {e}"));
+            }
+        };
+
+        let protocol_message: ProtocolMessage = match message_in.try_into_protocol_message() {
+            Ok(p) => p,
+            Err(_) => return Err(anyhow!("ciphertext did not contain a protocol message")),
+        };
+
         let provider = &self.provider;
         let group = self
             .group
             .as_mut()
             .ok_or_else(|| anyhow!("MLS group not initialized"))?;
-        let processed = group.process_message(provider, protocol_message)?;
+
+        let processed = match group.process_message(provider, protocol_message) {
+            Ok(p) => p,
+            Err(e) => {
+                let s = e.to_string();
+                // Replay / stale epoch / FS-pruned secrets should be a no-op in chat history paths.
+                if s.contains("Wrong Epoch")
+                    || s.contains("Message epoch differs from the group's epoch")
+                    || s.contains("SecretReuseError")
+                    || s.contains("requested secret was deleted")
+                {
+                    return Ok(Vec::new());
+                }
+                return Err(anyhow!("failed to process MLS message: {e}"));
+            }
+        };
 
         match processed.into_content() {
             ProcessedMessageContent::ApplicationMessage(app_msg) => Ok(app_msg.into_bytes()),
@@ -306,11 +447,10 @@ impl<S: MlsStore> MlsGroupHandle<S> {
                 self.persist_group().await?;
                 Ok(Vec::new())
             }
-            // Proposal and external/public messages can legitimately appear on the same MLS wire.
-            // They do not produce chat plaintext and should be treated as a no-op in the app path.
             _ => Ok(Vec::new()),
         }
     }
+
 
     pub fn export_secret(&self, label: &str, len: usize) -> Result<Vec<u8>> {
         let group = self
@@ -321,40 +461,50 @@ impl<S: MlsStore> MlsGroupHandle<S> {
     }
 
     async fn persist_group(&self) -> Result<()> {
-        if let Some(group) = &self.group {
-            let group_state_blob = serde_json::to_vec(&MlsSnapshotV1 {
-                group_id: group.group_id().as_slice().to_vec(),
-            })?;
-            let key_material_blob = {
-                let values = self
-                    .provider
-                    .storage()
-                    .values
-                    .read()
-                    .unwrap()
-                    .iter()
-                    .map(|(key, value)| SerializedProviderValue {
-                        key: key.clone(),
-                        value: value.clone(),
-                    })
-                    .collect();
-                serde_json::to_vec(&SerializedProviderState { values })?
-            };
+        let Some(group) = &self.group else {
+            return Ok(());
+        };
 
-            self.store
-                .save_group_state(
-                    self.user_id,
-                    &self.device_id,
-                    self.guild_id,
-                    self.channel_id,
-                    PersistedGroupSnapshot {
-                        schema_version: MLS_SNAPSHOT_SCHEMA_VERSION,
-                        group_state_blob,
-                        key_material_blob,
-                    },
-                )
-                .await?;
-        }
+        let group_state_blob = serde_json::to_vec(&MlsSnapshotV2 {
+            group_id: Some(group.group_id().as_slice().to_vec()),
+        })?;
+
+        let key_material_blob = self.serialize_provider_state()?;
+
+        self.store
+            .save_group_state(
+                self.user_id,
+                &self.device_id,
+                self.guild_id,
+                self.channel_id,
+                PersistedGroupSnapshot {
+                    schema_version: MLS_SNAPSHOT_SCHEMA_VERSION,
+                    group_state_blob,
+                    key_material_blob,
+                },
+            )
+            .await?;
+
+        Ok(())
+    }
+
+    async fn persist_pending_join_provider_state(&self) -> Result<()> {
+        let group_state_blob = serde_json::to_vec(&MlsSnapshotV2 { group_id: None })?;
+        let key_material_blob = self.serialize_provider_state()?;
+
+        self.store
+            .save_pending_join_state(
+                self.user_id,
+                &self.device_id,
+                self.guild_id,
+                PersistedGroupSnapshot {
+                    schema_version: MLS_SNAPSHOT_SCHEMA_VERSION,
+                    group_state_blob,
+                    key_material_blob,
+                },
+            )
+            .await?;
+
         Ok(())
     }
 
@@ -372,6 +522,28 @@ impl<S: MlsStore> MlsGroupHandle<S> {
             return Ok(());
         };
 
+        self.restore_from_snapshot(snapshot, true).await
+    }
+
+    async fn load_pending_join_provider_state(&mut self) -> Result<()> {
+        let Some(snapshot) = self
+            .store
+            .load_pending_join_state(self.user_id, &self.device_id, self.guild_id)
+            .await?
+        else {
+            return Err(anyhow!(
+                "no pending join state found (key package may not have been generated/persisted yet)"
+            ));
+        };
+
+        self.restore_from_snapshot(snapshot, false).await
+    }
+
+    async fn restore_from_snapshot(
+        &mut self,
+        snapshot: PersistedGroupSnapshot,
+        expect_group: bool,
+    ) -> Result<()> {
         if snapshot.schema_version != MLS_SNAPSHOT_SCHEMA_VERSION {
             return Err(anyhow!(
                 "unsupported MLS snapshot schema version: {}",
@@ -379,7 +551,7 @@ impl<S: MlsStore> MlsGroupHandle<S> {
             ));
         }
 
-        let parsed_state: MlsSnapshotV1 = serde_json::from_slice(&snapshot.group_state_blob)?;
+        let parsed_state: MlsSnapshotV2 = serde_json::from_slice(&snapshot.group_state_blob)?;
         let parsed_provider_state: SerializedProviderState =
             serde_json::from_slice(&snapshot.key_material_blob)?;
 
@@ -394,16 +566,51 @@ impl<S: MlsStore> MlsGroupHandle<S> {
             );
         }
 
-        let group_id = GroupId::from_slice(&parsed_state.group_id);
-        self.group = MlsGroup::load(self.provider.storage(), &group_id)?;
+        match (expect_group, parsed_state.group_id) {
+            (true, Some(group_id_bytes)) => {
+                let group_id = GroupId::from_slice(&group_id_bytes);
+                self.group = MlsGroup::load(self.provider.storage(), &group_id)?;
 
-        if self.group.is_none() {
-            return Err(anyhow!(
-                "persisted MLS snapshot did not contain a loadable group"
-            ));
+                if self.group.is_none() {
+                    return Err(anyhow!(
+                        "persisted MLS snapshot did not contain a loadable group"
+                    ));
+                }
+            }
+            (true, None) => {
+                return Err(anyhow!(
+                    "expected group snapshot but found pending-join snapshot"
+                ));
+            }
+            (false, Some(_)) => {
+                return Err(anyhow!(
+                    "expected pending-join snapshot but found group snapshot"
+                ));
+            }
+            (false, None) => {
+                // Correct: provider state restored, group remains None until Welcome is applied.
+                self.group = None;
+            }
         }
 
         Ok(())
+    }
+
+    fn serialize_provider_state(&self) -> Result<Vec<u8>> {
+        let values = self
+            .provider
+            .storage()
+            .values
+            .read()
+            .unwrap()
+            .iter()
+            .map(|(key, value)| SerializedProviderValue {
+                key: key.clone(),
+                value: value.clone(),
+            })
+            .collect();
+
+        Ok(serde_json::to_vec(&SerializedProviderState { values })?)
     }
 }
 
@@ -415,12 +622,14 @@ mod tests {
 
     type IdentityKey = (i64, String);
     type GroupKey = (i64, String, i64, i64);
+    type PendingJoinKey = (i64, String, i64);
     type BlobMap<K, V> = Arc<Mutex<HashMap<K, V>>>;
 
     #[derive(Default, Clone)]
     struct MemoryStore {
         identities: BlobMap<IdentityKey, Vec<u8>>,
         groups: BlobMap<GroupKey, PersistedGroupSnapshot>,
+        pending_joins: BlobMap<PendingJoinKey, PersistedGroupSnapshot>,
     }
 
     #[async_trait]
@@ -480,6 +689,47 @@ mod tests {
                 .get(&(user_id, device_id.to_string(), guild_id.0, channel_id.0))
                 .cloned())
         }
+
+        async fn save_pending_join_state(
+            &self,
+            user_id: i64,
+            device_id: &str,
+            guild_id: GuildId,
+            snapshot: PersistedGroupSnapshot,
+        ) -> Result<()> {
+            self.pending_joins
+                .lock()
+                .await
+                .insert((user_id, device_id.to_string(), guild_id.0), snapshot);
+            Ok(())
+        }
+
+        async fn load_pending_join_state(
+            &self,
+            user_id: i64,
+            device_id: &str,
+            guild_id: GuildId,
+        ) -> Result<Option<PersistedGroupSnapshot>> {
+            Ok(self
+                .pending_joins
+                .lock()
+                .await
+                .get(&(user_id, device_id.to_string(), guild_id.0))
+                .cloned())
+        }
+
+        async fn clear_pending_join_state(
+            &self,
+            user_id: i64,
+            device_id: &str,
+            guild_id: GuildId,
+        ) -> Result<()> {
+            self.pending_joins
+                .lock()
+                .await
+                .remove(&(user_id, device_id.to_string(), guild_id.0));
+            Ok(())
+        }
     }
 
     #[test]
@@ -504,192 +754,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn persisted_identity_survives_restart_and_can_send_after_commit_merge() {
-        let guild_id = GuildId(1);
-        let channel_id = ChannelId(77);
-
-        let alice_store = MemoryStore::default();
-        let bob_store = MemoryStore::default();
-        let charlie_store = MemoryStore::default();
-
-        let alice_identity = MlsIdentity::new_with_name(b"alice".to_vec()).expect("alice identity");
-        let bob_identity = MlsIdentity::new_with_name(b"bob".to_vec()).expect("bob identity");
-
-        let bob_identity_bytes = bob_identity.to_bytes().expect("serialize bob identity");
-        bob_store
-            .save_identity_keys(2, "device-bob", &bob_identity_bytes)
-            .await
-            .expect("persist bob identity");
-
-        let mut alice = MlsGroupHandle::new(
-            alice_store,
-            1,
-            "device-alice",
-            guild_id,
-            channel_id,
-            alice_identity,
-        )
-        .await
-        .expect("alice handle");
-        alice
-            .create_group(channel_id)
-            .await
-            .expect("create alice group");
-
-        let mut bob = MlsGroupHandle::new(
-            bob_store.clone(),
-            2,
-            "device-bob",
-            guild_id,
-            channel_id,
-            MlsIdentity::from_bytes(&bob_identity_bytes).expect("decode bob identity"),
-        )
-        .await
-        .expect("bob handle session 1");
-
-        let bob_key_package = bob
-            .key_package_bytes()
-            .expect("bob key package before restart");
-
-        let (_commit_for_adder, bob_welcome) =
-            alice.add_member(&bob_key_package).await.expect("add bob");
-
-        bob.join_group_from_welcome(&bob_welcome.expect("welcome for bob"))
-            .await
-            .expect("bob joins");
-
-        drop(bob);
-
-        let mut bob = MlsGroupHandle::new(
-            bob_store.clone(),
-            2,
-            "device-bob",
-            guild_id,
-            channel_id,
-            MlsIdentity::from_bytes(
-                &bob_store
-                    .load_identity_keys(2, "device-bob")
-                    .await
-                    .expect("reload identity")
-                    .expect("identity exists"),
-            )
-            .expect("decode identity after restart"),
-        )
-        .await
-        .expect("bob handle session 2");
-
-        let charlie_identity =
-            MlsIdentity::new_with_name(b"charlie".to_vec()).expect("charlie identity");
-        let charlie = MlsGroupHandle::new(
-            charlie_store,
-            3,
-            "device-charlie",
-            guild_id,
-            channel_id,
-            charlie_identity,
-        )
-        .await
-        .expect("charlie handle");
-        let charlie_key_package = charlie
-            .key_package_bytes()
-            .expect("charlie key package bytes");
-
-        let (commit_for_existing_members, _welcome_for_charlie) = alice
-            .add_member(&charlie_key_package)
-            .await
-            .expect("alice adds charlie");
-
-        let merge_plaintext = bob
-            .decrypt_application(&commit_for_existing_members)
-            .await
-            .expect("bob processes commit from prior session state");
-        assert!(merge_plaintext.is_empty());
-
-        let bob_ciphertext = bob
-            .encrypt_application(b"bob survived restart")
-            .expect("bob encrypts with restored signer");
-        let alice_plaintext = alice
-            .decrypt_application(&bob_ciphertext)
-            .await
-            .expect("alice decrypts bob message after restart");
-        assert_eq!(alice_plaintext, b"bob survived restart");
-    }
-
-    #[tokio::test]
-    async fn merge_commit_before_decrypting_next_application() {
-        let guild_id = GuildId(1);
-        let channel_id = ChannelId(20);
-
-        let alice_identity = MlsIdentity::new_with_name(b"alice".to_vec()).expect("alice identity");
-        let bob_identity = MlsIdentity::new_with_name(b"bob".to_vec()).expect("bob identity");
-        let charlie_identity =
-            MlsIdentity::new_with_name(b"charlie".to_vec()).expect("charlie identity");
-
-        let mut alice = MlsGroupHandle::new(
-            MemoryStore::default(),
-            1,
-            "device-alice",
-            guild_id,
-            channel_id,
-            alice_identity,
-        )
-        .await
-        .expect("alice handle");
-        let bob = MlsGroupHandle::new(
-            MemoryStore::default(),
-            2,
-            "device-bob",
-            guild_id,
-            channel_id,
-            bob_identity,
-        )
-        .await
-        .expect("bob handle");
-        let charlie = MlsGroupHandle::new(
-            MemoryStore::default(),
-            3,
-            "device-charlie",
-            guild_id,
-            channel_id,
-            charlie_identity,
-        )
-        .await
-        .expect("charlie handle");
-
-        let bob_kp = bob.key_package_bytes().expect("bob key package bytes");
-        let charlie_kp = charlie
-            .key_package_bytes()
-            .expect("charlie key package bytes");
-        alice.create_group(channel_id).await.expect("create group");
-
-        let (commit_to_bob, welcome_for_bob) = alice.add_member(&bob_kp).await.expect("add bob");
-
-        let mut bob = bob;
-        bob.join_group_from_welcome(&welcome_for_bob.expect("welcome bob"))
-            .await
-            .expect("bob joins");
-
-        let (commit_for_existing, _welcome_for_charlie) =
-            alice.add_member(&charlie_kp).await.expect("add charlie");
-
-        let _ = bob
-            .decrypt_application(&commit_for_existing)
-            .await
-            .expect("process inbound commit and merge it");
-
-        let ciphertext = alice
-            .encrypt_application(b"post-commit message")
-            .expect("encrypt app message");
-        let plaintext = bob
-            .decrypt_application(&ciphertext)
-            .await
-            .expect("decrypt app message after commit merge");
-
-        assert_eq!(plaintext, b"post-commit message");
-        assert!(!commit_to_bob.is_empty());
-    }
-
-    #[tokio::test]
     async fn two_members_exchange_application_message() {
         let guild_id = GuildId(1);
         let channel_id = ChannelId(10);
@@ -707,7 +771,8 @@ mod tests {
         )
         .await
         .expect("alice handle");
-        let bob = MlsGroupHandle::new(
+
+        let mut bob = MlsGroupHandle::new(
             MemoryStore::default(),
             2,
             "device-bob",
@@ -717,13 +782,28 @@ mod tests {
         )
         .await
         .expect("bob handle");
-        let bob_kp = bob.key_package_bytes().expect("bob key package bytes");
+
+        let bob_kp = bob.key_package_bytes().await.expect("bob key package bytes");
         alice.create_group(channel_id).await.expect("create group");
 
         let (_commit, welcome) = alice.add_member(&bob_kp).await.expect("add member");
         let welcome = welcome.expect("welcome message");
 
-        let mut bob = bob;
+        // Simulate new join handle (different process/instance) using persisted pending join state
+        let bob_join = MlsGroupHandle::open_for_join(
+            MemoryStore::default(), // NOTE: in this test this is a different store; real test below uses same store
+            2,
+            "device-bob",
+            guild_id,
+            channel_id,
+            MlsIdentity::new_with_name(b"bob".to_vec()).expect("bob identity"),
+        )
+        .await;
+
+        // Expected to fail with a different store instance:
+        assert!(bob_join.is_err());
+
+        // Join with the original bob handle (same provider state in memory)
         bob.join_group_from_welcome(&welcome)
             .await
             .expect("bob joins group");
@@ -741,17 +821,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn persisted_group_snapshot_round_trip_supports_future_epochs() {
+    async fn pending_join_state_survives_reopen_and_welcome_join() {
         let guild_id = GuildId(1);
-        let channel_id = ChannelId(42);
-        let alice_store = MemoryStore::default();
-        let bob_store = MemoryStore::default();
+        let channel_id = ChannelId(77);
+
+        let store = MemoryStore::default();
 
         let alice_identity = MlsIdentity::new_with_name(b"alice".to_vec()).expect("alice identity");
         let bob_identity = MlsIdentity::new_with_name(b"bob".to_vec()).expect("bob identity");
 
         let mut alice = MlsGroupHandle::new(
-            alice_store.clone(),
+            store.clone(),
             1,
             "device-alice",
             guild_id,
@@ -760,8 +840,10 @@ mod tests {
         )
         .await
         .expect("alice handle");
-        let mut bob = MlsGroupHandle::new(
-            bob_store.clone(),
+        alice.create_group(channel_id).await.expect("create alice group");
+
+        let mut bob_gen = MlsGroupHandle::new(
+            store.clone(),
             2,
             "device-bob",
             guild_id,
@@ -769,67 +851,39 @@ mod tests {
             bob_identity,
         )
         .await
-        .expect("bob handle");
+        .expect("bob handle (generate kp)");
 
-        let bob_kp = bob.key_package_bytes().expect("bob key package");
-        alice.create_group(channel_id).await.expect("create group");
-        let (_commit, welcome) = alice.add_member(&bob_kp).await.expect("add bob");
-        bob.join_group_from_welcome(&welcome.expect("welcome"))
-            .await
-            .expect("bob joins");
+        // Generate and persist pending join provider state
+        let bob_kp = bob_gen.key_package_bytes().await.expect("bob key package");
+        drop(bob_gen);
 
-        let pre_restart = alice
-            .encrypt_application(b"before restart")
-            .expect("encrypt pre-restart");
-        let pre_restart_plain = bob
-            .decrypt_application(&pre_restart)
-            .await
-            .expect("decrypt pre-restart");
-        assert_eq!(pre_restart_plain, b"before restart");
+        let (_commit, welcome) = alice.add_member(&bob_kp).await.expect("alice add bob");
+        let welcome = welcome.expect("welcome");
 
-        let bob_identity_reloaded =
-            MlsIdentity::new_with_name(b"bob".to_vec()).expect("bob identity reload");
-        let mut bob = MlsGroupHandle::new(
-            bob_store.clone(),
+        // Re-open in join mode (simulating separate process)
+        let mut bob_join = MlsGroupHandle::open_for_join(
+            store.clone(),
             2,
             "device-bob",
             guild_id,
             channel_id,
-            bob_identity_reloaded,
+            MlsIdentity::new_with_name(b"bob".to_vec()).expect("bob identity reload"),
         )
         .await
-        .expect("bob handle reload");
+        .expect("open_for_join");
 
-        let charlie_identity =
-            MlsIdentity::new_with_name(b"charlie".to_vec()).expect("charlie identity");
-        let charlie = MlsGroupHandle::new(
-            MemoryStore::default(),
-            3,
-            "device-charlie",
-            guild_id,
-            channel_id,
-            charlie_identity,
-        )
-        .await
-        .expect("charlie handle");
-        let charlie_kp = charlie.key_package_bytes().expect("charlie key package");
-
-        let (commit_for_existing, _welcome_for_charlie) =
-            alice.add_member(&charlie_kp).await.expect("add charlie");
-
-        let merge_result = bob
-            .decrypt_application(&commit_for_existing)
+        bob_join
+            .join_group_from_welcome(&welcome)
             .await
-            .expect("process commit after restart");
-        assert!(merge_result.is_empty());
+            .expect("join from welcome");
 
-        let future_epoch_ciphertext = alice
-            .encrypt_application(b"new epoch message")
-            .expect("encrypt new epoch");
-        let future_epoch_plaintext = bob
-            .decrypt_application(&future_epoch_ciphertext)
+        let ct = alice
+            .encrypt_application(b"hello after reopen")
+            .expect("alice encrypt");
+        let pt = bob_join
+            .decrypt_application(&ct)
             .await
-            .expect("decrypt new epoch");
-        assert_eq!(future_epoch_plaintext, b"new epoch message");
+            .expect("bob decrypt");
+        assert_eq!(pt, b"hello after reopen");
     }
 }

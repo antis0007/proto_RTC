@@ -2308,61 +2308,70 @@ impl DesktopGuiApp {
 
         egui::TopBottomPanel::bottom("composer_panel")
             .resizable(true)
-            .default_height(self.composer_panel_height)
+            // pick a sane starting height once; egui will persist the resized height internally
+            .default_height(MIN_COMPOSER_PANEL_HEIGHT.max(96.0))
             .min_height(MIN_COMPOSER_PANEL_HEIGHT)
+            .max_height(MAX_COMPOSER_PANEL_HEIGHT)
             .show(ctx, |ui| {
-                self.composer_panel_height = ui
-                    .available_height()
-                    .clamp(MIN_COMPOSER_PANEL_HEIGHT, MAX_COMPOSER_PANEL_HEIGHT);
-
                 ui.add_space(6.0);
+
                 let can_send = self.selected_channel.is_some();
+                let enabled = can_send && self.auth_session_established;
 
-                ui.vertical(|ui| {
-                    ui.add_enabled_ui(can_send && self.auth_session_established, |ui| {
-                            let row_height = (self.composer_panel_height - 18.0)
-                                .clamp(36.0, MAX_COMPOSER_PANEL_HEIGHT - 12.0);
-                            let send_width = (88.0 + (row_height - 36.0) * 0.28).clamp(88.0, 124.0);
-                            let attachment_width =
-                                (38.0 + (row_height - 36.0) * 0.12).clamp(38.0, 48.0);
+                // Use the *current* panel height for sizing, but do NOT store it and feed it back.
+                let panel_h = ui.available_height();
+                let row_height = (panel_h - 18.0).clamp(36.0, 72.0);
+                let send_width = (88.0 + (row_height - 36.0) * 0.28).clamp(88.0, 124.0);
+                let attachment_width = (38.0 + (row_height - 36.0) * 0.12).clamp(38.0, 48.0);
 
-                            ui.horizontal(|ui| {
-                                if ui.button("📎").on_hover_text("Attach file").clicked() {
-                                    self.pending_attachment = rfd::FileDialog::new().pick_file();
+                ui.add_enabled_ui(enabled, |ui| {
+                    ui.horizontal(|ui| {
+                        // Make the attachment button actually occupy attachment_width
+                        if ui.add_sized([attachment_width, row_height], egui::Button::new("📎"))
+                            .on_hover_text("Attach file")
+                            .clicked()
+                        {
+                            self.pending_attachment = rfd::FileDialog::new().pick_file();
+                        }
+
+                        // Account for spacing so the text box doesn’t “slide”
+                        let spacing = ui.spacing().item_spacing.x;
+                        let text_w = (ui.available_width() - send_width - spacing).max(64.0);
+
+                        let response = ui
+                            .scope(|ui| {
+                                if let Some(palette) = theme_discord_dark_palette(self.theme) {
+                                    ui.visuals_mut().extreme_bg_color = palette.message_background;
                                 }
-                                let response = ui
-                                    .scope(|ui| {
-                                        if let Some(palette) = theme_discord_dark_palette(self.theme)
-                                        {
-                                            ui.visuals_mut().extreme_bg_color =
-                                                palette.message_background;
-                                        }
-                                        ui.add_sized(
-                                            [
-                                                ui.available_width() - send_width - attachment_width,
-                                                row_height,
-                                            ],
-                                            egui::TextEdit::multiline(&mut self.composer)
-                                                .id_source("composer_text")
-                                                .hint_text(
-                                                    "Message #channel (Enter to send, Shift+Enter for newline)",
-                                                ),
-                                        )
-                                    })
-                                    .inner;
-                                let send_shortcut = response.has_focus()
-                                    && ui.input(|i| {
-                                        i.key_pressed(egui::Key::Enter) && !i.modifiers.shift
-                                    });
-                                let clicked_send = ui
-                                    .add_sized([send_width, row_height], egui::Button::new("⬆ Send"))
-                                    .clicked();
-                                if send_shortcut || clicked_send {
-                                    self.try_send_current_composer(&response);
-                                }
-                            });
+                                ui.add_sized(
+                                    [text_w, row_height],
+                                    egui::TextEdit::multiline(&mut self.composer)
+                                        .id_source("composer_text")
+                                        .hint_text("Message #channel (Enter to send, Shift+Enter for newline)"),
+                                )
+                            })
+                            .inner;
 
-                            if let Some(path) = self.pending_attachment.clone() {
+                        let send_shortcut = response.has_focus()
+                            && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
+
+                        let clicked_send = ui
+                            .add_sized([send_width, row_height], egui::Button::new("⬆ Send"))
+                            .clicked();
+
+                        if send_shortcut || clicked_send {
+                            self.try_send_current_composer(&response);
+                        }
+                    });
+
+                    // If attachment previews can be tall, keep them from forcing layout thrash:
+                    // show them in a small scroll area inside the panel.
+                    if let Some(path) = self.pending_attachment.clone() {
+                        ui.add_space(6.0);
+
+                        egui::ScrollArea::vertical()
+                            .max_height((panel_h - row_height - 18.0).max(0.0))
+                            .show(ui, |ui| {
                                 ui.horizontal_wrapped(|ui| {
                                     ui.small(format!("Attached: {}", path.display()));
                                     if ui.button("✕ Remove").clicked() {
@@ -2375,24 +2384,20 @@ impl DesktopGuiApp {
                                     .and_then(|name| name.to_str())
                                     .unwrap_or("attachment");
                                 let size_text = Self::attachment_size_text(&path);
+
                                 match self.load_attachment_preview(ctx, &path) {
-                                    Some(AttachmentPreview::Image {
-                                        texture,
-                                        size,
-                                        preview_png,
-                                    }) => {
+                                    Some(AttachmentPreview::Image { texture, size, preview_png }) => {
                                         egui::Frame::group(ui.style()).show(ui, |ui| {
                                             ui.horizontal(|ui| {
                                                 ui.label(format!("🖼 {file_name}"));
                                                 ui.small(size_text.clone());
                                             });
-                                            let response = ui.add(
+                                            let img_resp = ui.add(
                                                 egui::Image::new((texture.id(), size))
                                                     .max_size(egui::vec2(240.0, 240.0)),
                                             );
-                                            let metadata =
-                                                format!("name: {file_name}\nsize: {size_text}");
-                                            response.context_menu(|ui| {
+                                            let metadata = format!("name: {file_name}\nsize: {size_text}");
+                                            img_resp.context_menu(|ui| {
                                                 self.render_image_context_menu(
                                                     ui,
                                                     file_name,
@@ -2418,16 +2423,13 @@ impl DesktopGuiApp {
                                         });
                                     }
                                 }
-                                ui.add_space(6.0);
-                            }
-                    });
+                            });
+                    }
                 });
 
-                if !can_send {
-                    ui.centered_and_justified(|ui| {
-                        ui.weak("Pick a channel to start chatting.");
-                    });
-                }
+                // IMPORTANT: don’t put a “fill remaining height” widget here.
+                // Show the “pick a channel” hint in the *CentralPanel* instead (see below).
+
                 ui.add_space(4.0);
             });
 
@@ -2565,13 +2567,12 @@ impl DesktopGuiApp {
                             }
                         } else {
                             ui.allocate_ui_with_layout(
+                                
                                 ui.available_size(),
                                 egui::Layout::centered_and_justified(egui::Direction::TopDown),
                                 |ui| {
-                                    ui.heading("Select a channel");
-                                    ui.weak(
-                                        "Choose a channel from the left to view and send messages.",
-                                    );
+                                    ui.heading("Pick a channel");
+                                    ui.weak("Pick a channel to start chatting.");
                                 },
                             );
                         }
@@ -3021,7 +3022,25 @@ fn scaled_text_styles(text_scale: f32) -> BTreeMap<egui::TextStyle, egui::FontId
 }
 
 const SETTINGS_STORAGE_KEY: &str = "desktop_gui.settings";
-const DESKTOP_GUI_DEVICE_ID: &str = "desktop-gui";
+const DESKTOP_GUI_DEVICE_ID_PREFIX: &str = "desktop-gui";
+
+fn sanitize_profile_segment(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        let ok = ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.');
+        out.push(if ok { ch } else { '_' });
+    }
+    let trimmed = out.trim_matches('_');
+    if trimmed.is_empty() {
+        "user".to_string()
+    } else {
+        trimmed.to_ascii_lowercase()
+    }
+}
+
+fn desktop_gui_device_id_for_username(username: &str) -> String {
+    format!("{DESKTOP_GUI_DEVICE_ID_PREFIX}-{}", sanitize_profile_segment(username))
+}
 
 #[derive(Debug, Deserialize)]
 struct LoginResponse {
@@ -3077,21 +3096,34 @@ fn read_non_empty_env_var(name: &str, attempts: &mut Vec<String>) -> Option<Stri
 fn resolve_mls_gui_data_dir() -> Result<PathBuf, String> {
     let mut attempts = Vec::new();
 
+    // 1) Explicit override wins (handy for scripts / testing)
+    if let Some(dir) = read_non_empty_env_var("PROTO_RTC_CLIENTS_DIR", &mut attempts) {
+        return Ok(PathBuf::from(dir));
+    }
+
+    // 2) Default to repo-local ./data/clients when launched from repo
+    if let Ok(cwd) = std::env::current_dir() {
+        return Ok(cwd.join("data").join("clients"));
+    }
+
+    // 3) Fallback to OS user profile location
     if let Some(home) = read_non_empty_env_var("HOME", &mut attempts) {
-        return Ok(PathBuf::from(home).join(".proto_rtc"));
+        return Ok(PathBuf::from(home).join(".proto_rtc").join("clients"));
     }
 
     #[cfg(target_os = "windows")]
     {
         if let Some(userprofile) = read_non_empty_env_var("USERPROFILE", &mut attempts) {
-            return Ok(PathBuf::from(userprofile).join(".proto_rtc"));
+            return Ok(PathBuf::from(userprofile).join(".proto_rtc").join("clients"));
         }
 
         let homedrive = read_non_empty_env_var("HOMEDRIVE", &mut attempts);
         let homepath = read_non_empty_env_var("HOMEPATH", &mut attempts);
         match (homedrive, homepath) {
             (Some(homedrive), Some(homepath)) => {
-                return Ok(PathBuf::from(format!("{homedrive}{homepath}")).join(".proto_rtc"));
+                return Ok(PathBuf::from(format!("{homedrive}{homepath}"))
+                    .join(".proto_rtc")
+                    .join("clients"));
             }
             _ => {
                 attempts.push(
@@ -3102,12 +3134,12 @@ fn resolve_mls_gui_data_dir() -> Result<PathBuf, String> {
         }
 
         if let Some(local_app_data) = read_non_empty_env_var("LOCALAPPDATA", &mut attempts) {
-            return Ok(PathBuf::from(local_app_data).join("proto_rtc"));
+            return Ok(PathBuf::from(local_app_data).join("proto_rtc").join("clients"));
         }
     }
 
     Err(format!(
-        "checked HOME{} and none provided a usable per-user directory ({})",
+        "could not resolve a client state root (checked PROTO_RTC_CLIENTS_DIR, current_dir, HOME{}): {}",
         if cfg!(target_os = "windows") {
             ", USERPROFILE, HOMEDRIVE+HOMEPATH, LOCALAPPDATA"
         } else {
@@ -3117,8 +3149,18 @@ fn resolve_mls_gui_data_dir() -> Result<PathBuf, String> {
     ))
 }
 
-fn resolve_user_mls_data_dir(base_dir: &std::path::Path, user_id: i64) -> PathBuf {
-    base_dir.join("mls").join(format!("user_{user_id}"))
+fn resolve_user_profile_data_dir(base_dir: &std::path::Path, username: &str) -> PathBuf {
+    base_dir.join(sanitize_profile_segment(username))
+}
+
+fn resolve_user_mls_data_dir(
+    base_dir: &std::path::Path,
+    username: &str,
+    user_id: i64,
+) -> PathBuf {
+    resolve_user_profile_data_dir(base_dir, username)
+        .join("mls")
+        .join(format!("user_{user_id}"))
 }
 
 async fn fetch_user_id_for_login(server_url: &str, username: &str) -> Result<i64, String> {
@@ -3147,22 +3189,44 @@ fn guild_id_from_invite(invite_code: &str) -> Option<GuildId> {
 
 async fn build_user_scoped_mls_client(
     base_dir: &std::path::Path,
+    username: &str,
     user_id: i64,
 ) -> Result<Arc<RealtimeClient<PassthroughCrypto>>, String> {
-    let user_mls_state_dir = resolve_user_mls_data_dir(base_dir, user_id);
+    let profile_dir = resolve_user_profile_data_dir(base_dir, username);
+    let user_mls_state_dir = resolve_user_mls_data_dir(base_dir, username, user_id);
+
+    // Create profile directories up-front so all local state is clearly scoped
+    std::fs::create_dir_all(profile_dir.join("downloads")).map_err(|err| {
+        format!(
+            "could not prepare profile directory '{}' for username='{}': {err}",
+            profile_dir.display(),
+            username
+        )
+    })?;
+    std::fs::create_dir_all(profile_dir.join("cache")).map_err(|err| {
+        format!(
+            "could not prepare cache directory '{}' for username='{}': {err}",
+            profile_dir.join("cache").display(),
+            username
+        )
+    })?;
     std::fs::create_dir_all(&user_mls_state_dir).map_err(|err| {
         format!(
-            "could not prepare per-user MLS state directory '{}' for user_id={user_id}: {err}",
-            user_mls_state_dir.display()
+            "could not prepare per-user MLS state directory '{}' for username='{}' user_id={user_id}: {err}",
+            user_mls_state_dir.display(),
+            username
         )
     })?;
 
     let mls_db_url = DurableMlsSessionManager::sqlite_url_for_gui_data_dir(&user_mls_state_dir);
-    let mls_manager = DurableMlsSessionManager::initialize(&mls_db_url, user_id, DESKTOP_GUI_DEVICE_ID)
+    let device_id = desktop_gui_device_id_for_username(username);
+
+    let mls_manager = DurableMlsSessionManager::initialize(&mls_db_url, user_id, &device_id)
         .await
         .map_err(|err| {
             format!(
-                "failed to initialize persistent MLS backend for user_id={user_id} ({mls_db_url}): {err:#}"
+                "failed to initialize persistent MLS backend for username='{}' user_id={} device_id='{}' ({}): {:#}",
+                username, user_id, device_id, mls_db_url, err
             )
         })?;
 
@@ -3253,7 +3317,7 @@ fn spawn_backend_thread(cmd_rx: Receiver<BackendCommand>, ui_tx: Sender<UiEvent>
                             }
                         };
 
-                        let rebound_client = match build_user_scoped_mls_client(&mls_state_dir, user_id).await {
+                        let rebound_client = match build_user_scoped_mls_client(&mls_state_dir, &username, user_id).await {
                             Ok(client) => client,
                             Err(err) => {
                                 let _ = ui_tx.try_send(UiEvent::Error(UiError::from_message(

@@ -81,13 +81,34 @@ impl MlsSessionManager for TestMlsSessionManager {
         _guild_id: GuildId,
         _channel_id: ChannelId,
     ) -> Result<bool> {
+        if let Some(err) = &self.fail_with {
+            return Err(anyhow!(err.clone()));
+        }
         Ok(self.has_persisted_group_state)
     }
 
     async fn open_or_create_group(&self, _guild_id: GuildId, _channel_id: ChannelId) -> Result<()> {
+        if let Some(err) = &self.fail_with {
+            return Err(anyhow!(err.clone()));
+        }
+
         let mut calls = self.open_or_create_calls.lock().await;
         *calls += 1;
         Ok(())
+    }
+
+    async fn reset_channel_group_state(
+        &self,
+        _guild_id: GuildId,
+        _channel_id: ChannelId,
+    ) -> Result<bool> {
+        if let Some(err) = &self.fail_with {
+            return Err(anyhow!(err.clone()));
+        }
+
+        // Default test behavior: nothing to reset.
+        // Return true in specific tests if you later want to simulate a reset.
+        Ok(false)
     }
 
     async fn encrypt_application(
@@ -112,13 +133,17 @@ impl MlsSessionManager for TestMlsSessionManager {
         if let Some(err) = &self.fail_with {
             return Err(anyhow!(err.clone()));
         }
+
         self.decrypted_ciphertexts
             .lock()
             .await
             .push(ciphertext.to_vec());
+
+        // Simulate non-application messages (e.g. commit/proposal) by returning empty plaintext.
         if ciphertext == self.add_member_commit.as_slice() {
             return Ok(Vec::new());
         }
+
         Ok(self.decrypt_plaintext.clone())
     }
 
@@ -130,6 +155,7 @@ impl MlsSessionManager for TestMlsSessionManager {
         if let Some(err) = &self.fail_with {
             return Err(anyhow!(err.clone()));
         }
+
         Ok(MlsAddMemberOutcome {
             commit_bytes: self.add_member_commit.clone(),
             welcome_bytes: self.add_member_welcome.clone(),
@@ -156,10 +182,12 @@ impl MlsSessionManager for TestMlsSessionManager {
         if let Some(err) = &self.fail_with {
             return Err(anyhow!(err.clone()));
         }
+
         self.joined_welcomes
             .lock()
             .await
             .push(welcome_bytes.to_vec());
+
         Ok(())
     }
 
@@ -175,6 +203,7 @@ impl MlsSessionManager for TestMlsSessionManager {
         Ok(self.exported_secret.clone())
     }
 }
+
 
 async fn handle_send_message(
     State(state): State<ServerState>,

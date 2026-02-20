@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -30,7 +30,7 @@ use tokio::{
     task::JoinHandle,
 };
 use tokio_tungstenite::{connect_async, tungstenite::Message};
-use tracing::{error, info, warn};
+use tracing::{debug, info, warn, error};
 use zeroize::Zeroize;
 
 pub mod error;
@@ -52,6 +52,7 @@ const WELCOME_SYNC_RETRY_MAX_DELAY: Duration = Duration::from_secs(2);
 const WELCOME_SYNC_COOLDOWN_AFTER_EXHAUSTED: Duration = Duration::from_secs(15);
 const BOOTSTRAP_KEY_PACKAGE_RETRY_ATTEMPTS: usize = 5;
 const BOOTSTRAP_REQUEST_MIN_INTERVAL: Duration = Duration::from_secs(30);
+const PROCESSED_MESSAGE_CACHE_MAX: usize = 4096;
 
 #[derive(Debug, Clone, Copy)]
 enum MlsFailureCategory {
@@ -80,6 +81,35 @@ fn is_duplicate_member_add_error(err: &anyhow::Error) -> bool {
 
 fn is_wrong_epoch_error(err: &anyhow::Error) -> bool {
     err.to_string().to_ascii_lowercase().contains("wrong epoch")
+}
+
+fn is_recovery_welcome_material_missing_404(status: reqwest::StatusCode, body: &str) -> bool {
+    status == reqwest::StatusCode::NOT_FOUND
+        && body
+            .to_ascii_lowercase()
+            .contains("no welcome material available for recovery")
+}
+
+fn is_recovery_welcome_unavailable_error(err: &anyhow::Error) -> bool {
+    let s = format!("{err:#}");
+    (s.contains("404") && s.contains("/mls/welcome/recovery"))
+        || (s.contains("409") && s.contains("no welcome material available for recovery"))
+        || (s.contains("status 409") && s.contains("no welcome material available for recovery"))
+}
+fn is_expected_historical_mls_decrypt_error(err: &anyhow::Error) -> bool {
+    let msg = err.to_string().to_ascii_lowercase();
+
+    // Backend-specific / library-specific patterns commonly seen when trying to decrypt
+    // messages from before local membership (or from an inaccessible epoch/generation).
+    msg.contains("aead decryption")
+        || msg.contains("failed to process mls message")
+        || msg.contains("wrong epoch")
+        || msg.contains("secretreuseerror")
+        || msg.contains("requested secret was deleted")
+        || msg.contains("ciphertext generation out of bounds")
+        || msg.contains("message epoch")
+        || msg.contains("secret tree")
+        || msg.contains("unable to decrypt")
 }
 
 fn welcome_retry_delay_with_jitter(
@@ -169,6 +199,11 @@ pub trait MlsSessionManager: Send + Sync {
         label: &str,
         len: usize,
     ) -> Result<Vec<u8>>;
+    async fn reset_channel_group_state(
+        &self,
+        guild_id: GuildId,
+        channel_id: ChannelId,
+    ) -> Result<bool>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -269,6 +304,18 @@ impl MlsSessionManager for MissingMlsSessionManager {
     ) -> Result<bool> {
         Err(anyhow!(
             "no active MLS group available for channel {}",
+            channel_id.0
+        ))
+    }
+
+    async fn reset_channel_group_state(
+        &self,
+        guild_id: GuildId,
+        channel_id: ChannelId,
+    ) -> Result<bool> {
+        Err(anyhow!(
+            "MLS backend unavailable for guild {} channel {}",
+            guild_id.0,
             channel_id.0
         ))
     }
@@ -553,6 +600,11 @@ struct RealtimeClientState {
     bootstrap_request_last_sent: HashMap<(GuildId, ChannelId), Instant>,
     pending_outbound_plaintexts: HashMap<String, String>,
     voice_session_keys: HashMap<VoiceConnectionKey, CachedVoiceSessionKey>,
+    processed_inbound_message_ids: HashSet<(ChannelId, MessageId)>,
+    processed_inbound_message_order: VecDeque<(ChannelId, MessageId)>,
+    inflight_bootstraps: HashSet<(GuildId, ChannelId)>,
+    inflight_inbound_message_ids: HashSet<(ChannelId, MessageId)>,
+    
 }
 
 #[derive(Serialize)]
@@ -581,6 +633,18 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
             Arc::new(MissingLiveKitControlPlane),
             Arc::new(MissingLiveKitConnector),
         )
+    }
+    async fn try_begin_bootstrap(&self, guild_id: GuildId, channel_id: ChannelId) -> bool {
+        let mut guard = self.inner.lock().await;
+        guard.inflight_bootstraps.insert((guild_id, channel_id))
+    }
+
+    async fn end_bootstrap(&self, guild_id: GuildId, channel_id: ChannelId) {
+        self.inner
+            .lock()
+            .await
+            .inflight_bootstraps
+            .remove(&(guild_id, channel_id));
     }
 
     pub fn new_with_mls_session_manager(
@@ -623,6 +687,10 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
                 bootstrap_request_last_sent: HashMap::new(),
                 pending_outbound_plaintexts: HashMap::new(),
                 voice_session_keys: HashMap::new(),
+                processed_inbound_message_ids: HashSet::new(),
+                processed_inbound_message_order: VecDeque::new(),
+                inflight_bootstraps: HashSet::new(),
+                inflight_inbound_message_ids: HashSet::new(),
             }),
             voice_connection: Mutex::new(None),
             voice_participants: RwLock::new(HashMap::new()),
@@ -1209,7 +1277,8 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
         target_user_id: i64,
     ) -> Result<()> {
         let (server_url, current_user_id) = self.session().await?;
-        self.http
+        let response = self
+            .http
             .post(format!("{server_url}/mls/welcome/recovery"))
             .query(&[
                 ("user_id", current_user_id),
@@ -1218,16 +1287,50 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
                 ("target_user_id", target_user_id),
             ])
             .send()
-            .await?
-            .error_for_status()?;
-        info!(
-            guild_id = guild_id.0,
-            channel_id = channel_id.0,
-            target_user_id,
-            "mls: recovery welcome generated/stored"
-        );
-        Ok(())
+            .await?;
+
+        let status = response.status();
+        if status.is_success() {
+            info!(
+                guild_id = guild_id.0,
+                channel_id = channel_id.0,
+                target_user_id,
+                "mls: recovery welcome generated/stored"
+            );
+            return Ok(());
+        }
+
+        let body = response.text().await.unwrap_or_default();
+        if is_recovery_welcome_material_missing_404(status, &body) {
+            // This usually means the server DB has been reset (or lost welcome history)
+            // while the leader still has local MLS state claiming the target is already in roster.
+            return Err(anyhow!(
+                "recovery welcome unavailable: server has no stored welcome for target {} (likely client/server MLS state divergence after reset)",
+                target_user_id
+            ));
+        }
+
+        if status == reqwest::StatusCode::NOT_FOUND {
+            warn!(
+                guild_id = guild_id.0,
+                channel_id = channel_id.0,
+                target_user_id,
+                "mls: /mls/welcome/recovery route unavailable on server; falling back to targeted bootstrap request"
+            );
+            let _ = self
+                .post_mls_bootstrap_request(
+                    guild_id,
+                    channel_id,
+                    Some(target_user_id),
+                    MlsBootstrapReason::RecoveryWelcomeDuplicateMember,
+                )
+                .await;
+            return Ok(());
+        }
+
+        Err(anyhow!("recovery welcome request failed (status {}): {}", status, body))
     }
+
     async fn post_mls_bootstrap_request(
         &self,
         guild_id: GuildId,
@@ -1490,7 +1593,20 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
 
         let result = async {
             let mut synced = false;
+
+            // Fast path: the elected leader should not wait for a welcome for its own channel.
+            if self
+                .maybe_initialize_local_group_if_leader(guild_id, channel_id)
+                .await
+                .unwrap_or(false)
+            {
+                synced = true;
+            }
+
             for attempt in 0..WELCOME_SYNC_RETRY_ATTEMPTS {
+                if synced {
+                    break;
+                }
                 info!(
                     guild_id = guild_id.0,
                     channel_id = channel_id.0,
@@ -1541,20 +1657,29 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
             }
 
             if !synced {
+                if self
+                    .maybe_initialize_local_group_if_leader(guild_id, channel_id)
+                    .await
+                    .unwrap_or(false)
                 {
-                    self.inner.lock().await.welcome_sync_retry_after.insert(
-                        (guild_id, channel_id),
-                        Instant::now() + WELCOME_SYNC_COOLDOWN_AFTER_EXHAUSTED,
-                    );
+                    synced = true;
+                    self.mark_welcome_sync_dirty(guild_id, channel_id).await;
+                } else {
+                    {
+                        self.inner.lock().await.welcome_sync_retry_after.insert(
+                            (guild_id, channel_id),
+                            Instant::now() + WELCOME_SYNC_COOLDOWN_AFTER_EXHAUSTED,
+                        );
+                    }
+                    let _ = self
+                        .request_mls_bootstrap(
+                            guild_id,
+                            channel_id,
+                            None,
+                            MlsBootstrapReason::MissingPendingWelcome,
+                        )
+                        .await;
                 }
-                let _ = self
-                    .request_mls_bootstrap(
-                        guild_id,
-                        channel_id,
-                        None,
-                        MlsBootstrapReason::MissingPendingWelcome,
-                    )
-                    .await;
             } else {
                 self.mark_welcome_sync_dirty(guild_id, channel_id).await;
             }
@@ -1584,6 +1709,119 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
             .json()
             .await?;
         Ok(members)
+    }
+
+    async fn maybe_initialize_local_group_if_leader(
+        &self,
+        guild_id: GuildId,
+        channel_id: ChannelId,
+    ) -> Result<bool> {
+        // Fast path: already initialized in this runtime.
+        if self.is_mls_channel_initialized(guild_id, channel_id).await {
+            return Ok(true);
+        }
+
+        let (_, current_user_id) = self.session().await?;
+        let members = self.fetch_members_for_guild(guild_id).await?;
+
+        let is_leader = members
+            .iter()
+            .map(|member| member.user_id.0)
+            .min()
+            .is_some_and(|leader_user_id| leader_user_id == current_user_id);
+
+        if !is_leader {
+            return Ok(false);
+        }
+
+        self.mls_session_manager
+            .open_or_create_group(guild_id, channel_id)
+            .await?;
+
+        let mut should_log = false;
+        {
+            let mut guard = self.inner.lock().await;
+            if guard.initialized_mls_channels.insert((guild_id, channel_id)) {
+                should_log = true;
+            }
+        }
+
+        if should_log {
+            info!(
+                guild_id = guild_id.0,
+                channel_id = channel_id.0,
+                current_user_id,
+                "mls: initialized local MLS group as elected leader"
+            );
+        }
+
+        Ok(true)
+    }
+
+
+
+    async fn self_heal_after_recovery_welcome_unavailable(
+        &self,
+        guild_id: GuildId,
+        channel_id: ChannelId,
+        current_user_id: i64,
+        target_user_id: i64,
+        context: &'static str,
+    ) -> Result<()> {
+        warn!(
+            guild_id = guild_id.0,
+            channel_id = channel_id.0,
+            target_user_id,
+            "mls: recovery welcome unavailable; resetting local MLS channel state and requesting targeted bootstrap"
+        );
+
+        match self
+            .mls_session_manager
+            .reset_channel_group_state(guild_id, channel_id)
+            .await
+        {
+            Ok(reset) => {
+                info!(
+                    guild_id = guild_id.0,
+                    channel_id = channel_id.0,
+                    target_user_id,
+                    reset_performed = reset,
+                    "mls: local MLS channel state reset result"
+                );
+            }
+            Err(reset_err) => {
+                self.emit_mls_failure_event(
+                    MlsFailureCategory::MembershipFetch,
+                    guild_id,
+                    Some(channel_id),
+                    Some(current_user_id),
+                    Some(target_user_id),
+                    context,
+                    &reset_err,
+                );
+            }
+        }
+
+        {
+            let mut guard = self.inner.lock().await;
+            guard.initialized_mls_channels.remove(&(guild_id, channel_id));
+            guard
+                .attempted_channel_member_additions
+                .retain(|(g, c, _)| *g != guild_id || *c != channel_id);
+        }
+
+        self.mark_welcome_sync_dirty(guild_id, channel_id).await;
+
+        let _ = self
+            .post_mls_bootstrap_request(
+                guild_id,
+                channel_id,
+                Some(target_user_id),
+                MlsBootstrapReason::RecoveryWelcomeDuplicateMember,
+            )
+            .await;
+
+        Ok(())
     }
 
     async fn maybe_add_existing_members_to_channel_group(
@@ -1728,8 +1966,19 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
                         guild_id = guild_id.0,
                         channel_id = channel_id.0,
                         target_user_id = member.user_id.0,
-                        "mls: failed to issue recovery welcome for existing member during bootstrap: {err}"
+                        "mls: failed to issue recovery welcome for existing member during bootstrap (possible stale local MLS state vs fresh server DB): {err}"
                     );
+                    if is_recovery_welcome_unavailable_error(&err) {
+                        let _ = self
+                            .self_heal_after_recovery_welcome_unavailable(
+                                guild_id,
+                                channel_id,
+                                current_user_id,
+                                member.user_id.0,
+                                "maybe_add_existing_members_to_channel_group.recovery_welcome_existing_member",
+                            )
+                            .await;
+                    }
                     continue;
                 }
                 self.inner
@@ -1762,8 +2011,19 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
                                 guild_id = guild_id.0,
                                 channel_id = channel_id.0,
                                 target_user_id = member.user_id.0,
-                                "mls: add_member duplicate recovery failed during bootstrap: {recovery_err}"
+                                "mls: add_member duplicate recovery failed during bootstrap (possible stale local MLS state vs fresh server DB): {recovery_err}"
                             );
+                            if is_recovery_welcome_unavailable_error(&recovery_err) {
+                                let _ = self
+                                    .self_heal_after_recovery_welcome_unavailable(
+                                        guild_id,
+                                        channel_id,
+                                        current_user_id,
+                                        member.user_id.0,
+                                        "maybe_add_existing_members_to_channel_group.add_member_duplicate_recovery",
+                                    )
+                                    .await;
+                            }
                             continue;
                         }
                         self.inner
@@ -1848,24 +2108,44 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
         current_user_id: i64,
         target_user_id: Option<i64>,
     ) -> Result<bool> {
-        let members = self
-            .fetch_members_for_guild(guild_id)
-            .await
-            .with_context(|| format!("failed to fetch guild members for guild {}", guild_id.0))?;
-        // NOTE(mls-debug): leader election is intentionally deterministic here so only
-        // one client is responsible for creating/repairing MLS state and issuing welcomes.
-        let is_leader = members
-            .iter()
-            .map(|member| member.user_id.0)
-            .min()
-            .is_some_and(|leader_user_id| leader_user_id == current_user_id);
-        if is_leader {
-            self.maybe_add_existing_members_to_channel_group(guild_id, channel_id, target_user_id)
-                .await?;
-            return Ok(true);
+        if !self.try_begin_bootstrap(guild_id, channel_id).await {
+            info!(
+                guild_id = guild_id.0,
+                channel_id = channel_id.0,
+                "mls: bootstrap already in progress; skipping duplicate trigger"
+            );
+            return Ok(false);
         }
-        Ok(false)
+
+        let result = async {
+            let members = self
+                .fetch_members_for_guild(guild_id)
+                .await
+                .with_context(|| format!("failed to fetch guild members for guild {}", guild_id.0))?;
+
+            let is_leader = members
+                .iter()
+                .map(|member| member.user_id.0)
+                .min()
+                .is_some_and(|leader_user_id| leader_user_id == current_user_id);
+            if target_user_id.is_none() && self.is_mls_channel_initialized(guild_id, channel_id).await {
+                // Already initialized and this is not a targeted repair request.
+                return Ok(true);
+            }
+            if is_leader {
+                self.maybe_add_existing_members_to_channel_group(guild_id, channel_id, target_user_id)
+                    .await?;
+                return Ok(true);
+            }
+
+            Ok(false)
+        }
+        .await;
+
+        self.end_bootstrap(guild_id, channel_id).await;
+        result
     }
+
 
     async fn active_context(&self) -> Result<(String, i64, GuildId, ChannelId)> {
         let guard = self.inner.lock().await;
@@ -1887,16 +2167,29 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
     }
 
     async fn emit_decrypted_message(&self, message: &MessagePayload) -> Result<()> {
+        let msg_key = (message.channel_id, message.message_id);
+
+        // Phase 1: gate duplicates and mark as inflight only (NOT processed yet).
         let (guild_id, user_id, pending_plaintext) = {
             let mut guard = self.inner.lock().await;
+
             let user_id = guard
                 .user_id
                 .ok_or_else(|| anyhow!("not logged in: missing user_id"))?;
+
+            if guard.processed_inbound_message_ids.contains(&msg_key) {
+                return Ok(());
+            }
+
+            if guard.inflight_inbound_message_ids.contains(&msg_key) {
+                return Ok(());
+            }
+
+            guard.inflight_inbound_message_ids.insert(msg_key);
+
             if let Some(guild_id) = guard.channel_guilds.get(&message.channel_id).copied() {
                 let pending_plaintext = if message.sender_id.0 == user_id {
-                    guard
-                        .pending_outbound_plaintexts
-                        .remove(&message.ciphertext_b64)
+                    guard.pending_outbound_plaintexts.remove(&message.ciphertext_b64)
                 } else {
                     None
                 };
@@ -1905,24 +2198,44 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
                 if let Some(guild_id) = guard.selected_guild {
                     guard.channel_guilds.insert(message.channel_id, guild_id);
                     let pending_plaintext = if message.sender_id.0 == user_id {
-                        guard
-                            .pending_outbound_plaintexts
-                            .remove(&message.ciphertext_b64)
+                        guard.pending_outbound_plaintexts.remove(&message.ciphertext_b64)
                     } else {
                         None
                     };
                     (guild_id, user_id, pending_plaintext)
                 } else {
+                    guard.inflight_inbound_message_ids.remove(&msg_key);
                     return Err(anyhow!(
                         "missing guild mapping for channel {}",
                         message.channel_id.0
                     ));
                 }
             } else {
+                // Message for a channel not in current context yet; ignore for now.
+                guard.inflight_inbound_message_ids.remove(&msg_key);
                 return Ok(());
             }
         };
 
+        let mark_processed = |state: &mut RealtimeClientState| {
+            state.inflight_inbound_message_ids.remove(&msg_key);
+
+            if state.processed_inbound_message_ids.insert(msg_key) {
+                state.processed_inbound_message_order.push_back(msg_key);
+
+                while state.processed_inbound_message_order.len() > PROCESSED_MESSAGE_CACHE_MAX {
+                    if let Some(old) = state.processed_inbound_message_order.pop_front() {
+                        state.processed_inbound_message_ids.remove(&old);
+                    }
+                }
+            }
+        };
+
+        let clear_inflight = |state: &mut RealtimeClientState| {
+            state.inflight_inbound_message_ids.remove(&msg_key);
+        };
+
+        // Self-sent messages: emit cached plaintext and mark processed.
         if message.sender_id.0 == user_id {
             if let Some(plaintext) = pending_plaintext {
                 let _ = self.events.send(ClientEvent::MessageDecrypted {
@@ -1930,31 +2243,40 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
                     plaintext,
                 });
             }
+
+            let mut guard = self.inner.lock().await;
+            mark_processed(&mut guard);
             return Ok(());
         }
 
-        if !self
-            .is_mls_channel_initialized(guild_id, message.channel_id)
-            .await
-        {
+        // Ensure MLS ready before decrypt.
+        if !self.is_mls_channel_initialized(guild_id, message.channel_id).await {
             let _ = self
                 .maybe_join_from_pending_welcome_with_retry(guild_id, message.channel_id)
                 .await;
-            if !self
-                .is_mls_channel_initialized(guild_id, message.channel_id)
-                .await
-            {
+
+            if !self.is_mls_channel_initialized(guild_id, message.channel_id).await {
+                // Not ready yet: allow a future retry.
+                let mut guard = self.inner.lock().await;
+                clear_inflight(&mut guard);
                 return Ok(());
             }
         }
-        let ciphertext = STANDARD
-            .decode(message.ciphertext_b64.as_bytes())
-            .with_context(|| {
-                format!(
-                    "invalid base64 ciphertext for message {}",
-                    message.message_id.0
-                )
-            })?;
+
+        let ciphertext = match STANDARD.decode(message.ciphertext_b64.as_bytes()) {
+            Ok(c) => c,
+            Err(e) => {
+                // Bad payload is permanent: mark processed to avoid infinite loops.
+                let mut guard = self.inner.lock().await;
+                mark_processed(&mut guard);
+
+                return Err(anyhow!(
+                    "invalid base64 ciphertext for message {}: {}",
+                    message.message_id.0,
+                    e
+                ));
+            }
+        };
 
         let plaintext_bytes = match self
             .mls_session_manager
@@ -1962,6 +2284,7 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
             .await
         {
             Ok(bytes) => bytes,
+
             Err(err) if is_wrong_epoch_error(&err) => {
                 warn!(
                     guild_id = guild_id.0,
@@ -1969,20 +2292,80 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
                     message_id = message.message_id.0,
                     "mls: wrong epoch while decrypting; dropping local initialization and retrying welcome sync"
                 );
-                self.inner
-                    .lock()
-                    .await
-                    .initialized_mls_channels
-                    .remove(&(guild_id, message.channel_id));
-                let _ = self
-                    .maybe_join_from_pending_welcome_with_retry(guild_id, message.channel_id)
+
+                {
+                    let mut guard = self.inner.lock().await;
+                    guard
+                        .initialized_mls_channels
+                        .remove(&(guild_id, message.channel_id));
+                    clear_inflight(&mut guard);
+                }
+
+                self.force_mls_resync_for_channel(guild_id, message.channel_id)
                     .await;
                 return Ok(());
             }
-            Err(err) => return Err(err),
+
+            Err(err) => {
+                let msg_lower = err.to_string().to_ascii_lowercase();
+
+                // Case A: expected history gap for MLS (e.g. Bob joined after these messages existed).
+                // These messages are not decryptable by design; skip without surfacing an error.
+                if is_expected_historical_mls_decrypt_error(&err) {
+                    // Distinguish likely "state drift" from "pre-join historical ciphertext".
+                    let looks_transient_state_drift = msg_lower.contains("wrong epoch")
+                        || msg_lower.contains("secretreuseerror")
+                        || msg_lower.contains("requested secret was deleted")
+                        || msg_lower.contains("ciphertext generation out of bounds");
+
+                    if looks_transient_state_drift {
+                        warn!(
+                            guild_id = guild_id.0,
+                            channel_id = message.channel_id.0,
+                            message_id = message.message_id.0,
+                            "mls: decrypt state-drift/epoch error; forcing welcome resync: {err}"
+                        );
+
+                        {
+                            let mut guard = self.inner.lock().await;
+                            guard
+                                .initialized_mls_channels
+                                .remove(&(guild_id, message.channel_id));
+                            clear_inflight(&mut guard);
+                        }
+
+                        let _ = self
+                            .maybe_join_from_pending_welcome_with_retry(guild_id, message.channel_id)
+                            .await;
+
+                        return Ok(());
+                    }
+
+                    // Historical pre-join ciphertext (AEAD auth failure is common here).
+                    // This is expected and should not block history loading or spam errors.
+                    debug!(
+                        guild_id = guild_id.0,
+                        channel_id = message.channel_id.0,
+                        message_id = message.message_id.0,
+                        "mls: skipping undecryptable historical message for current member: {err}"
+                    );
+
+                    let mut guard = self.inner.lock().await;
+                    mark_processed(&mut guard);
+                    return Ok(());
+                }
+
+                // Case B: truly unexpected decrypt failure.
+                let mut guard = self.inner.lock().await;
+                mark_processed(&mut guard);
+                return Err(err);
+            }
         };
 
+        // Empty plaintext usually means commit/proposal/no-op. Count as processed.
         if plaintext_bytes.is_empty() {
+            let mut guard = self.inner.lock().await;
+            mark_processed(&mut guard);
             return Ok(());
         }
 
@@ -1991,8 +2374,73 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
             message: message.clone(),
             plaintext,
         });
+
+        let mut guard = self.inner.lock().await;
+        mark_processed(&mut guard);
+
         Ok(())
     }
+
+
+
+
+    async fn ensure_channel_ready_for_send(
+        &self,
+        guild_id: GuildId,
+        channel_id: ChannelId,
+        user_id: i64,
+    ) -> Result<()> {
+        // Let leader do a single bootstrap attempt.
+        if let Err(err) = self
+            .maybe_bootstrap_existing_members_if_leader(guild_id, channel_id, user_id, None)
+            .await
+        {
+            self.emit_mls_failure_event(
+                MlsFailureCategory::MembershipFetch,
+                guild_id,
+                Some(channel_id),
+                Some(user_id),
+                None,
+                "ensure_channel_ready_for_send.bootstrap",
+                &err,
+            );
+        }
+
+        // Try local restore / welcome sync.
+        if self
+            .ensure_mls_channel_initialized(guild_id, channel_id)
+            .await?
+        {
+            return Ok(());
+        }
+
+        // One explicit reconcile pass (not nested retries).
+        if let Err(err) = self.reconcile_mls_state_for_guild(guild_id).await {
+            self.emit_mls_failure_event(
+                MlsFailureCategory::MembershipFetch,
+                guild_id,
+                Some(channel_id),
+                Some(user_id),
+                None,
+                "ensure_channel_ready_for_send.reconcile",
+                &err,
+            );
+        }
+
+        if self
+            .ensure_mls_channel_initialized(guild_id, channel_id)
+            .await?
+        {
+            return Ok(());
+        }
+
+        Err(anyhow!(
+            "MLS state for guild {} channel {} is not ready yet; wait for secure session sync",
+            guild_id.0,
+            channel_id.0
+        ))
+    }
+
 
     async fn send_message_with_attachment_impl(
         &self,
@@ -2000,6 +2448,8 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
         attachment: Option<AttachmentPayload>,
     ) -> Result<()> {
         let (_server_url, user_id, guild_id, channel_id) = self.active_context().await?;
+        self.ensure_channel_ready_for_send(guild_id, channel_id, user_id)
+            .await?;
         if let Err(err) = self
             .maybe_bootstrap_existing_members_if_leader(guild_id, channel_id, user_id, None)
             .await
@@ -2275,18 +2725,76 @@ fn is_missing_mls_group_error(message: &str) -> bool {
 }
 
 impl<C: CryptoProvider + 'static> RealtimeClient<C> {
+    async fn force_mls_resync_for_channel(
+        &self,
+        guild_id: GuildId,
+        channel_id: ChannelId,
+    ) {
+        {
+            let mut guard = self.inner.lock().await;
+            guard.initialized_mls_channels.remove(&(guild_id, channel_id));
+        }
+        self.mark_welcome_sync_dirty(guild_id, channel_id).await;
+        let _ = self
+            .maybe_join_from_pending_welcome_with_retry(guild_id, channel_id)
+            .await;
+    }
+
     async fn prewarm_mls_for_guild_channels(
         &self,
         guild_id: GuildId,
         channels: &[ChannelSummary],
     ) -> Result<()> {
         let (_, user_id) = self.session().await?;
+
         for channel in channels {
             if channel.kind != shared::domain::ChannelKind::Text {
                 continue;
             }
 
             let channel_id = channel.channel_id;
+
+            // 1) Try local restore first (cheap, no network churn)
+            match self
+                .try_restore_mls_channel_from_local_state(guild_id, channel_id)
+                .await
+            {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(err) => {
+                    self.emit_mls_failure_event(
+                        MlsFailureCategory::MembershipFetch,
+                        guild_id,
+                        Some(channel_id),
+                        Some(user_id),
+                        None,
+                        "prewarm_mls_for_guild_channels.restore_local_state",
+                        &err,
+                    );
+                }
+            }
+
+            // 2) Try to consume pending welcome (joiners)
+            if let Err(err) = self
+                .maybe_join_from_pending_welcome_with_retry(guild_id, channel_id)
+                .await
+            {
+                self.emit_mls_failure_event(
+                    MlsFailureCategory::WelcomeFetch,
+                    guild_id,
+                    Some(channel_id),
+                    Some(user_id),
+                    Some(user_id),
+                    "prewarm_mls_for_guild_channels.welcome_sync",
+                    &err,
+                );
+            }
+
+            if self.is_mls_channel_initialized(guild_id, channel_id).await {
+                continue;
+            }
+
+            // 3) Only then let leader bootstrap membership for channel
             if let Err(err) = self
                 .maybe_bootstrap_existing_members_if_leader(guild_id, channel_id, user_id, None)
                 .await
@@ -2309,54 +2817,11 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
                 )
                 .await;
             }
-            if let Err(err) = self
-                .maybe_join_from_pending_welcome_with_retry(guild_id, channel_id)
-                .await
-            {
-                self.emit_mls_failure_event(
-                    MlsFailureCategory::WelcomeFetch,
-                    guild_id,
-                    Some(channel_id),
-                    Some(user_id),
-                    Some(user_id),
-                    "prewarm_mls_for_guild_channels.welcome_sync",
-                    &err,
-                );
-                self.retry_for_mls_failure(
-                    MlsFailureCategory::WelcomeFetch,
-                    guild_id,
-                    channel_id,
-                    Some(user_id),
-                    Some(user_id),
-                )
-                .await;
-            }
-            if let Err(err) = self
-                .try_restore_mls_channel_from_local_state(guild_id, channel_id)
-                .await
-            {
-                self.emit_mls_failure_event(
-                    MlsFailureCategory::MembershipFetch,
-                    guild_id,
-                    Some(channel_id),
-                    Some(user_id),
-                    None,
-                    "prewarm_mls_for_guild_channels.restore_local_state",
-                    &err,
-                );
-                self.retry_for_mls_failure(
-                    MlsFailureCategory::MembershipFetch,
-                    guild_id,
-                    channel_id,
-                    Some(user_id),
-                    None,
-                )
-                .await;
-            }
         }
 
         Ok(())
     }
+
 
     async fn reconcile_mls_state_for_guild(&self, guild_id: GuildId) -> Result<()> {
         let (server_url, user_id) = self.session().await?;
@@ -2417,6 +2882,11 @@ impl<C: CryptoProvider + 'static> ClientHandle for Arc<RealtimeClient<C>> {
             guard.inflight_welcome_syncs.clear();
             guard.bootstrap_request_last_sent.clear();
             guard.attempted_channel_member_additions.clear();
+            guard.processed_inbound_message_ids.clear();
+            guard.processed_inbound_message_order.clear();
+            guard.inflight_bootstraps.clear();
+            guard.inflight_inbound_message_ids.clear();
+            
             zeroize_voice_session_cache(&mut guard);
         }
 
@@ -2434,6 +2904,10 @@ impl<C: CryptoProvider + 'static> ClientHandle for Arc<RealtimeClient<C>> {
             guard.inflight_welcome_syncs.clear();
             guard.bootstrap_request_last_sent.clear();
             guard.attempted_channel_member_additions.clear();
+            guard.processed_inbound_message_ids.clear();
+            guard.processed_inbound_message_order.clear();
+            guard.inflight_bootstraps.clear();
+            guard.inflight_inbound_message_ids.clear();
             zeroize_voice_session_cache(&mut guard);
             return Err(err);
         }
