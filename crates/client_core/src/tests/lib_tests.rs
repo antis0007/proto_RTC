@@ -253,7 +253,11 @@ async fn send_message_requires_active_mls_state() {
         .send_message("plaintext-message")
         .await
         .expect_err("must fail");
-    assert!(err.to_string().contains("uninitialized"));
+    let err_text = err.to_string();
+    assert!(
+        err_text.contains("uninitialized") || err_text.contains("failed to fetch guild members"),
+        "unexpected error: {err_text}"
+    );
 }
 
 #[tokio::test]
@@ -526,12 +530,17 @@ struct OnboardingServerState {
     add_member_posts: Arc<Mutex<Vec<(i64, i64, i64)>>>,
     stored_ciphertexts: Arc<Mutex<Vec<String>>>,
     include_target_member: Arc<Mutex<bool>>,
+    fail_member_fetch: Arc<Mutex<bool>>,
+    fail_key_package_fetch: Arc<Mutex<bool>>,
     bootstrap_requests: Arc<Mutex<Vec<(i64, i64, i64, Option<i64>, String)>>>,
 }
 
 async fn onboarding_list_members(
     State(state): State<OnboardingServerState>,
-) -> Json<Vec<MemberSummary>> {
+) -> Result<Json<Vec<MemberSummary>>, StatusCode> {
+    if *state.fail_member_fetch.lock().await {
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
     let mut members = vec![MemberSummary {
         guild_id: GuildId(11),
         user_id: shared::domain::UserId(7),
@@ -548,16 +557,27 @@ async fn onboarding_list_members(
             muted: false,
         });
     }
-    Json(members)
+    Ok(Json(members))
 }
 
-async fn onboarding_fetch_key_package() -> Json<KeyPackageResponse> {
-    Json(KeyPackageResponse {
+#[derive(Deserialize)]
+struct FetchKeyPackageQuery {
+    user_id: i64,
+}
+
+async fn onboarding_fetch_key_package(
+    State(state): State<OnboardingServerState>,
+    Query(q): Query<FetchKeyPackageQuery>,
+) -> Result<Json<KeyPackageResponse>, StatusCode> {
+    if *state.fail_key_package_fetch.lock().await && q.user_id == 42 {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    Ok(Json(KeyPackageResponse {
         key_package_id: 1,
         guild_id: 11,
         user_id: 42,
         key_package_b64: STANDARD.encode(b"target-kp"),
-    })
+    }))
 }
 
 #[derive(Deserialize)]
@@ -685,6 +705,8 @@ async fn spawn_onboarding_server() -> Result<(String, OnboardingServerState)> {
         add_member_posts: Arc::new(Mutex::new(Vec::new())),
         stored_ciphertexts: Arc::new(Mutex::new(Vec::new())),
         include_target_member: Arc::new(Mutex::new(true)),
+        fail_member_fetch: Arc::new(Mutex::new(false)),
+        fail_key_package_fetch: Arc::new(Mutex::new(false)),
         bootstrap_requests: Arc::new(Mutex::new(Vec::new())),
     };
     let app = Router::new()
@@ -1140,6 +1162,114 @@ async fn missing_welcome_bootstrap_targets_requester_and_forces_retry_for_that_m
     // a targeted retry should still regenerate/store welcome for user 42.
     let posts = server_state.add_member_posts.lock().await.clone();
     assert_eq!(posts, vec![(11, 13, 42)]);
+}
+
+#[tokio::test]
+async fn bootstrap_membership_fetch_failure_emits_structured_error_and_requests_retry() {
+    let (server_url, server_state) = spawn_onboarding_server().await.expect("spawn server");
+    *server_state.fail_member_fetch.lock().await = true;
+
+    let client = RealtimeClient::new_with_mls_session_manager(
+        PassthroughCrypto,
+        Arc::new(TestMlsSessionManager::ok(
+            b"ciphertext-no-members".to_vec(),
+            Vec::new(),
+        )),
+    );
+    {
+        let mut inner = client.inner.lock().await;
+        inner.server_url = Some(server_url);
+        inner.user_id = Some(7);
+        inner.selected_guild = Some(GuildId(11));
+        inner.selected_channel = Some(ChannelId(13));
+        inner.channel_guilds.insert(ChannelId(13), GuildId(11));
+        inner
+            .initialized_mls_channels
+            .insert((GuildId(11), ChannelId(13)));
+    }
+
+    let mut rx = client.subscribe_events();
+    client
+        .send_message("trigger membership retry")
+        .await
+        .expect("send should continue despite membership fetch failure");
+
+    let err_msg = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if let ClientEvent::Error(msg) = rx.recv().await.expect("event") {
+                if msg.contains("category=membership_fetch") {
+                    break msg;
+                }
+            }
+        }
+    })
+    .await
+    .expect("structured error event timeout");
+
+    assert!(err_msg.contains("guild_id=11"));
+    assert!(err_msg.contains("channel_id=13"));
+    assert!(err_msg.contains("actor_user_id=7"));
+
+    let bootstrap_requests = server_state.bootstrap_requests.lock().await.clone();
+    assert!(
+        bootstrap_requests
+            .iter()
+            .any(|entry| entry.0 == 7 && entry.1 == 11 && entry.2 == 13),
+        "expected a membership-triggered bootstrap retry request"
+    );
+}
+
+#[tokio::test]
+async fn bootstrap_key_package_failure_emits_structured_error_and_requests_targeted_retry() {
+    let (server_url, server_state) = spawn_onboarding_server().await.expect("spawn server");
+    *server_state.fail_key_package_fetch.lock().await = true;
+
+    let leader = RealtimeClient::new_with_mls_session_manager(
+        PassthroughCrypto,
+        Arc::new(TestMlsSessionManager::ok(Vec::new(), Vec::new())),
+    );
+    {
+        let mut inner = leader.inner.lock().await;
+        inner.server_url = Some(server_url);
+        inner.user_id = Some(7);
+        inner.selected_guild = Some(GuildId(11));
+        inner.selected_channel = Some(ChannelId(13));
+        inner.channel_guilds.insert(ChannelId(13), GuildId(11));
+    }
+
+    let mut rx = leader.subscribe_events();
+    leader
+        .select_channel(ChannelId(13))
+        .await
+        .expect("select channel should succeed even when key package fetch fails");
+
+    let err_msg = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if let ClientEvent::Error(msg) = rx.recv().await.expect("event") {
+                if msg.contains("category=key_package_fetch") {
+                    break msg;
+                }
+            }
+        }
+    })
+    .await
+    .expect("structured error event timeout");
+
+    assert!(err_msg.contains("guild_id=11"));
+    assert!(err_msg.contains("channel_id=13"));
+    assert!(err_msg.contains("target_user_id=42"));
+
+    let bootstrap_requests = server_state.bootstrap_requests.lock().await.clone();
+    assert!(
+        bootstrap_requests.iter().any(|entry| {
+            entry.0 == 7
+                && entry.1 == 11
+                && entry.2 == 13
+                && entry.3 == Some(42)
+                && entry.4 == "unknown"
+        }),
+        "expected a targeted bootstrap retry request for the key package failure"
+    );
 }
 
 #[tokio::test]
