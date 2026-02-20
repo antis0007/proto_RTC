@@ -12,7 +12,10 @@ use std::{
     str::FromStr,
 };
 
-use shared::domain::{ChannelId, ChannelKind, FileId, GuildId, MessageId, Role, UserId};
+use shared::domain::{
+    ChannelId, ChannelKind, DeviceId, DeviceLinkState, FileId, GuildId, LinkedDeviceSummary,
+    MessageId, Role, UserId,
+};
 
 #[derive(Clone)]
 pub struct Storage {
@@ -49,8 +52,18 @@ pub struct StoredFile {
 }
 
 #[derive(Debug, Clone)]
+pub struct StoredDeviceSummary {
+    pub device_id: DeviceId,
+    pub user_id: UserId,
+    pub device_name: String,
+    pub device_public_identity: String,
+    pub is_revoked: bool,
+}
+
+#[derive(Debug, Clone)]
 pub struct PendingWelcome {
     pub welcome_bytes: Vec<u8>,
+    pub target_device_id: Option<DeviceId>,
 }
 
 #[derive(Debug, Clone)]
@@ -91,7 +104,6 @@ impl Storage {
             .context("sqlite ping failed")?;
         Ok(())
     }
-
 
     async fn ensure_pending_join_table(&self) -> Result<()> {
         sqlx::query(
@@ -441,19 +453,139 @@ impl Storage {
         }))
     }
 
+    pub async fn register_device(
+        &self,
+        user_id: UserId,
+        device_name: &str,
+        device_public_identity: &str,
+    ) -> Result<StoredDeviceSummary> {
+        let row = sqlx::query(
+            "INSERT INTO user_devices (user_id, device_name, device_public_identity)
+             VALUES (?, ?, ?)
+             RETURNING device_id, user_id, device_name, device_public_identity, is_revoked",
+        )
+        .bind(user_id.0)
+        .bind(device_name)
+        .bind(device_public_identity)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(StoredDeviceSummary {
+            device_id: DeviceId(row.get::<i64, _>(0)),
+            user_id: UserId(row.get::<i64, _>(1)),
+            device_name: row.get::<String, _>(2),
+            device_public_identity: row.get::<String, _>(3),
+            is_revoked: row.get::<bool, _>(4),
+        })
+    }
+
+    pub async fn get_device(
+        &self,
+        user_id: UserId,
+        device_id: DeviceId,
+    ) -> Result<Option<StoredDeviceSummary>> {
+        let row = sqlx::query(
+            "SELECT device_id, user_id, device_name, device_public_identity, is_revoked
+             FROM user_devices
+             WHERE user_id = ? AND device_id = ?",
+        )
+        .bind(user_id.0)
+        .bind(device_id.0)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(|row| StoredDeviceSummary {
+            device_id: DeviceId(row.get::<i64, _>(0)),
+            user_id: UserId(row.get::<i64, _>(1)),
+            device_name: row.get::<String, _>(2),
+            device_public_identity: row.get::<String, _>(3),
+            is_revoked: row.get::<bool, _>(4),
+        }))
+    }
+
+    pub async fn list_devices_for_user(&self, user_id: UserId) -> Result<Vec<LinkedDeviceSummary>> {
+        let rows = sqlx::query(
+            "SELECT device_id, user_id, device_name, device_public_identity, is_revoked
+             FROM user_devices
+             WHERE user_id = ?
+             ORDER BY device_id ASC",
+        )
+        .bind(user_id.0)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                let is_revoked = row.get::<bool, _>(4);
+                LinkedDeviceSummary {
+                    device: shared::domain::DeviceSummary {
+                        device_id: DeviceId(row.get::<i64, _>(0)),
+                        user_id: UserId(row.get::<i64, _>(1)),
+                        device_name: row.get::<String, _>(2),
+                        device_public_identity: row.get::<String, _>(3),
+                        is_revoked,
+                    },
+                    link_state: if is_revoked {
+                        DeviceLinkState::Revoked
+                    } else {
+                        DeviceLinkState::Linked
+                    },
+                }
+            })
+            .collect())
+    }
+
+    pub async fn create_device_link_token(
+        &self,
+        user_id: UserId,
+        initiator_device_id: DeviceId,
+        target_device_pubkey: &str,
+        expires_at: DateTime<Utc>,
+    ) -> Result<i64> {
+        let row = sqlx::query(
+            "INSERT INTO device_link_tokens (user_id, initiator_device_id, target_device_pubkey, expires_at)
+             VALUES (?, ?, ?, ?)
+             RETURNING token_id",
+        )
+        .bind(user_id.0)
+        .bind(initiator_device_id.0)
+        .bind(target_device_pubkey)
+        .bind(expires_at)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.get::<i64, _>(0))
+    }
+
+    pub async fn consume_device_link_token(&self, user_id: UserId, token_id: i64) -> Result<bool> {
+        let updated = sqlx::query(
+            "UPDATE device_link_tokens
+             SET consumed_at = CURRENT_TIMESTAMP
+             WHERE token_id = ? AND user_id = ? AND consumed_at IS NULL AND expires_at > CURRENT_TIMESTAMP",
+        )
+        .bind(token_id)
+        .bind(user_id.0)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(updated > 0)
+    }
+
     pub async fn insert_key_package(
         &self,
         guild_id: GuildId,
         user_id: UserId,
+        device_id: Option<DeviceId>,
         key_package_bytes: &[u8],
     ) -> Result<i64> {
         let rec = sqlx::query(
-            "INSERT INTO mls_key_packages (guild_id, user_id, key_package_bytes)
-             VALUES (?, ?, ?)
+            "INSERT INTO mls_key_packages (guild_id, user_id, device_id, key_package_bytes)
+             VALUES (?, ?, ?, ?)
              RETURNING id",
         )
         .bind(guild_id.0)
         .bind(user_id.0)
+        .bind(device_id.map(|id| id.0))
         .bind(key_package_bytes)
         .fetch_one(&self.pool)
         .await?;
@@ -464,20 +596,43 @@ impl Storage {
         &self,
         guild_id: GuildId,
         user_id: UserId,
-    ) -> Result<Option<(i64, Vec<u8>)>> {
-        let row = sqlx::query(
-            "SELECT id, key_package_bytes
-             FROM mls_key_packages
-             WHERE guild_id = ? AND user_id = ?
-             ORDER BY id DESC
-             LIMIT 1",
-        )
-        .bind(guild_id.0)
-        .bind(user_id.0)
-        .fetch_optional(&self.pool)
-        .await?;
+        target_device_id: Option<DeviceId>,
+    ) -> Result<Option<(i64, Option<DeviceId>, Vec<u8>)>> {
+        let row = if let Some(device_id) = target_device_id {
+            sqlx::query(
+                "SELECT id, device_id, key_package_bytes
+                 FROM mls_key_packages
+                 WHERE guild_id = ? AND user_id = ? AND device_id = ?
+                 ORDER BY id DESC
+                 LIMIT 1",
+            )
+            .bind(guild_id.0)
+            .bind(user_id.0)
+            .bind(device_id.0)
+            .fetch_optional(&self.pool)
+            .await?
+        } else {
+            sqlx::query(
+                "SELECT kp.id, kp.device_id, kp.key_package_bytes
+                 FROM mls_key_packages kp
+                 LEFT JOIN user_devices ud ON ud.device_id = kp.device_id
+                 WHERE kp.guild_id = ? AND kp.user_id = ? AND (kp.device_id IS NULL OR COALESCE(ud.is_revoked, 0) = 0)
+                 ORDER BY kp.id DESC
+                 LIMIT 1",
+            )
+            .bind(guild_id.0)
+            .bind(user_id.0)
+            .fetch_optional(&self.pool)
+            .await?
+        };
 
-        Ok(row.map(|r| (r.get::<i64, _>(0), r.get::<Vec<u8>, _>(1))))
+        Ok(row.map(|r| {
+            (
+                r.get::<i64, _>(0),
+                r.get::<Option<i64>, _>(1).map(DeviceId),
+                r.get::<Vec<u8>, _>(2),
+            )
+        }))
     }
 
     pub async fn insert_pending_welcome(
@@ -485,16 +640,18 @@ impl Storage {
         guild_id: GuildId,
         channel_id: ChannelId,
         user_id: UserId,
+        target_device_id: Option<DeviceId>,
         welcome_bytes: &[u8],
     ) -> Result<i64> {
         let rec = sqlx::query(
-            "INSERT INTO pending_welcomes (guild_id, channel_id, user_id, welcome_bytes)
-             VALUES (?, ?, ?, ?)
+            "INSERT INTO pending_welcomes (guild_id, channel_id, user_id, target_device_id, welcome_bytes)
+             VALUES (?, ?, ?, ?, ?)
              RETURNING id",
         )
         .bind(guild_id.0)
         .bind(channel_id.0)
         .bind(user_id.0)
+        .bind(target_device_id.map(|id| id.0))
         .bind(welcome_bytes)
         .fetch_one(&self.pool)
         .await?;
@@ -507,22 +664,40 @@ impl Storage {
         guild_id: GuildId,
         channel_id: ChannelId,
         user_id: UserId,
+        target_device_id: Option<DeviceId>,
     ) -> Result<Option<PendingWelcome>> {
-        let row = sqlx::query(
-            "SELECT welcome_bytes
-             FROM pending_welcomes
-             WHERE guild_id = ? AND channel_id = ? AND user_id = ? AND consumed_at IS NULL
-             ORDER BY id DESC
-             LIMIT 1",
-        )
-        .bind(guild_id.0)
-        .bind(channel_id.0)
-        .bind(user_id.0)
-        .fetch_optional(&self.pool)
-        .await?;
+        let row = if let Some(device_id) = target_device_id {
+            sqlx::query(
+                "SELECT welcome_bytes, target_device_id
+                 FROM pending_welcomes
+                 WHERE guild_id = ? AND channel_id = ? AND user_id = ? AND target_device_id = ? AND consumed_at IS NULL
+                 ORDER BY id DESC
+                 LIMIT 1",
+            )
+            .bind(guild_id.0)
+            .bind(channel_id.0)
+            .bind(user_id.0)
+            .bind(device_id.0)
+            .fetch_optional(&self.pool)
+            .await?
+        } else {
+            sqlx::query(
+                "SELECT welcome_bytes, target_device_id
+                 FROM pending_welcomes
+                 WHERE guild_id = ? AND channel_id = ? AND user_id = ? AND consumed_at IS NULL
+                 ORDER BY id DESC
+                 LIMIT 1",
+            )
+            .bind(guild_id.0)
+            .bind(channel_id.0)
+            .bind(user_id.0)
+            .fetch_optional(&self.pool)
+            .await?
+        };
 
         Ok(row.map(|r| PendingWelcome {
             welcome_bytes: r.get::<Vec<u8>, _>(0),
+            target_device_id: r.get::<Option<i64>, _>(1).map(DeviceId),
         }))
     }
 
@@ -531,22 +706,40 @@ impl Storage {
         guild_id: GuildId,
         channel_id: ChannelId,
         user_id: UserId,
+        target_device_id: Option<DeviceId>,
     ) -> Result<Option<PendingWelcome>> {
-        let row = sqlx::query(
-            "SELECT welcome_bytes
-             FROM pending_welcomes
-             WHERE guild_id = ? AND channel_id = ? AND user_id = ?
-             ORDER BY id DESC
-             LIMIT 1",
-        )
-        .bind(guild_id.0)
-        .bind(channel_id.0)
-        .bind(user_id.0)
-        .fetch_optional(&self.pool)
-        .await?;
+        let row = if let Some(device_id) = target_device_id {
+            sqlx::query(
+                "SELECT welcome_bytes, target_device_id
+                 FROM pending_welcomes
+                 WHERE guild_id = ? AND channel_id = ? AND user_id = ? AND target_device_id = ?
+                 ORDER BY id DESC
+                 LIMIT 1",
+            )
+            .bind(guild_id.0)
+            .bind(channel_id.0)
+            .bind(user_id.0)
+            .bind(device_id.0)
+            .fetch_optional(&self.pool)
+            .await?
+        } else {
+            sqlx::query(
+                "SELECT welcome_bytes, target_device_id
+                 FROM pending_welcomes
+                 WHERE guild_id = ? AND channel_id = ? AND user_id = ?
+                 ORDER BY id DESC
+                 LIMIT 1",
+            )
+            .bind(guild_id.0)
+            .bind(channel_id.0)
+            .bind(user_id.0)
+            .fetch_optional(&self.pool)
+            .await?
+        };
 
         Ok(row.map(|r| PendingWelcome {
             welcome_bytes: r.get::<Vec<u8>, _>(0),
+            target_device_id: r.get::<Option<i64>, _>(1).map(DeviceId),
         }))
     }
 
@@ -580,7 +773,6 @@ impl Storage {
         }))
     }
 
-
     /// Deletes the persisted MLS group snapshot for a single channel on this device.
     ///
     /// This is the main self-heal primitive for stale local MLS roster state (e.g. the
@@ -613,13 +805,12 @@ impl Storage {
         user_id: i64,
         device_id: &str,
     ) -> Result<u64> {
-        let result = sqlx::query(
-            "DELETE FROM mls_group_states WHERE user_id = ? AND device_id = ?",
-        )
-        .bind(user_id)
-        .bind(device_id)
-        .execute(&self.pool)
-        .await?;
+        let result =
+            sqlx::query("DELETE FROM mls_group_states WHERE user_id = ? AND device_id = ?")
+                .bind(user_id)
+                .bind(device_id)
+                .execute(&self.pool)
+                .await?;
 
         Ok(result.rows_affected())
     }
@@ -634,23 +825,21 @@ impl Storage {
     ) -> Result<(u64, u64)> {
         let mut tx = self.pool.begin().await?;
 
-        let groups = sqlx::query(
-            "DELETE FROM mls_group_states WHERE user_id = ? AND device_id = ?",
-        )
-        .bind(user_id)
-        .bind(device_id)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
+        let groups =
+            sqlx::query("DELETE FROM mls_group_states WHERE user_id = ? AND device_id = ?")
+                .bind(user_id)
+                .bind(device_id)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
 
-        let identities = sqlx::query(
-            "DELETE FROM mls_identity_keys WHERE user_id = ? AND device_id = ?",
-        )
-        .bind(user_id)
-        .bind(device_id)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
+        let identities =
+            sqlx::query("DELETE FROM mls_identity_keys WHERE user_id = ? AND device_id = ?")
+                .bind(user_id)
+                .bind(device_id)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
 
         tx.commit().await?;
         Ok((groups, identities))
@@ -888,7 +1077,6 @@ impl MlsStore for Storage {
         .await?;
         Ok(())
     }
-
 }
 
 #[cfg(test)]

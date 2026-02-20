@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    domain::{ChannelId, ChannelKind, FileId, GuildId, MessageId, Role, UserId},
+    domain::{ChannelId, ChannelKind, DeviceId, FileId, GuildId, MessageId, Role, UserId},
     error::ApiError,
 };
 
@@ -80,6 +80,8 @@ pub struct KeyPackageResponse {
     pub key_package_id: i64,
     pub guild_id: i64,
     pub user_id: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<DeviceId>,
     pub key_package_b64: String,
 }
 
@@ -88,6 +90,8 @@ pub struct WelcomeResponse {
     pub guild_id: GuildId,
     pub channel_id: ChannelId,
     pub user_id: UserId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_device_id: Option<DeviceId>,
     pub welcome_b64: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub consumed_at: Option<DateTime<Utc>>,
@@ -162,6 +166,8 @@ pub enum ServerEvent {
         guild_id: GuildId,
         channel_id: ChannelId,
         target_user_id: UserId,
+        #[serde(default)]
+        target_device_id: Option<DeviceId>,
     },
     MlsBootstrapRequested {
         guild_id: GuildId,
@@ -169,6 +175,8 @@ pub enum ServerEvent {
         requesting_user_id: UserId,
         #[serde(default)]
         target_user_id: Option<UserId>,
+        #[serde(default)]
+        target_device_id: Option<DeviceId>,
         #[serde(default)]
         reason: MlsBootstrapReason,
     },

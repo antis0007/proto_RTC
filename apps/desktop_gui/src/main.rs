@@ -2567,7 +2567,7 @@ impl DesktopGuiApp {
                             }
                         } else {
                             ui.allocate_ui_with_layout(
-                                
+
                                 ui.available_size(),
                                 egui::Layout::centered_and_justified(egui::Direction::TopDown),
                                 |ui| {
@@ -3039,7 +3039,10 @@ fn sanitize_profile_segment(input: &str) -> String {
 }
 
 fn desktop_gui_device_id_for_username(username: &str) -> String {
-    format!("{DESKTOP_GUI_DEVICE_ID_PREFIX}-{}", sanitize_profile_segment(username))
+    format!(
+        "{DESKTOP_GUI_DEVICE_ID_PREFIX}-{}",
+        sanitize_profile_segment(username)
+    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -3114,7 +3117,9 @@ fn resolve_mls_gui_data_dir() -> Result<PathBuf, String> {
     #[cfg(target_os = "windows")]
     {
         if let Some(userprofile) = read_non_empty_env_var("USERPROFILE", &mut attempts) {
-            return Ok(PathBuf::from(userprofile).join(".proto_rtc").join("clients"));
+            return Ok(PathBuf::from(userprofile)
+                .join(".proto_rtc")
+                .join("clients"));
         }
 
         let homedrive = read_non_empty_env_var("HOMEDRIVE", &mut attempts);
@@ -3134,7 +3139,9 @@ fn resolve_mls_gui_data_dir() -> Result<PathBuf, String> {
         }
 
         if let Some(local_app_data) = read_non_empty_env_var("LOCALAPPDATA", &mut attempts) {
-            return Ok(PathBuf::from(local_app_data).join("proto_rtc").join("clients"));
+            return Ok(PathBuf::from(local_app_data)
+                .join("proto_rtc")
+                .join("clients"));
         }
     }
 
@@ -3153,11 +3160,7 @@ fn resolve_user_profile_data_dir(base_dir: &std::path::Path, username: &str) -> 
     base_dir.join(sanitize_profile_segment(username))
 }
 
-fn resolve_user_mls_data_dir(
-    base_dir: &std::path::Path,
-    username: &str,
-    user_id: i64,
-) -> PathBuf {
+fn resolve_user_mls_data_dir(base_dir: &std::path::Path, username: &str, user_id: i64) -> PathBuf {
     resolve_user_profile_data_dir(base_dir, username)
         .join("mls")
         .join(format!("user_{user_id}"))

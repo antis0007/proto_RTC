@@ -102,22 +102,23 @@ async fn stores_latest_key_package_per_user_per_guild() {
     let guild = storage.create_guild("security", user).await.expect("guild");
 
     let first_id = storage
-        .insert_key_package(guild, user, b"kp-1")
+        .insert_key_package(guild, user, None, b"kp-1")
         .await
         .expect("insert key package");
     let second_id = storage
-        .insert_key_package(guild, user, b"kp-2")
+        .insert_key_package(guild, user, None, b"kp-2")
         .await
         .expect("insert key package");
     assert!(second_id > first_id);
 
     let latest = storage
-        .load_latest_key_package(guild, user)
+        .load_latest_key_package(guild, user, None)
         .await
         .expect("latest")
         .expect("some latest");
     assert_eq!(latest.0, second_id);
-    assert_eq!(latest.1, b"kp-2");
+    assert_eq!(latest.1, None);
+    assert_eq!(latest.2, b"kp-2");
 }
 
 #[tokio::test]
@@ -134,11 +135,11 @@ async fn loads_latest_unconsumed_pending_welcome() {
         .expect("channel");
 
     storage
-        .insert_pending_welcome(guild, channel, user, b"welcome-v1")
+        .insert_pending_welcome(guild, channel, user, None, b"welcome-v1")
         .await
         .expect("insert welcome");
     storage
-        .insert_pending_welcome(guild, channel, user, b"welcome-v2")
+        .insert_pending_welcome(guild, channel, user, None, b"welcome-v2")
         .await
         .expect("insert welcome");
 
@@ -165,7 +166,7 @@ async fn consumed_pending_welcome_is_not_returned_again() {
         .expect("channel");
 
     storage
-        .insert_pending_welcome(guild, channel, user, b"single-use")
+        .insert_pending_welcome(guild, channel, user, None, b"single-use")
         .await
         .expect("insert welcome");
 
@@ -223,19 +224,19 @@ async fn pending_welcome_lookup_is_isolated_by_guild_channel_and_user() {
         .expect("channel b1");
 
     storage
-        .insert_pending_welcome(guild_a, channel_a1, alice, b"target")
+        .insert_pending_welcome(guild_a, channel_a1, alice, None, b"target")
         .await
         .expect("insert target");
     storage
-        .insert_pending_welcome(guild_a, channel_a1, bob, b"other-user")
+        .insert_pending_welcome(guild_a, channel_a1, bob, None, b"other-user")
         .await
         .expect("insert other user");
     storage
-        .insert_pending_welcome(guild_a, channel_a2, alice, b"other-channel")
+        .insert_pending_welcome(guild_a, channel_a2, alice, None, b"other-channel")
         .await
         .expect("insert other channel");
     storage
-        .insert_pending_welcome(guild_b, channel_b1, alice, b"other-guild")
+        .insert_pending_welcome(guild_b, channel_b1, alice, None, b"other-guild")
         .await
         .expect("insert other guild");
 
@@ -282,7 +283,7 @@ async fn consuming_pending_welcome_is_race_safe() {
         .expect("channel");
 
     storage
-        .insert_pending_welcome(guild, channel, user, b"race-welcome")
+        .insert_pending_welcome(guild, channel, user, None, b"race-welcome")
         .await
         .expect("insert welcome");
 

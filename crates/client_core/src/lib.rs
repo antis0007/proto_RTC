@@ -30,7 +30,7 @@ use tokio::{
     task::JoinHandle,
 };
 use tokio_tungstenite::{connect_async, tungstenite::Message};
-use tracing::{debug, info, warn, error};
+use tracing::{debug, error, info, warn};
 use zeroize::Zeroize;
 
 pub mod error;
@@ -439,6 +439,17 @@ struct LoginResponse {
 }
 
 #[derive(Debug, Serialize)]
+struct RegisterDeviceRequest {
+    device_name: String,
+    device_public_identity: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RegisteredDeviceResponse {
+    device_id: i64,
+}
+
+#[derive(Debug, Serialize)]
 struct JoinGuildRequest {
     user_id: i64,
     invite_code: String,
@@ -588,6 +599,7 @@ struct ActiveVoiceSession {
 struct RealtimeClientState {
     server_url: Option<String>,
     user_id: Option<i64>,
+    device_id: Option<i64>,
     selected_guild: Option<GuildId>,
     selected_channel: Option<ChannelId>,
     ws_started: bool,
@@ -604,7 +616,6 @@ struct RealtimeClientState {
     processed_inbound_message_order: VecDeque<(ChannelId, MessageId)>,
     inflight_bootstraps: HashSet<(GuildId, ChannelId)>,
     inflight_inbound_message_ids: HashSet<(ChannelId, MessageId)>,
-    
 }
 
 #[derive(Serialize)]
@@ -675,6 +686,7 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
             inner: Mutex::new(RealtimeClientState {
                 server_url: None,
                 user_id: None,
+                device_id: None,
                 selected_guild: None,
                 selected_channel: None,
                 ws_started: false,
@@ -1026,6 +1038,7 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
                                 guild_id,
                                 channel_id,
                                 target_user_id,
+                                ..
                             } = event
                             {
                                 let current_user_id = { client.inner.lock().await.user_id };
@@ -1059,12 +1072,13 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
                                 requesting_user_id,
                                 target_user_id,
                                 reason,
+                                ..
                             } = event
                             {
                                 client.mark_welcome_sync_dirty(guild_id, channel_id).await;
                                 let client_clone = Arc::clone(&client);
                                 tokio::spawn(async move {
-                                    let Ok((_, current_user_id)) = client_clone.session().await
+                                    let Ok((_, current_user_id, _)) = client_clone.session().await
                                     else {
                                         return;
                                     };
@@ -1143,7 +1157,7 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
         Ok(())
     }
 
-    async fn session(&self) -> Result<(String, i64)> {
+    async fn session(&self) -> Result<(String, i64, i64)> {
         let guard = self.inner.lock().await;
         let server_url = guard
             .server_url
@@ -1152,17 +1166,24 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
         let user_id = guard
             .user_id
             .ok_or_else(|| anyhow!("not logged in: missing user_id"))?;
-        Ok((server_url, user_id))
+        let device_id = guard
+            .device_id
+            .ok_or_else(|| anyhow!("not logged in: missing device_id"))?;
+        Ok((server_url, user_id, device_id))
     }
 
     async fn upload_key_package_for_guild(&self, guild_id: GuildId) -> Result<i64> {
-        let (server_url, user_id) = self.session().await?;
+        let (server_url, user_id, device_id) = self.session().await?;
         let key_package_bytes = self.mls_session_manager.key_package_bytes(guild_id).await?;
 
         let response: UploadKeyPackageResponse = self
             .http
             .post(format!("{server_url}/mls/key_packages"))
-            .query(&[("user_id", user_id), ("guild_id", guild_id.0)])
+            .query(&[
+                ("user_id", user_id),
+                ("guild_id", guild_id.0),
+                ("device_id", device_id),
+            ])
             .body(key_package_bytes)
             .send()
             .await?
@@ -1174,11 +1195,15 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
     }
 
     pub async fn fetch_key_package(&self, user_id: i64, guild_id: GuildId) -> Result<Vec<u8>> {
-        let (server_url, _current_user_id) = self.session().await?;
+        let (server_url, current_user_id, _current_device_id) = self.session().await?;
         let response: KeyPackageResponse = self
             .http
             .get(format!("{server_url}/mls/key_packages"))
-            .query(&[("user_id", user_id), ("guild_id", guild_id.0)])
+            .query(&[
+                ("user_id", current_user_id),
+                ("guild_id", guild_id.0),
+                ("target_user_id", user_id),
+            ])
             .send()
             .await?
             .error_for_status()?
@@ -1241,7 +1266,7 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
         target_user_id: i64,
         welcome_bytes: &[u8],
     ) -> Result<()> {
-        let (server_url, current_user_id) = self.session().await?;
+        let (server_url, current_user_id, device_id) = self.session().await?;
         info!(
             guild_id = guild_id.0,
             channel_id = channel_id.0,
@@ -1256,6 +1281,7 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
                 ("guild_id", guild_id.0),
                 ("channel_id", channel_id.0),
                 ("target_user_id", target_user_id),
+                ("target_device_id", device_id),
             ])
             .body(welcome_bytes.to_vec())
             .send()
@@ -1276,7 +1302,7 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
         channel_id: ChannelId,
         target_user_id: i64,
     ) -> Result<()> {
-        let (server_url, current_user_id) = self.session().await?;
+        let (server_url, current_user_id, device_id) = self.session().await?;
         let response = self
             .http
             .post(format!("{server_url}/mls/welcome/recovery"))
@@ -1285,6 +1311,7 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
                 ("guild_id", guild_id.0),
                 ("channel_id", channel_id.0),
                 ("target_user_id", target_user_id),
+                ("target_device_id", device_id),
             ])
             .send()
             .await?;
@@ -1328,7 +1355,11 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
             return Ok(());
         }
 
-        Err(anyhow!("recovery welcome request failed (status {}): {}", status, body))
+        Err(anyhow!(
+            "recovery welcome request failed (status {}): {}",
+            status,
+            body
+        ))
     }
 
     async fn post_mls_bootstrap_request(
@@ -1361,7 +1392,7 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
                 .bootstrap_request_last_sent
                 .insert((guild_id, channel_id), Instant::now());
         }
-        let (server_url, user_id) = self.session().await?;
+        let (server_url, user_id, device_id) = self.session().await?;
         let mut request = self
             .http
             .post(format!("{server_url}/mls/bootstrap/request"))
@@ -1369,6 +1400,7 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
                 ("user_id", user_id),
                 ("guild_id", guild_id.0),
                 ("channel_id", channel_id.0),
+                ("target_device_id", device_id),
             ]);
         request = request.query(&[(
             "reason",
@@ -1509,7 +1541,7 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
         guild_id: GuildId,
         channel_id: ChannelId,
     ) -> Result<bool> {
-        let (server_url, user_id) = self.session().await?;
+        let (server_url, user_id, device_id) = self.session().await?;
         let response = self
             .http
             .get(format!("{server_url}/mls/welcome"))
@@ -1517,6 +1549,7 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
                 ("user_id", user_id),
                 ("guild_id", guild_id.0),
                 ("channel_id", channel_id.0),
+                ("target_device_id", device_id),
             ])
             .send()
             .await?;
@@ -1698,7 +1731,7 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
     }
 
     async fn fetch_members_for_guild(&self, guild_id: GuildId) -> Result<Vec<MemberSummary>> {
-        let (server_url, user_id) = self.session().await?;
+        let (server_url, user_id, _device_id) = self.session().await?;
         let members: Vec<MemberSummary> = self
             .http
             .get(format!("{server_url}/guilds/{}/members", guild_id.0))
@@ -1721,7 +1754,7 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
             return Ok(true);
         }
 
-        let (_, current_user_id) = self.session().await?;
+        let (_, current_user_id, _) = self.session().await?;
         let members = self.fetch_members_for_guild(guild_id).await?;
 
         let is_leader = members
@@ -1741,7 +1774,10 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
         let mut should_log = false;
         {
             let mut guard = self.inner.lock().await;
-            if guard.initialized_mls_channels.insert((guild_id, channel_id)) {
+            if guard
+                .initialized_mls_channels
+                .insert((guild_id, channel_id))
+            {
                 should_log = true;
             }
         }
@@ -1757,8 +1793,6 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
 
         Ok(true)
     }
-
-
 
     async fn self_heal_after_recovery_welcome_unavailable(
         &self,
@@ -1804,7 +1838,9 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
 
         {
             let mut guard = self.inner.lock().await;
-            guard.initialized_mls_channels.remove(&(guild_id, channel_id));
+            guard
+                .initialized_mls_channels
+                .remove(&(guild_id, channel_id));
             guard
                 .attempted_channel_member_additions
                 .retain(|(g, c, _)| *g != guild_id || *c != channel_id);
@@ -1830,7 +1866,7 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
         channel_id: ChannelId,
         target_user_id: Option<i64>,
     ) -> Result<()> {
-        let (_server_url, current_user_id) = self.session().await?;
+        let (_server_url, current_user_id, _) = self.session().await?;
         self.mls_session_manager
             .open_or_create_group(guild_id, channel_id)
             .await?;
@@ -2121,20 +2157,28 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
             let members = self
                 .fetch_members_for_guild(guild_id)
                 .await
-                .with_context(|| format!("failed to fetch guild members for guild {}", guild_id.0))?;
+                .with_context(|| {
+                    format!("failed to fetch guild members for guild {}", guild_id.0)
+                })?;
 
             let is_leader = members
                 .iter()
                 .map(|member| member.user_id.0)
                 .min()
                 .is_some_and(|leader_user_id| leader_user_id == current_user_id);
-            if target_user_id.is_none() && self.is_mls_channel_initialized(guild_id, channel_id).await {
+            if target_user_id.is_none()
+                && self.is_mls_channel_initialized(guild_id, channel_id).await
+            {
                 // Already initialized and this is not a targeted repair request.
                 return Ok(true);
             }
             if is_leader {
-                self.maybe_add_existing_members_to_channel_group(guild_id, channel_id, target_user_id)
-                    .await?;
+                self.maybe_add_existing_members_to_channel_group(
+                    guild_id,
+                    channel_id,
+                    target_user_id,
+                )
+                .await?;
                 return Ok(true);
             }
 
@@ -2145,7 +2189,6 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
         self.end_bootstrap(guild_id, channel_id).await;
         result
     }
-
 
     async fn active_context(&self) -> Result<(String, i64, GuildId, ChannelId)> {
         let guard = self.inner.lock().await;
@@ -2189,7 +2232,9 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
 
             if let Some(guild_id) = guard.channel_guilds.get(&message.channel_id).copied() {
                 let pending_plaintext = if message.sender_id.0 == user_id {
-                    guard.pending_outbound_plaintexts.remove(&message.ciphertext_b64)
+                    guard
+                        .pending_outbound_plaintexts
+                        .remove(&message.ciphertext_b64)
                 } else {
                     None
                 };
@@ -2198,7 +2243,9 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
                 if let Some(guild_id) = guard.selected_guild {
                     guard.channel_guilds.insert(message.channel_id, guild_id);
                     let pending_plaintext = if message.sender_id.0 == user_id {
-                        guard.pending_outbound_plaintexts.remove(&message.ciphertext_b64)
+                        guard
+                            .pending_outbound_plaintexts
+                            .remove(&message.ciphertext_b64)
                     } else {
                         None
                     };
@@ -2250,12 +2297,18 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
         }
 
         // Ensure MLS ready before decrypt.
-        if !self.is_mls_channel_initialized(guild_id, message.channel_id).await {
+        if !self
+            .is_mls_channel_initialized(guild_id, message.channel_id)
+            .await
+        {
             let _ = self
                 .maybe_join_from_pending_welcome_with_retry(guild_id, message.channel_id)
                 .await;
 
-            if !self.is_mls_channel_initialized(guild_id, message.channel_id).await {
+            if !self
+                .is_mls_channel_initialized(guild_id, message.channel_id)
+                .await
+            {
                 // Not ready yet: allow a future retry.
                 let mut guard = self.inner.lock().await;
                 clear_inflight(&mut guard);
@@ -2335,7 +2388,10 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
                         }
 
                         let _ = self
-                            .maybe_join_from_pending_welcome_with_retry(guild_id, message.channel_id)
+                            .maybe_join_from_pending_welcome_with_retry(
+                                guild_id,
+                                message.channel_id,
+                            )
                             .await;
 
                         return Ok(());
@@ -2380,9 +2436,6 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
 
         Ok(())
     }
-
-
-
 
     async fn ensure_channel_ready_for_send(
         &self,
@@ -2440,7 +2493,6 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
             channel_id.0
         ))
     }
-
 
     async fn send_message_with_attachment_impl(
         &self,
@@ -2560,7 +2612,7 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
         ciphertext_b64: String,
         attachment: Option<AttachmentPayload>,
     ) -> Result<()> {
-        let (_server_url, user_id) = self.session().await?;
+        let (_server_url, user_id, _) = self.session().await?;
         let payload = SendMessageHttpRequest {
             user_id,
             guild_id: guild_id.0,
@@ -2627,7 +2679,7 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
         limit: u32,
         before: Option<MessageId>,
     ) -> Result<Vec<MessagePayload>> {
-        let (server_url, user_id) = self.session().await?;
+        let (server_url, user_id, _device_id) = self.session().await?;
         {
             let mut guard = self.inner.lock().await;
             if !guard.channel_guilds.contains_key(&channel_id) {
@@ -2670,7 +2722,7 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
     }
 
     async fn post_send_message_payload(&self, payload: SendMessageHttpRequest) -> Result<()> {
-        let (server_url, _user_id) = self.session().await?;
+        let (server_url, _user_id, _) = self.session().await?;
         self.http
             .post(format!("{server_url}/messages"))
             .json(&payload)
@@ -2725,14 +2777,12 @@ fn is_missing_mls_group_error(message: &str) -> bool {
 }
 
 impl<C: CryptoProvider + 'static> RealtimeClient<C> {
-    async fn force_mls_resync_for_channel(
-        &self,
-        guild_id: GuildId,
-        channel_id: ChannelId,
-    ) {
+    async fn force_mls_resync_for_channel(&self, guild_id: GuildId, channel_id: ChannelId) {
         {
             let mut guard = self.inner.lock().await;
-            guard.initialized_mls_channels.remove(&(guild_id, channel_id));
+            guard
+                .initialized_mls_channels
+                .remove(&(guild_id, channel_id));
         }
         self.mark_welcome_sync_dirty(guild_id, channel_id).await;
         let _ = self
@@ -2745,7 +2795,7 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
         guild_id: GuildId,
         channels: &[ChannelSummary],
     ) -> Result<()> {
-        let (_, user_id) = self.session().await?;
+        let (_, user_id, _) = self.session().await?;
 
         for channel in channels {
             if channel.kind != shared::domain::ChannelKind::Text {
@@ -2822,9 +2872,8 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
         Ok(())
     }
 
-
     async fn reconcile_mls_state_for_guild(&self, guild_id: GuildId) -> Result<()> {
-        let (server_url, user_id) = self.session().await?;
+        let (server_url, user_id, _device_id) = self.session().await?;
         let channels: Vec<ChannelSummary> = self
             .http
             .get(format!("{server_url}/guilds/{}/channels", guild_id.0))
@@ -2872,6 +2921,7 @@ impl<C: CryptoProvider + 'static> ClientHandle for Arc<RealtimeClient<C>> {
             let mut guard = self.inner.lock().await;
             guard.server_url = Some(server_url.to_string());
             guard.user_id = Some(body.user_id);
+            guard.device_id = None;
             guard.selected_guild = None;
             guard.selected_channel = None;
             guard.ws_started = false;
@@ -2886,7 +2936,7 @@ impl<C: CryptoProvider + 'static> ClientHandle for Arc<RealtimeClient<C>> {
             guard.processed_inbound_message_order.clear();
             guard.inflight_bootstraps.clear();
             guard.inflight_inbound_message_ids.clear();
-            
+
             zeroize_voice_session_cache(&mut guard);
         }
 
@@ -2894,6 +2944,7 @@ impl<C: CryptoProvider + 'static> ClientHandle for Arc<RealtimeClient<C>> {
             let mut guard = self.inner.lock().await;
             guard.server_url = None;
             guard.user_id = None;
+            guard.device_id = None;
             guard.ws_started = false;
             guard.selected_guild = None;
             guard.selected_channel = None;
@@ -2917,6 +2968,25 @@ impl<C: CryptoProvider + 'static> ClientHandle for Arc<RealtimeClient<C>> {
             guard.ws_started = true;
         }
 
+        let registered_device: RegisteredDeviceResponse = self
+            .http
+            .post(format!("{server_url}/devices/register"))
+            .query(&[("user_id", body.user_id)])
+            .json(&RegisterDeviceRequest {
+                device_name: "desktop".to_string(),
+                device_public_identity: format!("user:{}", body.user_id),
+            })
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+
+        {
+            let mut guard = self.inner.lock().await;
+            guard.device_id = Some(registered_device.device_id);
+        }
+
         let guilds: Vec<GuildSummary> = self
             .http
             .get(format!("{server_url}/guilds"))
@@ -2935,7 +3005,7 @@ impl<C: CryptoProvider + 'static> ClientHandle for Arc<RealtimeClient<C>> {
     }
 
     async fn list_guilds(&self) -> Result<()> {
-        let (server_url, user_id) = self.session().await?;
+        let (server_url, user_id, _device_id) = self.session().await?;
         let guilds: Vec<GuildSummary> = self
             .http
             .get(format!("{server_url}/guilds"))
@@ -2955,7 +3025,7 @@ impl<C: CryptoProvider + 'static> ClientHandle for Arc<RealtimeClient<C>> {
     }
 
     async fn list_channels(&self, guild_id: GuildId) -> Result<()> {
-        let (server_url, user_id) = self.session().await?;
+        let (server_url, user_id, _device_id) = self.session().await?;
         {
             let mut guard = self.inner.lock().await;
             guard.selected_guild = Some(guild_id);
@@ -3026,7 +3096,7 @@ impl<C: CryptoProvider + 'static> ClientHandle for Arc<RealtimeClient<C>> {
         }
         .ok_or_else(|| anyhow!("no guild selected"))?;
 
-        let (_, current_user_id) = self.session().await?;
+        let (_, current_user_id, _) = self.session().await?;
         let _ = self
             .maybe_bootstrap_existing_members_if_leader(guild_id, channel_id, current_user_id, None)
             .await?;
@@ -3111,7 +3181,7 @@ impl<C: CryptoProvider + 'static> ClientHandle for Arc<RealtimeClient<C>> {
     }
 
     async fn download_file(&self, file_id: FileId) -> Result<Vec<u8>> {
-        let (server_url, user_id) = self.session().await?;
+        let (server_url, user_id, _device_id) = self.session().await?;
         let bytes = self
             .http
             .get(format!("{server_url}/files/{}", file_id.0))
@@ -3125,7 +3195,7 @@ impl<C: CryptoProvider + 'static> ClientHandle for Arc<RealtimeClient<C>> {
     }
 
     async fn create_invite(&self, guild_id: GuildId) -> Result<String> {
-        let (server_url, user_id) = self.session().await?;
+        let (server_url, user_id, _device_id) = self.session().await?;
         let response: InviteResponse = self
             .http
             .post(format!("{server_url}/guilds/{}/invites", guild_id.0))
@@ -3139,7 +3209,7 @@ impl<C: CryptoProvider + 'static> ClientHandle for Arc<RealtimeClient<C>> {
     }
 
     async fn join_with_invite(&self, invite_code: &str) -> Result<()> {
-        let (server_url, user_id) = self.session().await?;
+        let (server_url, user_id, _device_id) = self.session().await?;
         self.http
             .post(format!("{server_url}/guilds/join"))
             .json(&JoinGuildRequest {

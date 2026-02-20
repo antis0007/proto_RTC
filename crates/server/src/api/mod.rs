@@ -3,7 +3,7 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use shared::{
-    domain::{ChannelId, ChannelKind, GuildId, Role, UserId},
+    domain::{ChannelId, ChannelKind, DeviceId, GuildId, Role, UserId},
     error::{ApiError, ErrorCode},
     protocol::{
         AttachmentPayload, ChannelSummary, GuildSummary, MemberSummary, MessagePayload, ServerEvent,
@@ -21,6 +21,12 @@ pub struct ApiContext {
 pub struct MlsKeyPackageQuery {
     pub guild_id: i64,
     pub user_id: i64,
+    #[serde(default)]
+    pub device_id: Option<i64>,
+    #[serde(default)]
+    pub target_user_id: Option<i64>,
+    #[serde(default)]
+    pub target_device_id: Option<i64>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -28,6 +34,12 @@ pub struct MlsWelcomeQuery {
     pub user_id: i64,
     pub guild_id: i64,
     pub channel_id: i64,
+    #[serde(default)]
+    pub device_id: Option<i64>,
+    #[serde(default)]
+    pub target_user_id: Option<i64>,
+    #[serde(default)]
+    pub target_device_id: Option<i64>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -40,6 +52,7 @@ pub struct KeyPackageResponse {
     pub key_package_id: i64,
     pub guild_id: i64,
     pub user_id: i64,
+    pub device_id: Option<DeviceId>,
     pub key_package_b64: String,
 }
 
@@ -48,6 +61,7 @@ pub struct MlsWelcomeResponse {
     pub user_id: i64,
     pub guild_id: i64,
     pub channel_id: i64,
+    pub target_device_id: Option<DeviceId>,
     pub welcome_b64: String,
     pub consumed_at: Option<DateTime<Utc>>,
 }
