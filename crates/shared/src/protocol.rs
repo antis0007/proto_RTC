@@ -152,6 +152,11 @@ pub enum ServerEvent {
         guild_id: GuildId,
         channel_id: ChannelId,
     },
+    MlsBootstrapRequested {
+        guild_id: GuildId,
+        channel_id: ChannelId,
+        requesting_user_id: UserId,
+    },
     FileStored {
         file_id: FileId,
     },

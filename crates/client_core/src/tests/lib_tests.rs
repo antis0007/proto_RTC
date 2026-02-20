@@ -131,7 +131,12 @@ impl MlsSessionManager for TestMlsSessionManager {
         })
     }
 
-    async fn join_from_welcome(&self, _channel_id: ChannelId, welcome_bytes: &[u8]) -> Result<()> {
+    async fn join_from_welcome(
+        &self,
+        _guild_id: GuildId,
+        _channel_id: ChannelId,
+        welcome_bytes: &[u8],
+    ) -> Result<()> {
         if let Some(err) = &self.fail_with {
             return Err(anyhow!(err.clone()));
         }

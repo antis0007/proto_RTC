@@ -14,6 +14,7 @@ mod media;
 mod ui;
 
 use arboard::{Clipboard, ImageData};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use client_core::{
     AttachmentUpload, ClientEvent, ClientHandle, DurableMlsSessionManager, PassthroughCrypto,
     RealtimeClient, VoiceConnectOptions, VoiceParticipantState, VoiceSessionSnapshot,
@@ -78,6 +79,7 @@ enum UiEvent {
     LoginOk,
     Info(String),
     InviteCreated(String),
+    JoinedGuild(GuildId),
     SenderDirectoryUpdated {
         user_id: i64,
         username: String,
@@ -723,6 +725,21 @@ impl DesktopGuiApp {
                     self.status =
                         "Invite created, copied to clipboard, and inserted into the Invite field"
                             .to_string();
+                }
+                UiEvent::JoinedGuild(guild_id) => {
+                    self.selected_guild = Some(guild_id);
+                    self.selected_channel = None;
+                    self.channels.clear();
+                    queue_command(
+                        &self.cmd_tx,
+                        BackendCommand::ListChannels { guild_id },
+                        &mut self.status,
+                    );
+                    queue_command(
+                        &self.cmd_tx,
+                        BackendCommand::ListMembers { guild_id },
+                        &mut self.status,
+                    );
                 }
                 UiEvent::SenderDirectoryUpdated { user_id, username } => {
                     self.sender_directory.insert(user_id, username);
@@ -2269,7 +2286,11 @@ impl DesktopGuiApp {
                     });
                 });
 
-                ui.label(&self.status);
+                let status_row_height = 18.0;
+                ui.add_sized(
+                    [ui.available_width(), status_row_height],
+                    egui::Label::new(egui::RichText::new(&self.status).small()),
+                );
                 self.show_status_banner(ui);
             });
     }
@@ -3117,6 +3138,13 @@ async fn fetch_user_id_for_login(server_url: &str, username: &str) -> Result<i64
     Ok(body.user_id)
 }
 
+fn guild_id_from_invite(invite_code: &str) -> Option<GuildId> {
+    let decoded = URL_SAFE_NO_PAD.decode(invite_code.as_bytes()).ok()?;
+    let decoded_text = String::from_utf8(decoded).ok()?;
+    let guild_id = decoded_text.strip_prefix("guild:")?.parse::<i64>().ok()?;
+    Some(GuildId(guild_id))
+}
+
 async fn build_user_scoped_mls_client(
     base_dir: &std::path::Path,
     user_id: i64,
@@ -3286,7 +3314,9 @@ fn spawn_backend_thread(cmd_rx: Receiver<BackendCommand>, ui_tx: Sender<UiEvent>
                         }
                     }
                     BackendCommand::ListGuilds => {
+                        tracing::info!("backend: list_guilds");
                         if let Err(err) = client.list_guilds().await {
+                            tracing::error!("backend: list_guilds failed: {err}");
                             let _ = ui_tx.try_send(UiEvent::Error(UiError::from_message(
                                 UiErrorContext::General,
                                 err.to_string(),
@@ -3294,7 +3324,9 @@ fn spawn_backend_thread(cmd_rx: Receiver<BackendCommand>, ui_tx: Sender<UiEvent>
                         }
                     }
                     BackendCommand::ListChannels { guild_id } => {
+                        tracing::info!(guild_id = guild_id.0, "backend: list_channels");
                         if let Err(err) = client.list_channels(guild_id).await {
+                            tracing::error!(guild_id = guild_id.0, "backend: list_channels failed: {err}");
                             let _ = ui_tx.try_send(UiEvent::Error(UiError::from_message(
                                 UiErrorContext::General,
                                 err.to_string(),
@@ -3302,7 +3334,9 @@ fn spawn_backend_thread(cmd_rx: Receiver<BackendCommand>, ui_tx: Sender<UiEvent>
                         }
                     }
                     BackendCommand::ListMembers { guild_id } => {
+                        tracing::info!(guild_id = guild_id.0, "backend: list_members");
                         if let Err(err) = client.list_members(guild_id).await {
+                            tracing::error!(guild_id = guild_id.0, "backend: list_members failed: {err}");
                             let _ = ui_tx.try_send(UiEvent::Error(UiError::from_message(
                                 UiErrorContext::General,
                                 err.to_string(),
@@ -3310,7 +3344,9 @@ fn spawn_backend_thread(cmd_rx: Receiver<BackendCommand>, ui_tx: Sender<UiEvent>
                         }
                     }
                     BackendCommand::SelectChannel { channel_id } => {
+                        tracing::info!(channel_id = channel_id.0, "backend: select_channel");
                         if let Err(err) = client.select_channel(channel_id).await {
+                            tracing::error!(channel_id = channel_id.0, "backend: select_channel failed: {err}");
                             let _ = ui_tx.try_send(UiEvent::Error(UiError::from_message(
                                 UiErrorContext::General,
                                 err.to_string(),
@@ -3330,6 +3366,11 @@ fn spawn_backend_thread(cmd_rx: Receiver<BackendCommand>, ui_tx: Sender<UiEvent>
                         text,
                         attachment_path,
                     } => {
+                        tracing::info!(
+                            has_attachment = attachment_path.is_some(),
+                            text_len = text.len(),
+                            "backend: send_message"
+                        );
                         let result = if let Some(path) = attachment_path {
                             let filename = path
                                 .file_name()
@@ -3359,6 +3400,7 @@ fn spawn_backend_thread(cmd_rx: Receiver<BackendCommand>, ui_tx: Sender<UiEvent>
                         };
 
                         if let Err(err) = result {
+                            tracing::error!("backend: send_message failed: {err}");
                             let _ = ui_tx.try_send(UiEvent::Error(UiError::from_message(
                                 UiErrorContext::SendMessage,
                                 err.to_string(),
@@ -3443,8 +3485,13 @@ fn spawn_backend_thread(cmd_rx: Receiver<BackendCommand>, ui_tx: Sender<UiEvent>
                         }
                     }
                     BackendCommand::JoinWithInvite { invite_code } => {
+                        tracing::info!("backend: join_with_invite");
                         match client.join_with_invite(&invite_code).await {
                             Ok(()) => {
+                                tracing::info!("backend: join_with_invite succeeded");
+                                if let Some(guild_id) = guild_id_from_invite(&invite_code) {
+                                    let _ = ui_tx.try_send(UiEvent::JoinedGuild(guild_id));
+                                }
                                 let _ = ui_tx.try_send(UiEvent::Info(
                                     "Joined guild from invite".to_string(),
                                 ));
@@ -3456,6 +3503,7 @@ fn spawn_backend_thread(cmd_rx: Receiver<BackendCommand>, ui_tx: Sender<UiEvent>
                                 }
                             }
                             Err(err) => {
+                                tracing::error!("backend: join_with_invite failed: {err}");
                                 let _ = ui_tx.try_send(UiEvent::Error(UiError::from_message(
                                     UiErrorContext::General,
                                     err.to_string(),

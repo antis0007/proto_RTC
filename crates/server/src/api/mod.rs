@@ -49,7 +49,7 @@ pub struct MlsWelcomeResponse {
     pub guild_id: i64,
     pub channel_id: i64,
     pub welcome_b64: String,
-    pub consumed_at: DateTime<Utc>,
+    pub consumed_at: Option<DateTime<Utc>>,
 }
 
 pub fn mls_key_packages_route() -> &'static str {
@@ -58,6 +58,10 @@ pub fn mls_key_packages_route() -> &'static str {
 
 pub fn mls_welcome_route() -> &'static str {
     "/mls/welcome"
+}
+
+pub fn mls_bootstrap_request_route() -> &'static str {
+    "/mls/bootstrap/request"
 }
 
 pub async fn list_guilds(ctx: &ApiContext, user_id: UserId) -> Result<Vec<GuildSummary>, ApiError> {

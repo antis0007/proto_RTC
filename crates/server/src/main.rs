@@ -2,9 +2,9 @@ use std::{net::SocketAddr, sync::Arc};
 
 use crate::api::{
     ensure_active_membership_in_channel, ensure_active_membership_in_guild, list_channels,
-    list_guilds, list_members, list_messages, mls_key_packages_route, mls_welcome_route,
-    request_livekit_token, send_message, ApiContext, KeyPackageResponse, MlsKeyPackageQuery,
-    MlsWelcomeQuery, MlsWelcomeResponse, UploadKeyPackageResponse,
+    list_guilds, list_members, list_messages, mls_bootstrap_request_route, mls_key_packages_route,
+    mls_welcome_route, request_livekit_token, send_message, ApiContext, KeyPackageResponse,
+    MlsKeyPackageQuery, MlsWelcomeQuery, MlsWelcomeResponse, UploadKeyPackageResponse,
 };
 use crate::livekit::LiveKitConfig;
 use axum::{
@@ -121,6 +121,13 @@ struct StorePendingWelcomeQuery {
     target_user_id: i64,
 }
 
+#[derive(Debug, Deserialize)]
+struct MlsBootstrapRequestQuery {
+    user_id: i64,
+    guild_id: i64,
+    channel_id: i64,
+}
+
 const MAX_ATTACHMENT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_FILENAME_BYTES: usize = 180;
 
@@ -221,6 +228,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route(mls_key_packages_route(), get(fetch_key_package))
         .route(mls_welcome_route(), post(store_pending_welcome))
         .route(mls_welcome_route(), get(fetch_pending_welcome))
+        .route(mls_bootstrap_request_route(), post(request_mls_bootstrap))
         .route("/ws", get(ws_handler))
         .with_state(state)
 }
@@ -323,6 +331,7 @@ async fn upload_file(
             )),
         ));
     }
+
     if body.len() > MAX_ATTACHMENT_BYTES {
         return Err((
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -482,10 +491,18 @@ async fn upload_key_package(
         .await
         .map_err(|error| (api_error_status(&error), Json(error)))?;
 
+    let guild_id = GuildId(q.guild_id);
+    let user_id = UserId(q.user_id);
+    info!(
+        guild_id = guild_id.0,
+        user_id = user_id.0,
+        key_package_size = body.len(),
+        "mls: upload key package request"
+    );
     let key_package_id = state
         .api
         .storage
-        .insert_key_package(GuildId(q.guild_id), UserId(q.user_id), &body)
+        .insert_key_package(guild_id, user_id, &body)
         .await
         .map_err(|e| {
             (
@@ -493,6 +510,19 @@ async fn upload_key_package(
                 Json(ApiError::new(ErrorCode::Internal, e.to_string())),
             )
         })?;
+
+    if let Ok(members) = list_members(&state.api, user_id, guild_id).await {
+        let _ = state
+            .events
+            .send(ServerEvent::GuildMembersUpdated { guild_id, members });
+    }
+
+    info!(
+        guild_id = guild_id.0,
+        user_id = user_id.0,
+        key_package_id,
+        "mls: key package stored"
+    );
 
     Ok(Json(UploadKeyPackageResponse { key_package_id }))
 }
@@ -535,6 +565,12 @@ async fn fetch_pending_welcome(
     State(state): State<Arc<AppState>>,
     Query(q): Query<MlsWelcomeQuery>,
 ) -> Result<Json<MlsWelcomeResponse>, (StatusCode, Json<ApiError>)> {
+    info!(
+        guild_id = q.guild_id,
+        channel_id = q.channel_id,
+        user_id = q.user_id,
+        "mls: fetch pending welcome request"
+    );
     ensure_active_membership_in_channel(
         &state.api,
         UserId(q.user_id),
@@ -544,10 +580,10 @@ async fn fetch_pending_welcome(
     .await
     .map_err(|error| (api_error_status(&error), Json(error)))?;
 
-    let consumed_welcome = state
+    let pending_welcome = state
         .api
         .storage
-        .load_and_consume_pending_welcome(
+        .load_pending_welcome(
             GuildId(q.guild_id),
             ChannelId(q.channel_id),
             UserId(q.user_id),
@@ -573,8 +609,8 @@ async fn fetch_pending_welcome(
         user_id: q.user_id,
         guild_id: q.guild_id,
         channel_id: q.channel_id,
-        welcome_b64: STANDARD.encode(consumed_welcome.welcome_bytes),
-        consumed_at: consumed_welcome.consumed_at,
+        welcome_b64: STANDARD.encode(pending_welcome.welcome_bytes),
+        consumed_at: None,
     }))
 }
 
@@ -628,6 +664,47 @@ async fn store_pending_welcome(
             )
         })?;
 
+    let _ = state.events.send(ServerEvent::MlsWelcomeAvailable {
+        guild_id: GuildId(q.guild_id),
+        channel_id: ChannelId(q.channel_id),
+    });
+
+    info!(
+        guild_id = q.guild_id,
+        channel_id = q.channel_id,
+        target_user_id = q.target_user_id,
+        "mls: pending welcome stored and broadcast"
+    );
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn request_mls_bootstrap(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<MlsBootstrapRequestQuery>,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    ensure_active_membership_in_channel(
+        &state.api,
+        UserId(q.user_id),
+        GuildId(q.guild_id),
+        ChannelId(q.channel_id),
+    )
+    .await
+    .map_err(|error| (api_error_status(&error), Json(error)))?;
+
+    let _ = state.events.send(ServerEvent::MlsBootstrapRequested {
+        guild_id: GuildId(q.guild_id),
+        channel_id: ChannelId(q.channel_id),
+        requesting_user_id: UserId(q.user_id),
+    });
+
+    info!(
+        guild_id = q.guild_id,
+        channel_id = q.channel_id,
+        requesting_user_id = q.user_id,
+        "mls: bootstrap requested"
+    );
+
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -642,7 +719,7 @@ async fn ws_handler(
 async fn ws_connection(
     state: Arc<AppState>,
     socket: axum::extract::ws::WebSocket,
-    _user_id: UserId,
+    user_id: UserId,
 ) {
     use axum::extract::ws::Message;
     use futures::{SinkExt, StreamExt};
@@ -650,8 +727,17 @@ async fn ws_connection(
     let (mut sender, mut receiver) = socket.split();
     let mut events_rx = state.events.subscribe();
 
+    let send_state = Arc::clone(&state);
     let send_task = tokio::spawn(async move {
-        while let Ok(event) = events_rx.recv().await {
+        loop {
+            let event = match events_rx.recv().await {
+                Ok(event) => event,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            };
+            if !is_event_visible_to_user(&send_state, user_id, &event).await {
+                continue;
+            }
             let text = match serde_json::to_string(&event) {
                 Ok(v) => v,
                 Err(_) => continue,
@@ -665,6 +751,53 @@ async fn ws_connection(
     while let Some(Ok(_msg)) = receiver.next().await {}
 
     send_task.abort();
+}
+
+async fn is_event_visible_to_user(
+    state: &Arc<AppState>,
+    user_id: UserId,
+    event: &ServerEvent,
+) -> bool {
+    let is_member = |guild_id: GuildId| async move {
+        matches!(
+            state.api.storage.membership_status(guild_id, user_id).await,
+            Ok(Some((_role, banned, _muted))) if !banned
+        )
+    };
+
+    match event {
+        ServerEvent::GuildUpdated { guild } => is_member(guild.guild_id).await,
+        ServerEvent::ChannelUpdated { channel } => is_member(channel.guild_id).await,
+        ServerEvent::GuildMembersUpdated { guild_id, .. } => is_member(*guild_id).await,
+        ServerEvent::MessageReceived { message } => {
+            let guild_id = match state
+                .api
+                .storage
+                .guild_for_channel(message.channel_id)
+                .await
+            {
+                Ok(Some(guild_id)) => guild_id,
+                _ => return false,
+            };
+            is_member(guild_id).await
+        }
+        ServerEvent::UserKicked {
+            guild_id,
+            target_user_id,
+        }
+        | ServerEvent::UserBanned {
+            guild_id,
+            target_user_id,
+        }
+        | ServerEvent::UserMuted {
+            guild_id,
+            target_user_id,
+        } => *target_user_id == user_id || is_member(*guild_id).await,
+        ServerEvent::LiveKitTokenIssued { guild_id, .. }
+        | ServerEvent::MlsWelcomeAvailable { guild_id, .. }
+        | ServerEvent::MlsBootstrapRequested { guild_id, .. } => is_member(*guild_id).await,
+        ServerEvent::FileStored { .. } | ServerEvent::Error(_) => true,
+    }
 }
 
 async fn http_list_guilds(
@@ -778,6 +911,11 @@ async fn http_join_guild(
         })?;
 
     let joining_user_id = UserId(req.user_id);
+    info!(
+        guild_id = guild_id.0,
+        user_id = joining_user_id.0,
+        "guild: join with invite"
+    );
     state
         .api
         .storage

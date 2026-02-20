@@ -47,6 +47,17 @@ const LIVEKIT_E2EE_INFO_PREFIX: &[u8] = b"proto-rtc/livekit-e2ee/v1";
 const LIVEKIT_E2EE_APP_SALT: &[u8] = b"proto-rtc/livekit-e2ee-app-salt";
 const WELCOME_SYNC_RETRY_ATTEMPTS: usize = 12;
 const WELCOME_SYNC_RETRY_DELAY: Duration = Duration::from_millis(500);
+const BOOTSTRAP_REQUEST_MIN_INTERVAL: Duration = Duration::from_secs(3);
+
+fn is_duplicate_member_add_error(err: &anyhow::Error) -> bool {
+    err.to_string()
+        .to_ascii_lowercase()
+        .contains("duplicate signature key")
+}
+
+fn is_wrong_epoch_error(err: &anyhow::Error) -> bool {
+    err.to_string().to_ascii_lowercase().contains("wrong epoch")
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct VoiceConnectionKey {
@@ -103,7 +114,12 @@ pub trait MlsSessionManager: Send + Sync {
         channel_id: ChannelId,
         key_package_bytes: &[u8],
     ) -> Result<MlsAddMemberOutcome>;
-    async fn join_from_welcome(&self, channel_id: ChannelId, welcome_bytes: &[u8]) -> Result<()>;
+    async fn join_from_welcome(
+        &self,
+        guild_id: GuildId,
+        channel_id: ChannelId,
+        welcome_bytes: &[u8],
+    ) -> Result<()>;
     async fn export_secret(
         &self,
         channel_id: ChannelId,
@@ -179,7 +195,12 @@ impl MlsSessionManager for MissingMlsSessionManager {
         ))
     }
 
-    async fn join_from_welcome(&self, channel_id: ChannelId, _welcome_bytes: &[u8]) -> Result<()> {
+    async fn join_from_welcome(
+        &self,
+        _guild_id: GuildId,
+        channel_id: ChannelId,
+        _welcome_bytes: &[u8],
+    ) -> Result<()> {
         Err(anyhow!(
             "no active MLS group available for channel {}",
             channel_id.0
@@ -473,6 +494,8 @@ struct RealtimeClientState {
     sender_directory: HashMap<i64, String>,
     attempted_channel_member_additions: HashSet<(GuildId, ChannelId, i64)>,
     initialized_mls_channels: HashSet<(GuildId, ChannelId)>,
+    inflight_welcome_syncs: HashSet<(GuildId, ChannelId)>,
+    bootstrap_request_last_sent: HashMap<(GuildId, ChannelId), Instant>,
     pending_outbound_plaintexts: HashMap<String, String>,
     voice_session_keys: HashMap<VoiceConnectionKey, CachedVoiceSessionKey>,
 }
@@ -540,6 +563,8 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
                 sender_directory: HashMap::new(),
                 attempted_channel_member_additions: HashSet::new(),
                 initialized_mls_channels: HashSet::new(),
+                inflight_welcome_syncs: HashSet::new(),
+                bootstrap_request_last_sent: HashMap::new(),
                 pending_outbound_plaintexts: HashMap::new(),
                 voice_session_keys: HashMap::new(),
             }),
@@ -846,6 +871,87 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
                                 if let Err(err) = client.emit_decrypted_message(message).await {
                                     let _ = client.events.send(ClientEvent::Error(err.to_string()));
                                 }
+                            } else if let ServerEvent::GuildMembersUpdated { guild_id, members } =
+                                &event
+                            {
+                                let _ = client.events.send(ClientEvent::Server(
+                                    ServerEvent::GuildMembersUpdated {
+                                        guild_id: *guild_id,
+                                        members: members.clone(),
+                                    },
+                                ));
+                                let guild_id = *guild_id;
+                                let client_clone = Arc::clone(&client);
+                                tokio::spawn(async move {
+                                    if let Err(err) =
+                                        client_clone.reconcile_mls_state_for_guild(guild_id).await
+                                    {
+                                        let _ = client_clone.events.send(ClientEvent::Error(format!(
+                                            "failed to reconcile MLS state for guild {} after membership update: {err}",
+                                            guild_id.0
+                                        )));
+                                    }
+                                });
+                            } else if let ServerEvent::MlsWelcomeAvailable {
+                                guild_id,
+                                channel_id,
+                            } = event
+                            {
+                                {
+                                    let mut guard = client.inner.lock().await;
+                                    guard.channel_guilds.insert(channel_id, guild_id);
+                                }
+                                let client_clone = Arc::clone(&client);
+                                tokio::spawn(async move {
+                                    if let Err(err) = client_clone
+                                        .maybe_join_from_pending_welcome_with_retry(
+                                            guild_id, channel_id,
+                                        )
+                                        .await
+                                    {
+                                        let _ = client_clone.events.send(ClientEvent::Error(
+                                            format!(
+                                                "failed MLS welcome sync for guild {} channel {}: {err}",
+                                                guild_id.0, channel_id.0
+                                            ),
+                                        ));
+                                    }
+                                });
+                            } else if let ServerEvent::MlsBootstrapRequested {
+                                guild_id,
+                                channel_id,
+                                requesting_user_id,
+                            } = event
+                            {
+                                let client_clone = Arc::clone(&client);
+                                tokio::spawn(async move {
+                                    let Ok((_, current_user_id)) = client_clone.session().await
+                                    else {
+                                        return;
+                                    };
+                                    info!(
+                                        guild_id = guild_id.0,
+                                        channel_id = channel_id.0,
+                                        requesting_user_id = requesting_user_id.0,
+                                        current_user_id,
+                                        "mls: received bootstrap request event"
+                                    );
+                                    if requesting_user_id.0 == current_user_id {
+                                        info!(
+                                            guild_id = guild_id.0,
+                                            channel_id = channel_id.0,
+                                            "mls: ignoring self-originated bootstrap request event"
+                                        );
+                                        return;
+                                    }
+                                    let _ = client_clone
+                                        .maybe_bootstrap_existing_members_if_moderator(
+                                            guild_id,
+                                            channel_id,
+                                            current_user_id,
+                                        )
+                                        .await;
+                                });
                             } else {
                                 let _ = client.events.send(ClientEvent::Server(event));
                             }
@@ -973,6 +1079,13 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
         welcome_bytes: &[u8],
     ) -> Result<()> {
         let (server_url, current_user_id) = self.session().await?;
+        info!(
+            guild_id = guild_id.0,
+            channel_id = channel_id.0,
+            target_user_id,
+            actor_user_id = current_user_id,
+            "mls: storing pending welcome"
+        );
         self.http
             .post(format!("{server_url}/mls/welcome"))
             .query(&[
@@ -985,6 +1098,53 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
             .send()
             .await?
             .error_for_status()?;
+        info!(
+            guild_id = guild_id.0,
+            channel_id = channel_id.0,
+            target_user_id,
+            "mls: pending welcome stored"
+        );
+        Ok(())
+    }
+
+    async fn request_mls_bootstrap(&self, guild_id: GuildId, channel_id: ChannelId) -> Result<()> {
+        {
+            let mut guard = self.inner.lock().await;
+            if let Some(last_sent_at) = guard
+                .bootstrap_request_last_sent
+                .get(&(guild_id, channel_id))
+                .copied()
+            {
+                if last_sent_at.elapsed() < BOOTSTRAP_REQUEST_MIN_INTERVAL {
+                    info!(
+                        guild_id = guild_id.0,
+                        channel_id = channel_id.0,
+                        "mls: bootstrap request suppressed due to rate limit"
+                    );
+                    return Ok(());
+                }
+            }
+            guard
+                .bootstrap_request_last_sent
+                .insert((guild_id, channel_id), Instant::now());
+        }
+        let (server_url, user_id) = self.session().await?;
+        self.http
+            .post(format!("{server_url}/mls/bootstrap/request"))
+            .query(&[
+                ("user_id", user_id),
+                ("guild_id", guild_id.0),
+                ("channel_id", channel_id.0),
+            ])
+            .send()
+            .await?
+            .error_for_status()?;
+        info!(
+            guild_id = guild_id.0,
+            channel_id = channel_id.0,
+            requester_user_id = user_id,
+            "mls: bootstrap request posted"
+        );
         Ok(())
     }
 
@@ -1006,6 +1166,11 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
             .await?;
 
         if response.status() == reqwest::StatusCode::NOT_FOUND {
+            info!(
+                guild_id = guild_id.0,
+                channel_id = channel_id.0,
+                "mls: pending welcome not found"
+            );
             return Ok(false);
         }
 
@@ -1018,13 +1183,18 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
             .open_or_create_group(guild_id, channel_id)
             .await?;
         self.mls_session_manager
-            .join_from_welcome(channel_id, &welcome_bytes)
+            .join_from_welcome(guild_id, channel_id, &welcome_bytes)
             .await?;
         self.inner
             .lock()
             .await
             .initialized_mls_channels
             .insert((guild_id, channel_id));
+        info!(
+            guild_id = guild_id.0,
+            channel_id = channel_id.0,
+            "mls: welcome consumed and channel initialized"
+        );
         Ok(true)
     }
 
@@ -1033,20 +1203,66 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
         guild_id: GuildId,
         channel_id: ChannelId,
     ) -> Result<bool> {
-        for attempt in 0..WELCOME_SYNC_RETRY_ATTEMPTS {
-            if self
-                .maybe_join_from_pending_welcome(guild_id, channel_id)
-                .await?
+        {
+            let mut guard = self.inner.lock().await;
+            if guard
+                .inflight_welcome_syncs
+                .contains(&(guild_id, channel_id))
             {
-                return Ok(true);
+                info!(
+                    guild_id = guild_id.0,
+                    channel_id = channel_id.0,
+                    "mls: welcome sync already in progress; skipping duplicate trigger"
+                );
+                return Ok(false);
             }
-
-            if attempt + 1 < WELCOME_SYNC_RETRY_ATTEMPTS {
-                tokio::time::sleep(WELCOME_SYNC_RETRY_DELAY).await;
-            }
+            guard.inflight_welcome_syncs.insert((guild_id, channel_id));
         }
 
-        Ok(false)
+        let result = async {
+            let mut synced = false;
+            for attempt in 0..WELCOME_SYNC_RETRY_ATTEMPTS {
+                info!(
+                    guild_id = guild_id.0,
+                    channel_id = channel_id.0,
+                    attempt = attempt + 1,
+                    max_attempts = WELCOME_SYNC_RETRY_ATTEMPTS,
+                    "mls: welcome sync attempt"
+                );
+                if self
+                    .maybe_join_from_pending_welcome(guild_id, channel_id)
+                    .await?
+                {
+                    info!(
+                        guild_id = guild_id.0,
+                        channel_id = channel_id.0,
+                        attempt = attempt + 1,
+                        "mls: welcome sync succeeded"
+                    );
+                    synced = true;
+                    break;
+                }
+
+                if attempt + 1 < WELCOME_SYNC_RETRY_ATTEMPTS {
+                    tokio::time::sleep(WELCOME_SYNC_RETRY_DELAY).await;
+                }
+            }
+
+            if !synced {
+                let _ = self.request_mls_bootstrap(guild_id, channel_id).await;
+            }
+
+            Ok(synced)
+        }
+        .await;
+
+        self.inner
+            .lock()
+            .await
+            .inflight_welcome_syncs
+            .remove(&(guild_id, channel_id));
+
+        result
     }
 
     async fn fetch_members_for_guild(&self, guild_id: GuildId) -> Result<Vec<MemberSummary>> {
@@ -1098,7 +1314,15 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
 
             let key_package_bytes = match self.fetch_key_package(member.user_id.0, guild_id).await {
                 Ok(bytes) => bytes,
-                Err(_) => continue,
+                Err(err) => {
+                    warn!(
+                        guild_id = guild_id.0,
+                        channel_id = channel_id.0,
+                        target_user_id = member.user_id.0,
+                        "mls: key package fetch failed during bootstrap: {err}"
+                    );
+                    continue;
+                }
             };
             let add_member_outcome = match self
                 .mls_session_manager
@@ -1106,8 +1330,36 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
                 .await
             {
                 Ok(outcome) => outcome,
-                Err(_) => continue,
+                Err(err) => {
+                    if is_duplicate_member_add_error(&err) {
+                        info!(
+                            guild_id = guild_id.0,
+                            channel_id = channel_id.0,
+                            target_user_id = member.user_id.0,
+                            "mls: add_member skipped because target already appears in group"
+                        );
+                        self.inner
+                            .lock()
+                            .await
+                            .attempted_channel_member_additions
+                            .insert((guild_id, channel_id, member.user_id.0));
+                        continue;
+                    }
+                    warn!(
+                        guild_id = guild_id.0,
+                        channel_id = channel_id.0,
+                        target_user_id = member.user_id.0,
+                        "mls: add_member failed during bootstrap: {err}"
+                    );
+                    continue;
+                }
             };
+            info!(
+                guild_id = guild_id.0,
+                channel_id = channel_id.0,
+                target_user_id = member.user_id.0,
+                "mls: add_member produced commit+welcome"
+            );
 
             let commit_bytes_b64 = STANDARD.encode(&add_member_outcome.commit_bytes);
             if let Err(err) = self
@@ -1263,10 +1515,31 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
                 )
             })?;
 
-        let plaintext_bytes = self
+        let plaintext_bytes = match self
             .mls_session_manager
             .decrypt_application(message.channel_id, &ciphertext)
-            .await?;
+            .await
+        {
+            Ok(bytes) => bytes,
+            Err(err) if is_wrong_epoch_error(&err) => {
+                warn!(
+                    guild_id = guild_id.0,
+                    channel_id = message.channel_id.0,
+                    message_id = message.message_id.0,
+                    "mls: wrong epoch while decrypting; dropping local initialization and retrying welcome sync"
+                );
+                self.inner
+                    .lock()
+                    .await
+                    .initialized_mls_channels
+                    .remove(&(guild_id, message.channel_id));
+                let _ = self
+                    .maybe_join_from_pending_welcome_with_retry(guild_id, message.channel_id)
+                    .await;
+                return Ok(());
+            }
+            Err(err) => return Err(err),
+        };
 
         if plaintext_bytes.is_empty() {
             return Ok(());
@@ -1303,6 +1576,7 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
             let _ = self
                 .maybe_bootstrap_existing_members_if_moderator(guild_id, channel_id, user_id)
                 .await?;
+            let _ = self.reconcile_mls_state_for_guild(guild_id).await;
 
             if !self
                 .ensure_mls_channel_initialized(guild_id, channel_id)
@@ -1554,6 +1828,31 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
 
         Ok(())
     }
+
+    async fn reconcile_mls_state_for_guild(&self, guild_id: GuildId) -> Result<()> {
+        let (server_url, user_id) = self.session().await?;
+        let channels: Vec<ChannelSummary> = self
+            .http
+            .get(format!("{server_url}/guilds/{}/channels", guild_id.0))
+            .query(&[("user_id", user_id)])
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+
+        {
+            let mut guard = self.inner.lock().await;
+            for channel in &channels {
+                guard
+                    .channel_guilds
+                    .insert(channel.channel_id, channel.guild_id);
+            }
+        }
+
+        self.prewarm_mls_for_guild_channels(guild_id, &channels)
+            .await
+    }
 }
 
 #[async_trait]
@@ -1586,6 +1885,8 @@ impl<C: CryptoProvider + 'static> ClientHandle for Arc<RealtimeClient<C>> {
             guard.sender_directory.clear();
             guard.pending_outbound_plaintexts.clear();
             guard.initialized_mls_channels.clear();
+            guard.inflight_welcome_syncs.clear();
+            guard.bootstrap_request_last_sent.clear();
             guard.attempted_channel_member_additions.clear();
             zeroize_voice_session_cache(&mut guard);
         }
@@ -1601,6 +1902,8 @@ impl<C: CryptoProvider + 'static> ClientHandle for Arc<RealtimeClient<C>> {
             guard.sender_directory.clear();
             guard.pending_outbound_plaintexts.clear();
             guard.initialized_mls_channels.clear();
+            guard.inflight_welcome_syncs.clear();
+            guard.bootstrap_request_last_sent.clear();
             guard.attempted_channel_member_additions.clear();
             zeroize_voice_session_cache(&mut guard);
             return Err(err);
@@ -1721,19 +2024,21 @@ impl<C: CryptoProvider + 'static> ClientHandle for Arc<RealtimeClient<C>> {
         .ok_or_else(|| anyhow!("no guild selected"))?;
 
         let (_, current_user_id) = self.session().await?;
-        let user_is_moderator = self
+        let _ = self
             .maybe_bootstrap_existing_members_if_moderator(guild_id, channel_id, current_user_id)
             .await?;
 
         let initialized = self
             .ensure_mls_channel_initialized(guild_id, channel_id)
             .await?;
-        if !initialized && !user_is_moderator {
-            return Err(anyhow!(
-                "MLS state for guild {} channel {} is uninitialized; wait for a moderator bootstrap or retry after welcome sync",
-                guild_id.0,
-                channel_id.0
-            ));
+        if !initialized {
+            let client = Arc::clone(self);
+            tokio::spawn(async move {
+                let _ = client.reconcile_mls_state_for_guild(guild_id).await;
+                let _ = client
+                    .maybe_join_from_pending_welcome_with_retry(guild_id, channel_id)
+                    .await;
+            });
         }
 
         self.fetch_messages(channel_id, 100, None).await?;
@@ -1805,6 +2110,14 @@ impl<C: CryptoProvider + 'static> ClientHandle for Arc<RealtimeClient<C>> {
 
         if let Some(guild_id) = RealtimeClient::<C>::guild_id_from_invite(invite_code) {
             self.upload_key_package_for_guild(guild_id).await?;
+            let _ = self.reconcile_mls_state_for_guild(guild_id).await;
+            let client = Arc::clone(self);
+            tokio::spawn(async move {
+                for _ in 0..6 {
+                    let _ = client.reconcile_mls_state_for_guild(guild_id).await;
+                    tokio::time::sleep(Duration::from_millis(350)).await;
+                }
+            });
         }
 
         Ok(())

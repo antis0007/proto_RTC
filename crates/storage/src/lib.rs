@@ -49,6 +49,11 @@ pub struct StoredFile {
 }
 
 #[derive(Debug, Clone)]
+pub struct PendingWelcome {
+    pub welcome_bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
 pub struct ConsumedPendingWelcome {
     pub welcome_bytes: Vec<u8>,
     pub consumed_at: DateTime<Utc>,
@@ -437,6 +442,30 @@ impl Storage {
         .await?;
 
         Ok(rec.get::<i64, _>(0))
+    }
+
+    pub async fn load_pending_welcome(
+        &self,
+        guild_id: GuildId,
+        channel_id: ChannelId,
+        user_id: UserId,
+    ) -> Result<Option<PendingWelcome>> {
+        let row = sqlx::query(
+            "SELECT welcome_bytes
+             FROM pending_welcomes
+             WHERE guild_id = ? AND channel_id = ? AND user_id = ? AND consumed_at IS NULL
+             ORDER BY id DESC
+             LIMIT 1",
+        )
+        .bind(guild_id.0)
+        .bind(channel_id.0)
+        .bind(user_id.0)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(|r| PendingWelcome {
+            welcome_bytes: r.get::<Vec<u8>, _>(0),
+        }))
     }
 
     pub async fn load_and_consume_pending_welcome(
