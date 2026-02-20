@@ -22,6 +22,8 @@ struct TestMlsSessionManager {
     joined_welcomes: Arc<Mutex<Vec<Vec<u8>>>>,
     decrypted_ciphertexts: Arc<Mutex<Vec<Vec<u8>>>>,
     has_persisted_group_state: bool,
+    open_or_create_group_calls: Arc<Mutex<u32>>,
+    add_member_calls: Arc<Mutex<u32>>,
 }
 
 impl TestMlsSessionManager {
@@ -36,6 +38,8 @@ impl TestMlsSessionManager {
             joined_welcomes: Arc::new(Mutex::new(Vec::new())),
             decrypted_ciphertexts: Arc::new(Mutex::new(Vec::new())),
             has_persisted_group_state: false,
+            open_or_create_group_calls: Arc::new(Mutex::new(0)),
+            add_member_calls: Arc::new(Mutex::new(0)),
         }
     }
 
@@ -50,6 +54,8 @@ impl TestMlsSessionManager {
             joined_welcomes: Arc::new(Mutex::new(Vec::new())),
             decrypted_ciphertexts: Arc::new(Mutex::new(Vec::new())),
             has_persisted_group_state: false,
+            open_or_create_group_calls: Arc::new(Mutex::new(0)),
+            add_member_calls: Arc::new(Mutex::new(0)),
         }
     }
 
@@ -82,6 +88,7 @@ impl MlsSessionManager for TestMlsSessionManager {
     }
 
     async fn open_or_create_group(&self, _guild_id: GuildId, _channel_id: ChannelId) -> Result<()> {
+        *self.open_or_create_group_calls.lock().await += 1;
         Ok(())
     }
 
@@ -125,6 +132,7 @@ impl MlsSessionManager for TestMlsSessionManager {
         if let Some(err) = &self.fail_with {
             return Err(anyhow!(err.clone()));
         }
+        *self.add_member_calls.lock().await += 1;
         Ok(MlsAddMemberOutcome {
             commit_bytes: self.add_member_commit.clone(),
             welcome_bytes: self.add_member_welcome.clone(),
@@ -1081,17 +1089,18 @@ async fn moderator_retries_member_bootstrap_after_new_member_joins() {
 }
 
 #[tokio::test]
-async fn missing_welcome_bootstrap_targets_requester_and_forces_retry_for_that_member() {
+async fn missing_welcome_bootstrap_keeps_leader_target_optional_and_recovers_locally() {
     let (server_url, server_state) = spawn_onboarding_server().await.expect("spawn server");
 
-    let requester = RealtimeClient::new_with_mls_session_manager(
-        PassthroughCrypto,
-        Arc::new(TestMlsSessionManager::ok(Vec::new(), Vec::new())),
-    );
+    let leader_mls = TestMlsSessionManager::ok(Vec::new(), Vec::new());
+    let open_or_create_group_calls = leader_mls.open_or_create_group_calls.clone();
+    let add_member_calls = leader_mls.add_member_calls.clone();
+    let requester =
+        RealtimeClient::new_with_mls_session_manager(PassthroughCrypto, Arc::new(leader_mls));
     {
         let mut inner = requester.inner.lock().await;
         inner.server_url = Some(server_url.clone());
-        inner.user_id = Some(42);
+        inner.user_id = Some(7);
         inner.selected_guild = Some(GuildId(11));
         inner.selected_channel = Some(ChannelId(13));
         inner.channel_guilds.insert(ChannelId(13), GuildId(11));
@@ -1111,13 +1120,25 @@ async fn missing_welcome_bootstrap_targets_requester_and_forces_retry_for_that_m
     assert_eq!(bootstrap_requests.len(), 1);
     assert_eq!(
         bootstrap_requests[0],
-        (42, 11, 13, Some(42), "missing_pending_welcome".to_string())
+        (7, 11, 13, None, "missing_pending_welcome".to_string())
     );
+    assert_eq!(*open_or_create_group_calls.lock().await, 1);
+    assert_eq!(*add_member_calls.lock().await, 1);
 
-    let leader = RealtimeClient::new_with_mls_session_manager(
-        PassthroughCrypto,
-        Arc::new(TestMlsSessionManager::ok(Vec::new(), Vec::new())),
-    );
+    let posts = server_state.add_member_posts.lock().await.clone();
+    assert_eq!(posts, vec![(11, 13, 42)]);
+}
+
+#[tokio::test]
+async fn leader_self_target_bootstrap_recovers_local_state_without_member_add() {
+    let (server_url, server_state) = spawn_onboarding_server().await.expect("spawn server");
+
+    let leader_mls = TestMlsSessionManager::ok(Vec::new(), Vec::new());
+    let open_or_create_group_calls = leader_mls.open_or_create_group_calls.clone();
+    let add_member_calls = leader_mls.add_member_calls.clone();
+    let leader =
+        RealtimeClient::new_with_mls_session_manager(PassthroughCrypto, Arc::new(leader_mls));
+
     {
         let mut inner = leader.inner.lock().await;
         inner.server_url = Some(server_url);
@@ -1125,21 +1146,56 @@ async fn missing_welcome_bootstrap_targets_requester_and_forces_retry_for_that_m
         inner.selected_guild = Some(GuildId(11));
         inner.selected_channel = Some(ChannelId(13));
         inner.channel_guilds.insert(ChannelId(13), GuildId(11));
-        inner
-            .attempted_channel_member_additions
-            .insert((GuildId(11), ChannelId(13), 42));
     }
 
     let bootstrapped = leader
-        .maybe_bootstrap_existing_members_if_leader(GuildId(11), ChannelId(13), 7, Some(42))
+        .maybe_bootstrap_existing_members_if_leader(GuildId(11), ChannelId(13), 7, Some(7))
         .await
         .expect("leader bootstrap call succeeds");
     assert!(bootstrapped);
 
-    // Even though target member was already marked in attempted_channel_member_additions,
-    // a targeted retry should still regenerate/store welcome for user 42.
+    let bootstrapped_again = leader
+        .maybe_bootstrap_existing_members_if_leader(GuildId(11), ChannelId(13), 7, Some(7))
+        .await
+        .expect("repeat leader bootstrap call succeeds");
+    assert!(bootstrapped_again);
+
+    assert_eq!(*open_or_create_group_calls.lock().await, 1);
+    assert_eq!(*add_member_calls.lock().await, 0);
+
     let posts = server_state.add_member_posts.lock().await.clone();
-    assert_eq!(posts, vec![(11, 13, 42)]);
+    assert!(posts.is_empty());
+}
+
+#[tokio::test]
+async fn missing_pending_welcome_requests_bootstrap_when_none_exists() {
+    let (server_url, server_state) = spawn_onboarding_server().await.expect("spawn server");
+
+    let client = RealtimeClient::new_with_mls_session_manager(
+        PassthroughCrypto,
+        Arc::new(TestMlsSessionManager::ok(Vec::new(), Vec::new())),
+    );
+    {
+        let mut inner = client.inner.lock().await;
+        inner.server_url = Some(server_url);
+        inner.user_id = Some(42);
+        inner.selected_guild = Some(GuildId(11));
+        inner.selected_channel = Some(ChannelId(13));
+        inner.channel_guilds.insert(ChannelId(13), GuildId(11));
+    }
+
+    let synced = client
+        .maybe_join_from_pending_welcome_with_retry(GuildId(11), ChannelId(13))
+        .await
+        .expect("welcome sync call succeeds");
+    assert!(!synced);
+
+    let bootstrap_requests = server_state.bootstrap_requests.lock().await.clone();
+    assert_eq!(bootstrap_requests.len(), 1);
+    assert_eq!(
+        bootstrap_requests[0],
+        (42, 11, 13, Some(42), "missing_pending_welcome".to_string())
+    );
 }
 
 #[tokio::test]

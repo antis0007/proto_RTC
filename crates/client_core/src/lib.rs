@@ -1236,7 +1236,15 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
                 }
             },
         )]);
-        let target_user_id = if matches!(reason, MlsBootstrapReason::MissingPendingWelcome) {
+        let requester_is_leader = self
+            .fetch_members_for_guild(guild_id)
+            .await
+            .ok()
+            .and_then(|members| members.iter().map(|member| member.user_id.0).min())
+            .is_some_and(|leader_user_id| leader_user_id == user_id);
+        let target_user_id = if matches!(reason, MlsBootstrapReason::MissingPendingWelcome)
+            && !requester_is_leader
+        {
             Some(user_id)
         } else {
             target_user_id
@@ -1466,7 +1474,7 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
                     member.user_id.0,
                 ))
             };
-            if already_added && !target_user_id.is_some_and(|target| target == member.user_id.0) {
+            if already_added && target_user_id.is_none_or(|target| target != member.user_id.0) {
                 continue;
             }
 
@@ -1669,11 +1677,72 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
             .min()
             .is_some_and(|leader_user_id| leader_user_id == current_user_id);
         if is_leader {
+            if target_user_id == Some(current_user_id) {
+                self.recover_local_mls_state_for_leader(guild_id, channel_id, current_user_id)
+                    .await?;
+                return Ok(true);
+            }
             self.maybe_add_existing_members_to_channel_group(guild_id, channel_id, target_user_id)
                 .await?;
             return Ok(true);
         }
         Ok(false)
+    }
+
+    async fn recover_local_mls_state_for_leader(
+        &self,
+        guild_id: GuildId,
+        channel_id: ChannelId,
+        current_user_id: i64,
+    ) -> Result<()> {
+        if self.is_mls_channel_initialized(guild_id, channel_id).await {
+            info!(
+                guild_id = guild_id.0,
+                channel_id = channel_id.0,
+                current_user_id,
+                recovery_path = "leader_self_target_already_initialized",
+                "mls: bootstrap self-target ignored because local MLS state is already initialized"
+            );
+            return Ok(());
+        }
+
+        let persisted_state_present = match self
+            .mls_session_manager
+            .has_persisted_group_state(guild_id, channel_id)
+            .await
+        {
+            Ok(has_state) => has_state,
+            Err(err) => {
+                warn!(
+                    guild_id = guild_id.0,
+                    channel_id = channel_id.0,
+                    current_user_id,
+                    recovery_path = "leader_self_target_local_state_probe_failed",
+                    "mls: local MLS state probe failed during self-recovery; rebuilding local state: {err}"
+                );
+                false
+            }
+        };
+
+        info!(
+            guild_id = guild_id.0,
+            channel_id = channel_id.0,
+            current_user_id,
+            persisted_state_present,
+            recovery_path = "leader_self_target_local_rebuild",
+            "mls: handling bootstrap self-target by rebuilding local MLS channel state"
+        );
+
+        self.mls_session_manager
+            .open_or_create_group(guild_id, channel_id)
+            .await?;
+        self.inner
+            .lock()
+            .await
+            .initialized_mls_channels
+            .insert((guild_id, channel_id));
+        self.mark_welcome_sync_dirty(guild_id, channel_id).await;
+        Ok(())
     }
 
     async fn active_context(&self) -> Result<(String, i64, GuildId, ChannelId)> {
