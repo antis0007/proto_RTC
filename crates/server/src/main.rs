@@ -594,16 +594,33 @@ async fn fetch_pending_welcome(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ApiError::new(ErrorCode::Internal, e.to_string())),
             )
-        })?
-        .ok_or_else(|| {
-            (
-                StatusCode::NOT_FOUND,
-                Json(ApiError::new(
-                    ErrorCode::NotFound,
-                    "pending welcome not found",
-                )),
-            )
         })?;
+
+    let Some(pending_welcome) = pending_welcome else {
+        info!(
+            guild_id = q.guild_id,
+            channel_id = q.channel_id,
+            user_id = q.user_id,
+            pending_welcome = false,
+            "mls: fetch pending welcome result"
+        );
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(ApiError::new(
+                ErrorCode::NotFound,
+                "pending welcome not found",
+            )),
+        ));
+    };
+
+    info!(
+        guild_id = q.guild_id,
+        channel_id = q.channel_id,
+        user_id = q.user_id,
+        pending_welcome = true,
+        welcome_size = pending_welcome.welcome_bytes.len(),
+        "mls: fetch pending welcome result"
+    );
 
     Ok(Json(MlsWelcomeResponse {
         user_id: q.user_id,

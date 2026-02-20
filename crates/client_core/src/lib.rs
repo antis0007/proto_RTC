@@ -47,6 +47,7 @@ const LIVEKIT_E2EE_INFO_PREFIX: &[u8] = b"proto-rtc/livekit-e2ee/v1";
 const LIVEKIT_E2EE_APP_SALT: &[u8] = b"proto-rtc/livekit-e2ee-app-salt";
 const WELCOME_SYNC_RETRY_ATTEMPTS: usize = 12;
 const WELCOME_SYNC_RETRY_DELAY: Duration = Duration::from_millis(500);
+const WELCOME_SYNC_COOLDOWN_AFTER_EXHAUSTED: Duration = Duration::from_secs(15);
 const BOOTSTRAP_REQUEST_MIN_INTERVAL: Duration = Duration::from_secs(30);
 
 fn is_duplicate_member_add_error(err: &anyhow::Error) -> bool {
@@ -511,6 +512,7 @@ struct RealtimeClientState {
     attempted_channel_member_additions: HashSet<(GuildId, ChannelId, i64)>,
     initialized_mls_channels: HashSet<(GuildId, ChannelId)>,
     inflight_welcome_syncs: HashSet<(GuildId, ChannelId)>,
+    welcome_sync_retry_after: HashMap<(GuildId, ChannelId), Instant>,
     bootstrap_request_last_sent: HashMap<(GuildId, ChannelId), Instant>,
     pending_outbound_plaintexts: HashMap<String, String>,
     voice_session_keys: HashMap<VoiceConnectionKey, CachedVoiceSessionKey>,
@@ -580,6 +582,7 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
                 attempted_channel_member_additions: HashSet::new(),
                 initialized_mls_channels: HashSet::new(),
                 inflight_welcome_syncs: HashSet::new(),
+                welcome_sync_retry_after: HashMap::new(),
                 bootstrap_request_last_sent: HashMap::new(),
                 pending_outbound_plaintexts: HashMap::new(),
                 voice_session_keys: HashMap::new(),
@@ -897,6 +900,12 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
                                     },
                                 ));
                                 let guild_id = *guild_id;
+                                {
+                                    let mut guard = client.inner.lock().await;
+                                    guard.welcome_sync_retry_after.retain(
+                                        |(mapped_guild_id, _), _| *mapped_guild_id != guild_id,
+                                    );
+                                }
                                 let client_clone = Arc::clone(&client);
                                 tokio::spawn(async move {
                                     if let Err(err) =
@@ -917,6 +926,7 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
                                     let mut guard = client.inner.lock().await;
                                     guard.channel_guilds.insert(channel_id, guild_id);
                                 }
+                                client.mark_welcome_sync_dirty(guild_id, channel_id).await;
                                 let client_clone = Arc::clone(&client);
                                 tokio::spawn(async move {
                                     if let Err(err) = client_clone
@@ -939,6 +949,7 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
                                 requesting_user_id,
                             } = event
                             {
+                                client.mark_welcome_sync_dirty(guild_id, channel_id).await;
                                 let client_clone = Arc::clone(&client);
                                 tokio::spawn(async move {
                                     let Ok((_, current_user_id)) = client_clone.session().await
@@ -1206,12 +1217,21 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
             .await
             .initialized_mls_channels
             .insert((guild_id, channel_id));
+        self.mark_welcome_sync_dirty(guild_id, channel_id).await;
         info!(
             guild_id = guild_id.0,
             channel_id = channel_id.0,
             "mls: welcome consumed and channel initialized"
         );
         Ok(true)
+    }
+
+    async fn mark_welcome_sync_dirty(&self, guild_id: GuildId, channel_id: ChannelId) {
+        self.inner
+            .lock()
+            .await
+            .welcome_sync_retry_after
+            .remove(&(guild_id, channel_id));
     }
 
     async fn maybe_join_from_pending_welcome_with_retry(
@@ -1231,6 +1251,16 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
                     "mls: welcome sync already in progress; skipping duplicate trigger"
                 );
                 return Ok(false);
+            }
+            if let Some(retry_after) = guard.welcome_sync_retry_after.get(&(guild_id, channel_id)) {
+                if *retry_after > Instant::now() {
+                    info!(
+                        guild_id = guild_id.0,
+                        channel_id = channel_id.0,
+                        "mls: welcome sync skipped due to cooldown"
+                    );
+                    return Ok(false);
+                }
             }
             guard.inflight_welcome_syncs.insert((guild_id, channel_id));
         }
@@ -1265,7 +1295,15 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
             }
 
             if !synced {
+                {
+                    self.inner.lock().await.welcome_sync_retry_after.insert(
+                        (guild_id, channel_id),
+                        Instant::now() + WELCOME_SYNC_COOLDOWN_AFTER_EXHAUSTED,
+                    );
+                }
                 let _ = self.request_mls_bootstrap(guild_id, channel_id).await;
+            } else {
+                self.mark_welcome_sync_dirty(guild_id, channel_id).await;
             }
 
             Ok(synced)
