@@ -3314,7 +3314,9 @@ fn spawn_backend_thread(cmd_rx: Receiver<BackendCommand>, ui_tx: Sender<UiEvent>
                         }
                     }
                     BackendCommand::ListGuilds => {
+                        tracing::info!("backend: list_guilds");
                         if let Err(err) = client.list_guilds().await {
+                            tracing::error!("backend: list_guilds failed: {err}");
                             let _ = ui_tx.try_send(UiEvent::Error(UiError::from_message(
                                 UiErrorContext::General,
                                 err.to_string(),
@@ -3322,7 +3324,9 @@ fn spawn_backend_thread(cmd_rx: Receiver<BackendCommand>, ui_tx: Sender<UiEvent>
                         }
                     }
                     BackendCommand::ListChannels { guild_id } => {
+                        tracing::info!(guild_id = guild_id.0, "backend: list_channels");
                         if let Err(err) = client.list_channels(guild_id).await {
+                            tracing::error!(guild_id = guild_id.0, "backend: list_channels failed: {err}");
                             let _ = ui_tx.try_send(UiEvent::Error(UiError::from_message(
                                 UiErrorContext::General,
                                 err.to_string(),
@@ -3330,7 +3334,9 @@ fn spawn_backend_thread(cmd_rx: Receiver<BackendCommand>, ui_tx: Sender<UiEvent>
                         }
                     }
                     BackendCommand::ListMembers { guild_id } => {
+                        tracing::info!(guild_id = guild_id.0, "backend: list_members");
                         if let Err(err) = client.list_members(guild_id).await {
+                            tracing::error!(guild_id = guild_id.0, "backend: list_members failed: {err}");
                             let _ = ui_tx.try_send(UiEvent::Error(UiError::from_message(
                                 UiErrorContext::General,
                                 err.to_string(),
@@ -3338,7 +3344,9 @@ fn spawn_backend_thread(cmd_rx: Receiver<BackendCommand>, ui_tx: Sender<UiEvent>
                         }
                     }
                     BackendCommand::SelectChannel { channel_id } => {
+                        tracing::info!(channel_id = channel_id.0, "backend: select_channel");
                         if let Err(err) = client.select_channel(channel_id).await {
+                            tracing::error!(channel_id = channel_id.0, "backend: select_channel failed: {err}");
                             let _ = ui_tx.try_send(UiEvent::Error(UiError::from_message(
                                 UiErrorContext::General,
                                 err.to_string(),
@@ -3358,6 +3366,11 @@ fn spawn_backend_thread(cmd_rx: Receiver<BackendCommand>, ui_tx: Sender<UiEvent>
                         text,
                         attachment_path,
                     } => {
+                        tracing::info!(
+                            has_attachment = attachment_path.is_some(),
+                            text_len = text.len(),
+                            "backend: send_message"
+                        );
                         let result = if let Some(path) = attachment_path {
                             let filename = path
                                 .file_name()
@@ -3387,6 +3400,7 @@ fn spawn_backend_thread(cmd_rx: Receiver<BackendCommand>, ui_tx: Sender<UiEvent>
                         };
 
                         if let Err(err) = result {
+                            tracing::error!("backend: send_message failed: {err}");
                             let _ = ui_tx.try_send(UiEvent::Error(UiError::from_message(
                                 UiErrorContext::SendMessage,
                                 err.to_string(),
@@ -3471,8 +3485,10 @@ fn spawn_backend_thread(cmd_rx: Receiver<BackendCommand>, ui_tx: Sender<UiEvent>
                         }
                     }
                     BackendCommand::JoinWithInvite { invite_code } => {
+                        tracing::info!("backend: join_with_invite");
                         match client.join_with_invite(&invite_code).await {
                             Ok(()) => {
+                                tracing::info!("backend: join_with_invite succeeded");
                                 if let Some(guild_id) = guild_id_from_invite(&invite_code) {
                                     let _ = ui_tx.try_send(UiEvent::JoinedGuild(guild_id));
                                 }
@@ -3487,6 +3503,7 @@ fn spawn_backend_thread(cmd_rx: Receiver<BackendCommand>, ui_tx: Sender<UiEvent>
                                 }
                             }
                             Err(err) => {
+                                tracing::error!("backend: join_with_invite failed: {err}");
                                 let _ = ui_tx.try_send(UiEvent::Error(UiError::from_message(
                                     UiErrorContext::General,
                                     err.to_string(),

@@ -323,6 +323,7 @@ async fn upload_file(
             )),
         ));
     }
+
     if body.len() > MAX_ATTACHMENT_BYTES {
         return Err((
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -484,6 +485,12 @@ async fn upload_key_package(
 
     let guild_id = GuildId(q.guild_id);
     let user_id = UserId(q.user_id);
+    info!(
+        guild_id = guild_id.0,
+        user_id = user_id.0,
+        key_package_size = body.len(),
+        "mls: upload key package request"
+    );
     let key_package_id = state
         .api
         .storage
@@ -501,6 +508,13 @@ async fn upload_key_package(
             .events
             .send(ServerEvent::GuildMembersUpdated { guild_id, members });
     }
+
+    info!(
+        guild_id = guild_id.0,
+        user_id = user_id.0,
+        key_package_id,
+        "mls: key package stored"
+    );
 
     Ok(Json(UploadKeyPackageResponse { key_package_id }))
 }
@@ -543,6 +557,12 @@ async fn fetch_pending_welcome(
     State(state): State<Arc<AppState>>,
     Query(q): Query<MlsWelcomeQuery>,
 ) -> Result<Json<MlsWelcomeResponse>, (StatusCode, Json<ApiError>)> {
+    info!(
+        guild_id = q.guild_id,
+        channel_id = q.channel_id,
+        user_id = q.user_id,
+        "mls: fetch pending welcome request"
+    );
     ensure_active_membership_in_channel(
         &state.api,
         UserId(q.user_id),
@@ -640,6 +660,13 @@ async fn store_pending_welcome(
         guild_id: GuildId(q.guild_id),
         channel_id: ChannelId(q.channel_id),
     });
+
+    info!(
+        guild_id = q.guild_id,
+        channel_id = q.channel_id,
+        target_user_id = q.target_user_id,
+        "mls: pending welcome stored and broadcast"
+    );
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -846,6 +873,11 @@ async fn http_join_guild(
         })?;
 
     let joining_user_id = UserId(req.user_id);
+    info!(
+        guild_id = guild_id.0,
+        user_id = joining_user_id.0,
+        "guild: join with invite"
+    );
     state
         .api
         .storage

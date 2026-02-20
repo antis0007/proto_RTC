@@ -1029,6 +1029,13 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
         welcome_bytes: &[u8],
     ) -> Result<()> {
         let (server_url, current_user_id) = self.session().await?;
+        info!(
+            guild_id = guild_id.0,
+            channel_id = channel_id.0,
+            target_user_id,
+            actor_user_id = current_user_id,
+            "mls: storing pending welcome"
+        );
         self.http
             .post(format!("{server_url}/mls/welcome"))
             .query(&[
@@ -1041,6 +1048,12 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
             .send()
             .await?
             .error_for_status()?;
+        info!(
+            guild_id = guild_id.0,
+            channel_id = channel_id.0,
+            target_user_id,
+            "mls: pending welcome stored"
+        );
         Ok(())
     }
 
@@ -1062,6 +1075,11 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
             .await?;
 
         if response.status() == reqwest::StatusCode::NOT_FOUND {
+            info!(
+                guild_id = guild_id.0,
+                channel_id = channel_id.0,
+                "mls: pending welcome not found"
+            );
             return Ok(false);
         }
 
@@ -1081,6 +1099,11 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
             .await
             .initialized_mls_channels
             .insert((guild_id, channel_id));
+        info!(
+            guild_id = guild_id.0,
+            channel_id = channel_id.0,
+            "mls: welcome consumed and channel initialized"
+        );
         Ok(true)
     }
 
@@ -1090,10 +1113,23 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
         channel_id: ChannelId,
     ) -> Result<bool> {
         for attempt in 0..WELCOME_SYNC_RETRY_ATTEMPTS {
+            info!(
+                guild_id = guild_id.0,
+                channel_id = channel_id.0,
+                attempt = attempt + 1,
+                max_attempts = WELCOME_SYNC_RETRY_ATTEMPTS,
+                "mls: welcome sync attempt"
+            );
             if self
                 .maybe_join_from_pending_welcome(guild_id, channel_id)
                 .await?
             {
+                info!(
+                    guild_id = guild_id.0,
+                    channel_id = channel_id.0,
+                    attempt = attempt + 1,
+                    "mls: welcome sync succeeded"
+                );
                 return Ok(true);
             }
 
@@ -1154,7 +1190,15 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
 
             let key_package_bytes = match self.fetch_key_package(member.user_id.0, guild_id).await {
                 Ok(bytes) => bytes,
-                Err(_) => continue,
+                Err(err) => {
+                    warn!(
+                        guild_id = guild_id.0,
+                        channel_id = channel_id.0,
+                        target_user_id = member.user_id.0,
+                        "mls: key package fetch failed during bootstrap: {err}"
+                    );
+                    continue;
+                }
             };
             let add_member_outcome = match self
                 .mls_session_manager
@@ -1162,8 +1206,22 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
                 .await
             {
                 Ok(outcome) => outcome,
-                Err(_) => continue,
+                Err(err) => {
+                    warn!(
+                        guild_id = guild_id.0,
+                        channel_id = channel_id.0,
+                        target_user_id = member.user_id.0,
+                        "mls: add_member failed during bootstrap: {err}"
+                    );
+                    continue;
+                }
             };
+            info!(
+                guild_id = guild_id.0,
+                channel_id = channel_id.0,
+                target_user_id = member.user_id.0,
+                "mls: add_member produced commit+welcome"
+            );
 
             let commit_bytes_b64 = STANDARD.encode(&add_member_outcome.commit_bytes);
             if let Err(err) = self
