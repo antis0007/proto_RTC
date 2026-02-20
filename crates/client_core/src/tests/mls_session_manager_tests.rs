@@ -36,7 +36,7 @@ async fn identity_persists_across_manager_restart_and_supports_commit_and_decryp
         .add_member(channel_id, &bob_key_package)
         .await
         .expect("add bob");
-    bob.join_from_welcome(channel_id, &first_welcome.welcome_bytes)
+    bob.join_from_welcome(guild_id, channel_id, &first_welcome.welcome_bytes)
         .await
         .expect("bob joins");
 
