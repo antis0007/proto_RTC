@@ -522,6 +522,8 @@ async fn emit_decrypted_message_auto_joins_from_welcome_when_uninitialized() {
     assert_eq!(*server_state.welcome_fetches.lock().await, 1);
 }
 
+type BootstrapRequestRecord = (i64, i64, i64, Option<i64>, String);
+
 #[derive(Clone)]
 struct OnboardingServerState {
     pending_welcome_b64: Arc<Mutex<Option<String>>>,
@@ -532,7 +534,7 @@ struct OnboardingServerState {
     include_target_member: Arc<Mutex<bool>>,
     fail_member_fetch: Arc<Mutex<bool>>,
     fail_key_package_fetch: Arc<Mutex<bool>>,
-    bootstrap_requests: Arc<Mutex<Vec<(i64, i64, i64, Option<i64>, String)>>>,
+    bootstrap_requests: Arc<Mutex<Vec<BootstrapRequestRecord>>>,
 }
 
 async fn onboarding_list_members(
