@@ -667,6 +667,7 @@ async fn store_pending_welcome(
     let _ = state.events.send(ServerEvent::MlsWelcomeAvailable {
         guild_id: GuildId(q.guild_id),
         channel_id: ChannelId(q.channel_id),
+        target_user_id: UserId(q.target_user_id),
     });
 
     info!(
@@ -794,8 +795,12 @@ async fn is_event_visible_to_user(
             target_user_id,
         } => *target_user_id == user_id || is_member(*guild_id).await,
         ServerEvent::LiveKitTokenIssued { guild_id, .. }
-        | ServerEvent::MlsWelcomeAvailable { guild_id, .. }
         | ServerEvent::MlsBootstrapRequested { guild_id, .. } => is_member(*guild_id).await,
+        ServerEvent::MlsWelcomeAvailable {
+            guild_id,
+            target_user_id,
+            ..
+        } => *target_user_id == user_id && is_member(*guild_id).await,
         ServerEvent::FileStored { .. } | ServerEvent::Error(_) => true,
     }
 }
