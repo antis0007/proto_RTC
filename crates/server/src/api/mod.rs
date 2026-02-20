@@ -64,6 +64,10 @@ pub fn mls_bootstrap_request_route() -> &'static str {
     "/mls/bootstrap/request"
 }
 
+pub fn mls_welcome_recovery_route() -> &'static str {
+    "/mls/welcome/recovery"
+}
+
 pub async fn list_guilds(ctx: &ApiContext, user_id: UserId) -> Result<Vec<GuildSummary>, ApiError> {
     let guilds = ctx
         .storage

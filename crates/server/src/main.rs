@@ -3,8 +3,9 @@ use std::{net::SocketAddr, sync::Arc};
 use crate::api::{
     ensure_active_membership_in_channel, ensure_active_membership_in_guild, list_channels,
     list_guilds, list_members, list_messages, mls_bootstrap_request_route, mls_key_packages_route,
-    mls_welcome_route, request_livekit_token, send_message, ApiContext, KeyPackageResponse,
-    MlsKeyPackageQuery, MlsWelcomeQuery, MlsWelcomeResponse, UploadKeyPackageResponse,
+    mls_welcome_recovery_route, mls_welcome_route, request_livekit_token, send_message, ApiContext,
+    KeyPackageResponse, MlsKeyPackageQuery, MlsWelcomeQuery, MlsWelcomeResponse,
+    UploadKeyPackageResponse,
 };
 use crate::livekit::LiveKitConfig;
 use axum::{
@@ -23,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use shared::{
     domain::{ChannelId, ChannelKind, FileId, GuildId, UserId},
     error::{ApiError, ErrorCode},
-    protocol::{AttachmentPayload, ServerEvent},
+    protocol::{AttachmentPayload, MlsBootstrapReason, ServerEvent},
 };
 use storage::Storage;
 use tokio::sync::broadcast;
@@ -126,6 +127,18 @@ struct MlsBootstrapRequestQuery {
     user_id: i64,
     guild_id: i64,
     channel_id: i64,
+    #[serde(default)]
+    target_user_id: Option<i64>,
+    #[serde(default)]
+    reason: MlsBootstrapReason,
+}
+
+#[derive(Debug, Deserialize)]
+struct RecoveryWelcomeQuery {
+    user_id: i64,
+    guild_id: i64,
+    channel_id: i64,
+    target_user_id: i64,
 }
 
 const MAX_ATTACHMENT_BYTES: usize = 8 * 1024 * 1024;
@@ -186,6 +199,7 @@ async fn main() -> anyhow::Result<()> {
         "/files/:file_id",
         mls_key_packages_route(),
         mls_welcome_route(),
+        mls_welcome_recovery_route(),
     ];
     for route in routes {
         info!(%route, "route registered");
@@ -228,6 +242,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route(mls_key_packages_route(), get(fetch_key_package))
         .route(mls_welcome_route(), post(store_pending_welcome))
         .route(mls_welcome_route(), get(fetch_pending_welcome))
+        .route(mls_welcome_recovery_route(), post(issue_recovery_welcome))
         .route(mls_bootstrap_request_route(), post(request_mls_bootstrap))
         .route("/ws", get(ws_handler))
         .with_state(state)
@@ -710,22 +725,117 @@ async fn request_mls_bootstrap(
     .await
     .map_err(|error| (api_error_status(&error), Json(error)))?;
 
+    if let Some(target_user_id) = q.target_user_id {
+        ensure_active_membership_in_channel(
+            &state.api,
+            UserId(target_user_id),
+            GuildId(q.guild_id),
+            ChannelId(q.channel_id),
+        )
+        .await
+        .map_err(|error| (api_error_status(&error), Json(error)))?;
+    }
+
     let _ = state.events.send(ServerEvent::MlsBootstrapRequested {
         guild_id: GuildId(q.guild_id),
         channel_id: ChannelId(q.channel_id),
         requesting_user_id: UserId(q.user_id),
+        target_user_id: q.target_user_id.map(UserId),
+        reason: q.reason,
     });
 
     info!(
         guild_id = q.guild_id,
         channel_id = q.channel_id,
         requesting_user_id = q.user_id,
+        target_user_id = q.target_user_id,
+        reason = ?q.reason,
         "mls: bootstrap requested"
     );
 
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn issue_recovery_welcome(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<RecoveryWelcomeQuery>,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    ensure_active_membership_in_channel(
+        &state.api,
+        UserId(q.user_id),
+        GuildId(q.guild_id),
+        ChannelId(q.channel_id),
+    )
+    .await
+    .map_err(|error| (api_error_status(&error), Json(error)))?;
+
+    ensure_active_membership_in_channel(
+        &state.api,
+        UserId(q.target_user_id),
+        GuildId(q.guild_id),
+        ChannelId(q.channel_id),
+    )
+    .await
+    .map_err(|error| (api_error_status(&error), Json(error)))?;
+
+    let latest_welcome = state
+        .api
+        .storage
+        .load_latest_welcome_any_state(
+            GuildId(q.guild_id),
+            ChannelId(q.channel_id),
+            UserId(q.target_user_id),
+        )
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError::new(ErrorCode::Internal, e.to_string())),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ApiError::new(
+                    ErrorCode::NotFound,
+                    "no welcome material available for recovery",
+                )),
+            )
+        })?;
+
+    state
+        .api
+        .storage
+        .insert_pending_welcome(
+            GuildId(q.guild_id),
+            ChannelId(q.channel_id),
+            UserId(q.target_user_id),
+            &latest_welcome.welcome_bytes,
+        )
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError::new(ErrorCode::Internal, e.to_string())),
+            )
+        })?;
+
+    let _ = state.events.send(ServerEvent::MlsWelcomeAvailable {
+        guild_id: GuildId(q.guild_id),
+        channel_id: ChannelId(q.channel_id),
+        target_user_id: UserId(q.target_user_id),
+    });
+
+    info!(
+        guild_id = q.guild_id,
+        channel_id = q.channel_id,
+        requesting_user_id = q.user_id,
+        target_user_id = q.target_user_id,
+        "mls: recovery welcome generated/stored"
+    );
+
+    Ok(StatusCode::NO_CONTENT)
+}
 async fn ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,

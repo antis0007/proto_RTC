@@ -20,7 +20,8 @@ use shared::{
     domain::{ChannelId, FileId, GuildId, MessageId},
     protocol::{
         AttachmentPayload, ChannelSummary, ClientRequest, GuildSummary, KeyPackageResponse,
-        MemberSummary, MessagePayload, ServerEvent, UploadKeyPackageResponse, WelcomeResponse,
+        MemberSummary, MessagePayload, MlsBootstrapReason, ServerEvent, UploadKeyPackageResponse,
+        WelcomeResponse,
     },
 };
 use thiserror::Error;
@@ -45,8 +46,9 @@ const LIVEKIT_E2EE_CACHE_TTL: Duration = Duration::from_secs(90);
 const LIVEKIT_E2EE_INFO_PREFIX: &[u8] = b"proto-rtc/livekit-e2ee/v1";
 /// Deterministic application salt for LiveKit E2EE key derivation.
 const LIVEKIT_E2EE_APP_SALT: &[u8] = b"proto-rtc/livekit-e2ee-app-salt";
-const WELCOME_SYNC_RETRY_ATTEMPTS: usize = 12;
-const WELCOME_SYNC_RETRY_DELAY: Duration = Duration::from_millis(500);
+const WELCOME_SYNC_RETRY_ATTEMPTS: usize = 6;
+const WELCOME_SYNC_RETRY_BASE_DELAY: Duration = Duration::from_millis(200);
+const WELCOME_SYNC_RETRY_MAX_DELAY: Duration = Duration::from_secs(2);
 const WELCOME_SYNC_COOLDOWN_AFTER_EXHAUSTED: Duration = Duration::from_secs(15);
 const BOOTSTRAP_REQUEST_MIN_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -58,6 +60,21 @@ fn is_duplicate_member_add_error(err: &anyhow::Error) -> bool {
 
 fn is_wrong_epoch_error(err: &anyhow::Error) -> bool {
     err.to_string().to_ascii_lowercase().contains("wrong epoch")
+}
+
+fn welcome_retry_delay_with_jitter(
+    attempt: usize,
+    guild_id: GuildId,
+    channel_id: ChannelId,
+) -> Duration {
+    let exp = (attempt as u32).min(4);
+    let backoff = WELCOME_SYNC_RETRY_BASE_DELAY.saturating_mul(1_u32 << exp);
+    let capped = backoff.min(WELCOME_SYNC_RETRY_MAX_DELAY);
+    let jitter_seed = (guild_id.0 as u64)
+        .wrapping_add((channel_id.0 as u64) << 8)
+        .wrapping_add(attempt as u64);
+    let jitter_ms = (jitter_seed % 90) + 10;
+    capped + Duration::from_millis(jitter_ms)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -952,6 +969,8 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
                                 guild_id,
                                 channel_id,
                                 requesting_user_id,
+                                target_user_id,
+                                reason,
                             } = event
                             {
                                 client.mark_welcome_sync_dirty(guild_id, channel_id).await;
@@ -966,6 +985,8 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
                                         channel_id = channel_id.0,
                                         requesting_user_id = requesting_user_id.0,
                                         current_user_id,
+                                        target_user_id = ?target_user_id,
+                                        reason = ?reason,
                                         "mls: received bootstrap request event"
                                     );
                                     if requesting_user_id.0 == current_user_id {
@@ -1140,7 +1161,39 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
         Ok(())
     }
 
-    async fn request_mls_bootstrap(&self, guild_id: GuildId, channel_id: ChannelId) -> Result<()> {
+    async fn request_recovery_welcome(
+        &self,
+        guild_id: GuildId,
+        channel_id: ChannelId,
+        target_user_id: i64,
+    ) -> Result<()> {
+        let (server_url, current_user_id) = self.session().await?;
+        self.http
+            .post(format!("{server_url}/mls/welcome/recovery"))
+            .query(&[
+                ("user_id", current_user_id),
+                ("guild_id", guild_id.0),
+                ("channel_id", channel_id.0),
+                ("target_user_id", target_user_id),
+            ])
+            .send()
+            .await?
+            .error_for_status()?;
+        info!(
+            guild_id = guild_id.0,
+            channel_id = channel_id.0,
+            target_user_id,
+            "mls: recovery welcome generated/stored"
+        );
+        Ok(())
+    }
+    async fn request_mls_bootstrap(
+        &self,
+        guild_id: GuildId,
+        channel_id: ChannelId,
+        target_user_id: Option<i64>,
+        reason: MlsBootstrapReason,
+    ) -> Result<()> {
         {
             let mut guard = self.inner.lock().await;
             if let Some(last_sent_at) = guard
@@ -1162,20 +1215,35 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
                 .insert((guild_id, channel_id), Instant::now());
         }
         let (server_url, user_id) = self.session().await?;
-        self.http
+        let mut request = self
+            .http
             .post(format!("{server_url}/mls/bootstrap/request"))
             .query(&[
                 ("user_id", user_id),
                 ("guild_id", guild_id.0),
                 ("channel_id", channel_id.0),
-            ])
-            .send()
-            .await?
-            .error_for_status()?;
+            ]);
+        request = request.query(&[(
+            "reason",
+            match reason {
+                MlsBootstrapReason::Unknown => "unknown",
+                MlsBootstrapReason::MissingPendingWelcome => "missing_pending_welcome",
+                MlsBootstrapReason::LocalStateMissing => "local_state_missing",
+                MlsBootstrapReason::RecoveryWelcomeDuplicateMember => {
+                    "recovery_welcome_duplicate_member"
+                }
+            },
+        )]);
+        if let Some(target_user_id) = target_user_id {
+            request = request.query(&[("target_user_id", target_user_id)]);
+        }
+        request.send().await?.error_for_status()?;
         info!(
             guild_id = guild_id.0,
             channel_id = channel_id.0,
             requester_user_id = user_id,
+            target_user_id = target_user_id,
+            reason = ?reason,
             "mls: bootstrap request posted"
         );
         // NOTE(mls-debug): if this requester is the elected leader, execute bootstrap
@@ -1302,7 +1370,8 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
                 }
 
                 if attempt + 1 < WELCOME_SYNC_RETRY_ATTEMPTS {
-                    tokio::time::sleep(WELCOME_SYNC_RETRY_DELAY).await;
+                    let delay = welcome_retry_delay_with_jitter(attempt, guild_id, channel_id);
+                    tokio::time::sleep(delay).await;
                 }
             }
 
@@ -1313,7 +1382,14 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
                         Instant::now() + WELCOME_SYNC_COOLDOWN_AFTER_EXHAUSTED,
                     );
                 }
-                let _ = self.request_mls_bootstrap(guild_id, channel_id).await;
+                let _ = self
+                    .request_mls_bootstrap(
+                        guild_id,
+                        channel_id,
+                        None,
+                        MlsBootstrapReason::MissingPendingWelcome,
+                    )
+                    .await;
             } else {
                 self.mark_welcome_sync_dirty(guild_id, channel_id).await;
             }
@@ -1411,8 +1487,11 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
                     guild_id = guild_id.0,
                     channel_id = channel_id.0,
                     target_user_id = member.user_id.0,
-                    "mls: add_member skipped because target already appears in MLS roster"
+                    "mls: target already in MLS roster; requesting recovery welcome"
                 );
+                let _ = self
+                    .request_recovery_welcome(guild_id, channel_id, member.user_id.0)
+                    .await;
                 self.inner
                     .lock()
                     .await
@@ -1433,8 +1512,11 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
                             guild_id = guild_id.0,
                             channel_id = channel_id.0,
                             target_user_id = member.user_id.0,
-                            "mls: add_member skipped because target already appears in group"
+                            "mls: add_member duplicate detected; requesting recovery welcome"
                         );
+                        let _ = self
+                            .request_recovery_welcome(guild_id, channel_id, member.user_id.0)
+                            .await;
                         self.inner
                             .lock()
                             .await
