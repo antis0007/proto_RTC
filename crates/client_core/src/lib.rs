@@ -895,8 +895,13 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
                             } else if let ServerEvent::MlsWelcomeAvailable {
                                 guild_id,
                                 channel_id,
+                                target_user_id,
                             } = event
                             {
+                                let current_user_id = { client.inner.lock().await.user_id };
+                                if current_user_id != Some(target_user_id.0) {
+                                    continue;
+                                }
                                 {
                                     let mut guard = client.inner.lock().await;
                                     guard.channel_guilds.insert(channel_id, guild_id);

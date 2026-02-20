@@ -151,6 +151,7 @@ pub enum ServerEvent {
     MlsWelcomeAvailable {
         guild_id: GuildId,
         channel_id: ChannelId,
+        target_user_id: UserId,
     },
     MlsBootstrapRequested {
         guild_id: GuildId,
