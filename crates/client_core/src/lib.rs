@@ -1433,9 +1433,6 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
             .decode(welcome.welcome_b64)
             .map_err(|e| anyhow!("invalid welcome payload from server: {e}"))?;
         self.mls_session_manager
-            .open_or_create_group(guild_id, channel_id)
-            .await?;
-        self.mls_session_manager
             .join_from_welcome(guild_id, channel_id, &welcome_bytes)
             .await?;
         self.inner

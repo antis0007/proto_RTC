@@ -22,6 +22,7 @@ struct TestMlsSessionManager {
     joined_welcomes: Arc<Mutex<Vec<Vec<u8>>>>,
     decrypted_ciphertexts: Arc<Mutex<Vec<Vec<u8>>>>,
     has_persisted_group_state: bool,
+    open_or_create_calls: Arc<Mutex<u32>>,
 }
 
 impl TestMlsSessionManager {
@@ -36,6 +37,7 @@ impl TestMlsSessionManager {
             joined_welcomes: Arc::new(Mutex::new(Vec::new())),
             decrypted_ciphertexts: Arc::new(Mutex::new(Vec::new())),
             has_persisted_group_state: false,
+            open_or_create_calls: Arc::new(Mutex::new(0)),
         }
     }
 
@@ -50,6 +52,7 @@ impl TestMlsSessionManager {
             joined_welcomes: Arc::new(Mutex::new(Vec::new())),
             decrypted_ciphertexts: Arc::new(Mutex::new(Vec::new())),
             has_persisted_group_state: false,
+            open_or_create_calls: Arc::new(Mutex::new(0)),
         }
     }
 
@@ -82,6 +85,8 @@ impl MlsSessionManager for TestMlsSessionManager {
     }
 
     async fn open_or_create_group(&self, _guild_id: GuildId, _channel_id: ChannelId) -> Result<()> {
+        let mut calls = self.open_or_create_calls.lock().await;
+        *calls += 1;
         Ok(())
     }
 
@@ -428,6 +433,7 @@ async fn suppresses_non_application_messages_after_decrypt() {
 async fn emit_decrypted_message_skips_when_uninitialized_and_no_welcome() {
     let manager = TestMlsSessionManager::ok(Vec::new(), b"hello".to_vec());
     let decrypt_inputs = manager.decrypted_ciphertexts.clone();
+    let open_or_create_calls = manager.open_or_create_calls.clone();
     let client = RealtimeClient::new_with_mls_session_manager(PassthroughCrypto, Arc::new(manager));
     {
         let mut inner = client.inner.lock().await;
@@ -441,12 +447,14 @@ async fn emit_decrypted_message_skips_when_uninitialized_and_no_welcome() {
         .expect("should skip ciphertext until welcome exists");
 
     assert!(decrypt_inputs.lock().await.is_empty());
+    assert_eq!(*open_or_create_calls.lock().await, 0);
 }
 
 #[tokio::test]
 async fn emit_decrypted_message_ignores_unmapped_channel_messages() {
     let manager = TestMlsSessionManager::ok(Vec::new(), b"hello".to_vec());
     let decrypt_inputs = manager.decrypted_ciphertexts.clone();
+    let open_or_create_calls = manager.open_or_create_calls.clone();
     let client = RealtimeClient::new_with_mls_session_manager(PassthroughCrypto, Arc::new(manager));
     {
         let mut inner = client.inner.lock().await;
@@ -461,6 +469,7 @@ async fn emit_decrypted_message_ignores_unmapped_channel_messages() {
         .expect("unmapped channels should be ignored");
 
     assert!(decrypt_inputs.lock().await.is_empty());
+    assert_eq!(*open_or_create_calls.lock().await, 0);
 }
 
 #[tokio::test]
