@@ -47,6 +47,7 @@ const LIVEKIT_E2EE_INFO_PREFIX: &[u8] = b"proto-rtc/livekit-e2ee/v1";
 const LIVEKIT_E2EE_APP_SALT: &[u8] = b"proto-rtc/livekit-e2ee-app-salt";
 const WELCOME_SYNC_RETRY_ATTEMPTS: usize = 12;
 const WELCOME_SYNC_RETRY_DELAY: Duration = Duration::from_millis(500);
+const BOOTSTRAP_REQUEST_MIN_INTERVAL: Duration = Duration::from_secs(3);
 
 fn is_duplicate_member_add_error(err: &anyhow::Error) -> bool {
     err.to_string()
@@ -493,6 +494,8 @@ struct RealtimeClientState {
     sender_directory: HashMap<i64, String>,
     attempted_channel_member_additions: HashSet<(GuildId, ChannelId, i64)>,
     initialized_mls_channels: HashSet<(GuildId, ChannelId)>,
+    inflight_welcome_syncs: HashSet<(GuildId, ChannelId)>,
+    bootstrap_request_last_sent: HashMap<(GuildId, ChannelId), Instant>,
     pending_outbound_plaintexts: HashMap<String, String>,
     voice_session_keys: HashMap<VoiceConnectionKey, CachedVoiceSessionKey>,
 }
@@ -560,6 +563,8 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
                 sender_directory: HashMap::new(),
                 attempted_channel_member_additions: HashSet::new(),
                 initialized_mls_channels: HashSet::new(),
+                inflight_welcome_syncs: HashSet::new(),
+                bootstrap_request_last_sent: HashMap::new(),
                 pending_outbound_plaintexts: HashMap::new(),
                 voice_session_keys: HashMap::new(),
             }),
@@ -931,6 +936,14 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
                                         current_user_id,
                                         "mls: received bootstrap request event"
                                     );
+                                    if requesting_user_id.0 == current_user_id {
+                                        info!(
+                                            guild_id = guild_id.0,
+                                            channel_id = channel_id.0,
+                                            "mls: ignoring self-originated bootstrap request event"
+                                        );
+                                        return;
+                                    }
                                     let _ = client_clone
                                         .maybe_bootstrap_existing_members_if_moderator(
                                             guild_id,
@@ -1095,6 +1108,26 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
     }
 
     async fn request_mls_bootstrap(&self, guild_id: GuildId, channel_id: ChannelId) -> Result<()> {
+        {
+            let mut guard = self.inner.lock().await;
+            if let Some(last_sent_at) = guard
+                .bootstrap_request_last_sent
+                .get(&(guild_id, channel_id))
+                .copied()
+            {
+                if last_sent_at.elapsed() < BOOTSTRAP_REQUEST_MIN_INTERVAL {
+                    info!(
+                        guild_id = guild_id.0,
+                        channel_id = channel_id.0,
+                        "mls: bootstrap request suppressed due to rate limit"
+                    );
+                    return Ok(());
+                }
+            }
+            guard
+                .bootstrap_request_last_sent
+                .insert((guild_id, channel_id), Instant::now());
+        }
         let (server_url, user_id) = self.session().await?;
         self.http
             .post(format!("{server_url}/mls/bootstrap/request"))
@@ -1170,35 +1203,66 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
         guild_id: GuildId,
         channel_id: ChannelId,
     ) -> Result<bool> {
-        for attempt in 0..WELCOME_SYNC_RETRY_ATTEMPTS {
-            info!(
-                guild_id = guild_id.0,
-                channel_id = channel_id.0,
-                attempt = attempt + 1,
-                max_attempts = WELCOME_SYNC_RETRY_ATTEMPTS,
-                "mls: welcome sync attempt"
-            );
-            if self
-                .maybe_join_from_pending_welcome(guild_id, channel_id)
-                .await?
+        {
+            let mut guard = self.inner.lock().await;
+            if guard
+                .inflight_welcome_syncs
+                .contains(&(guild_id, channel_id))
             {
                 info!(
                     guild_id = guild_id.0,
                     channel_id = channel_id.0,
-                    attempt = attempt + 1,
-                    "mls: welcome sync succeeded"
+                    "mls: welcome sync already in progress; skipping duplicate trigger"
                 );
-                return Ok(true);
+                return Ok(false);
             }
-
-            if attempt + 1 < WELCOME_SYNC_RETRY_ATTEMPTS {
-                tokio::time::sleep(WELCOME_SYNC_RETRY_DELAY).await;
-            }
+            guard.inflight_welcome_syncs.insert((guild_id, channel_id));
         }
 
-        let _ = self.request_mls_bootstrap(guild_id, channel_id).await;
+        let result = async {
+            let mut synced = false;
+            for attempt in 0..WELCOME_SYNC_RETRY_ATTEMPTS {
+                info!(
+                    guild_id = guild_id.0,
+                    channel_id = channel_id.0,
+                    attempt = attempt + 1,
+                    max_attempts = WELCOME_SYNC_RETRY_ATTEMPTS,
+                    "mls: welcome sync attempt"
+                );
+                if self
+                    .maybe_join_from_pending_welcome(guild_id, channel_id)
+                    .await?
+                {
+                    info!(
+                        guild_id = guild_id.0,
+                        channel_id = channel_id.0,
+                        attempt = attempt + 1,
+                        "mls: welcome sync succeeded"
+                    );
+                    synced = true;
+                    break;
+                }
 
-        Ok(false)
+                if attempt + 1 < WELCOME_SYNC_RETRY_ATTEMPTS {
+                    tokio::time::sleep(WELCOME_SYNC_RETRY_DELAY).await;
+                }
+            }
+
+            if !synced {
+                let _ = self.request_mls_bootstrap(guild_id, channel_id).await;
+            }
+
+            Ok(synced)
+        }
+        .await;
+
+        self.inner
+            .lock()
+            .await
+            .inflight_welcome_syncs
+            .remove(&(guild_id, channel_id));
+
+        result
     }
 
     async fn fetch_members_for_guild(&self, guild_id: GuildId) -> Result<Vec<MemberSummary>> {
@@ -1821,6 +1885,8 @@ impl<C: CryptoProvider + 'static> ClientHandle for Arc<RealtimeClient<C>> {
             guard.sender_directory.clear();
             guard.pending_outbound_plaintexts.clear();
             guard.initialized_mls_channels.clear();
+            guard.inflight_welcome_syncs.clear();
+            guard.bootstrap_request_last_sent.clear();
             guard.attempted_channel_member_additions.clear();
             zeroize_voice_session_cache(&mut guard);
         }
@@ -1836,6 +1902,8 @@ impl<C: CryptoProvider + 'static> ClientHandle for Arc<RealtimeClient<C>> {
             guard.sender_directory.clear();
             guard.pending_outbound_plaintexts.clear();
             guard.initialized_mls_channels.clear();
+            guard.inflight_welcome_syncs.clear();
+            guard.bootstrap_request_last_sent.clear();
             guard.attempted_channel_member_additions.clear();
             zeroize_voice_session_cache(&mut guard);
             return Err(err);
