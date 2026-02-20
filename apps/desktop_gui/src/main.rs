@@ -14,6 +14,7 @@ mod media;
 mod ui;
 
 use arboard::{Clipboard, ImageData};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use client_core::{
     AttachmentUpload, ClientEvent, ClientHandle, DurableMlsSessionManager, PassthroughCrypto,
     RealtimeClient, VoiceConnectOptions, VoiceParticipantState, VoiceSessionSnapshot,
@@ -78,6 +79,7 @@ enum UiEvent {
     LoginOk,
     Info(String),
     InviteCreated(String),
+    JoinedGuild(GuildId),
     SenderDirectoryUpdated {
         user_id: i64,
         username: String,
@@ -723,6 +725,21 @@ impl DesktopGuiApp {
                     self.status =
                         "Invite created, copied to clipboard, and inserted into the Invite field"
                             .to_string();
+                }
+                UiEvent::JoinedGuild(guild_id) => {
+                    self.selected_guild = Some(guild_id);
+                    self.selected_channel = None;
+                    self.channels.clear();
+                    queue_command(
+                        &self.cmd_tx,
+                        BackendCommand::ListChannels { guild_id },
+                        &mut self.status,
+                    );
+                    queue_command(
+                        &self.cmd_tx,
+                        BackendCommand::ListMembers { guild_id },
+                        &mut self.status,
+                    );
                 }
                 UiEvent::SenderDirectoryUpdated { user_id, username } => {
                     self.sender_directory.insert(user_id, username);
@@ -3121,6 +3138,13 @@ async fn fetch_user_id_for_login(server_url: &str, username: &str) -> Result<i64
     Ok(body.user_id)
 }
 
+fn guild_id_from_invite(invite_code: &str) -> Option<GuildId> {
+    let decoded = URL_SAFE_NO_PAD.decode(invite_code.as_bytes()).ok()?;
+    let decoded_text = String::from_utf8(decoded).ok()?;
+    let guild_id = decoded_text.strip_prefix("guild:")?.parse::<i64>().ok()?;
+    Some(GuildId(guild_id))
+}
+
 async fn build_user_scoped_mls_client(
     base_dir: &std::path::Path,
     user_id: i64,
@@ -3449,6 +3473,9 @@ fn spawn_backend_thread(cmd_rx: Receiver<BackendCommand>, ui_tx: Sender<UiEvent>
                     BackendCommand::JoinWithInvite { invite_code } => {
                         match client.join_with_invite(&invite_code).await {
                             Ok(()) => {
+                                if let Some(guild_id) = guild_id_from_invite(&invite_code) {
+                                    let _ = ui_tx.try_send(UiEvent::JoinedGuild(guild_id));
+                                }
                                 let _ = ui_tx.try_send(UiEvent::Info(
                                     "Joined guild from invite".to_string(),
                                 ));
