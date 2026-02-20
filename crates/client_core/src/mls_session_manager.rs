@@ -211,6 +211,23 @@ impl MlsSessionManager for DurableMlsSessionManager {
         })
     }
 
+    async fn group_contains_key_package_identity(
+        &self,
+        channel_id: ChannelId,
+        key_package_bytes: &[u8],
+    ) -> Result<bool> {
+        let key = self.key_for_channel(channel_id).await?;
+        let mut sessions = self.sessions.lock().await;
+        let handle = sessions.get_mut(&key).ok_or_else(|| {
+            anyhow!(
+                "MLS session missing for guild {} channel {}",
+                key.0 .0,
+                key.1 .0
+            )
+        })?;
+        handle.group_contains_key_package_identity(key_package_bytes)
+    }
+
     async fn join_from_welcome(
         &self,
         guild_id: GuildId,

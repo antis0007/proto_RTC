@@ -256,6 +256,25 @@ impl<S: MlsStore> MlsGroupHandle<S> {
         Ok((commit_bytes, welcome_bytes))
     }
 
+    pub fn group_contains_key_package_identity(&self, key_package_bytes: &[u8]) -> Result<bool> {
+        let mut bytes = key_package_bytes;
+        let key_package_in = <KeyPackageIn as TlsDeserializeTrait>::tls_deserialize(&mut bytes)?;
+        if !bytes.is_empty() {
+            return Err(anyhow!("key package bytes had trailing data"));
+        }
+        let key_package = key_package_in
+            .validate(self.provider.crypto(), ProtocolVersion::default())
+            .map_err(|e| anyhow!("invalid key package bytes: {e}"))?;
+        let target_signature_key = key_package.leaf_node().signature_key().as_slice();
+        let group = self
+            .group
+            .as_ref()
+            .ok_or_else(|| anyhow!("MLS group not initialized"))?;
+        Ok(group
+            .members()
+            .any(|member| member.signature_key.as_slice() == target_signature_key))
+    }
+
     pub fn encrypt_application(&mut self, plaintext_bytes: &[u8]) -> Result<Vec<u8>> {
         let provider = &self.provider;
         let signer = &self.identity.signer;

@@ -131,6 +131,17 @@ impl MlsSessionManager for TestMlsSessionManager {
         })
     }
 
+    async fn group_contains_key_package_identity(
+        &self,
+        _channel_id: ChannelId,
+        _key_package_bytes: &[u8],
+    ) -> Result<bool> {
+        if let Some(err) = &self.fail_with {
+            return Err(anyhow!(err.clone()));
+        }
+        Ok(false)
+    }
+
     async fn join_from_welcome(
         &self,
         _guild_id: GuildId,
