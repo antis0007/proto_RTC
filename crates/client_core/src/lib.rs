@@ -54,6 +54,10 @@ fn is_duplicate_member_add_error(err: &anyhow::Error) -> bool {
         .contains("duplicate signature key")
 }
 
+fn is_wrong_epoch_error(err: &anyhow::Error) -> bool {
+    err.to_string().to_ascii_lowercase().contains("wrong epoch")
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct VoiceConnectionKey {
     guild_id: GuildId,
@@ -1447,10 +1451,31 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
                 )
             })?;
 
-        let plaintext_bytes = self
+        let plaintext_bytes = match self
             .mls_session_manager
             .decrypt_application(message.channel_id, &ciphertext)
-            .await?;
+            .await
+        {
+            Ok(bytes) => bytes,
+            Err(err) if is_wrong_epoch_error(&err) => {
+                warn!(
+                    guild_id = guild_id.0,
+                    channel_id = message.channel_id.0,
+                    message_id = message.message_id.0,
+                    "mls: wrong epoch while decrypting; dropping local initialization and retrying welcome sync"
+                );
+                self.inner
+                    .lock()
+                    .await
+                    .initialized_mls_channels
+                    .remove(&(guild_id, message.channel_id));
+                let _ = self
+                    .maybe_join_from_pending_welcome_with_retry(guild_id, message.channel_id)
+                    .await;
+                return Ok(());
+            }
+            Err(err) => return Err(err),
+        };
 
         if plaintext_bytes.is_empty() {
             return Ok(());
