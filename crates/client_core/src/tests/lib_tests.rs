@@ -526,6 +526,7 @@ struct OnboardingServerState {
     add_member_posts: Arc<Mutex<Vec<(i64, i64, i64)>>>,
     stored_ciphertexts: Arc<Mutex<Vec<String>>>,
     include_target_member: Arc<Mutex<bool>>,
+    bootstrap_requests: Arc<Mutex<Vec<(i64, i64, i64, Option<i64>, String)>>>,
 }
 
 async fn onboarding_list_members(
@@ -587,6 +588,29 @@ async fn onboarding_store_welcome(
 #[derive(Deserialize)]
 struct WelcomeQuery {
     user_id: i64,
+}
+
+#[derive(Deserialize)]
+struct BootstrapRequestQuery {
+    user_id: i64,
+    guild_id: i64,
+    channel_id: i64,
+    target_user_id: Option<i64>,
+    reason: String,
+}
+
+async fn onboarding_bootstrap_request(
+    State(state): State<OnboardingServerState>,
+    Query(q): Query<BootstrapRequestQuery>,
+) -> StatusCode {
+    state.bootstrap_requests.lock().await.push((
+        q.user_id,
+        q.guild_id,
+        q.channel_id,
+        q.target_user_id,
+        q.reason,
+    ));
+    StatusCode::NO_CONTENT
 }
 
 async fn onboarding_fetch_welcome(
@@ -661,6 +685,7 @@ async fn spawn_onboarding_server() -> Result<(String, OnboardingServerState)> {
         add_member_posts: Arc::new(Mutex::new(Vec::new())),
         stored_ciphertexts: Arc::new(Mutex::new(Vec::new())),
         include_target_member: Arc::new(Mutex::new(true)),
+        bootstrap_requests: Arc::new(Mutex::new(Vec::new())),
     };
     let app = Router::new()
         .route(
@@ -679,6 +704,10 @@ async fn spawn_onboarding_server() -> Result<(String, OnboardingServerState)> {
         .route(
             "/channels/13/messages",
             axum::routing::get(onboarding_messages_for_channel),
+        )
+        .route(
+            "/mls/bootstrap/request",
+            axum::routing::post(onboarding_bootstrap_request),
         )
         .route("/messages", axum::routing::post(onboarding_send_message))
         .with_state(state.clone());
@@ -1049,6 +1078,68 @@ async fn moderator_retries_member_bootstrap_after_new_member_joins() {
         joined_welcomes.lock().await.clone(),
         vec![b"welcome-generated".to_vec()]
     );
+}
+
+#[tokio::test]
+async fn missing_welcome_bootstrap_targets_requester_and_forces_retry_for_that_member() {
+    let (server_url, server_state) = spawn_onboarding_server().await.expect("spawn server");
+
+    let requester = RealtimeClient::new_with_mls_session_manager(
+        PassthroughCrypto,
+        Arc::new(TestMlsSessionManager::ok(Vec::new(), Vec::new())),
+    );
+    {
+        let mut inner = requester.inner.lock().await;
+        inner.server_url = Some(server_url.clone());
+        inner.user_id = Some(42);
+        inner.selected_guild = Some(GuildId(11));
+        inner.selected_channel = Some(ChannelId(13));
+        inner.channel_guilds.insert(ChannelId(13), GuildId(11));
+    }
+
+    requester
+        .request_mls_bootstrap(
+            GuildId(11),
+            ChannelId(13),
+            None,
+            MlsBootstrapReason::MissingPendingWelcome,
+        )
+        .await
+        .expect("bootstrap request succeeds");
+
+    let bootstrap_requests = server_state.bootstrap_requests.lock().await.clone();
+    assert_eq!(bootstrap_requests.len(), 1);
+    assert_eq!(
+        bootstrap_requests[0],
+        (42, 11, 13, Some(42), "missing_pending_welcome".to_string())
+    );
+
+    let leader = RealtimeClient::new_with_mls_session_manager(
+        PassthroughCrypto,
+        Arc::new(TestMlsSessionManager::ok(Vec::new(), Vec::new())),
+    );
+    {
+        let mut inner = leader.inner.lock().await;
+        inner.server_url = Some(server_url);
+        inner.user_id = Some(7);
+        inner.selected_guild = Some(GuildId(11));
+        inner.selected_channel = Some(ChannelId(13));
+        inner.channel_guilds.insert(ChannelId(13), GuildId(11));
+        inner
+            .attempted_channel_member_additions
+            .insert((GuildId(11), ChannelId(13), 42));
+    }
+
+    let bootstrapped = leader
+        .maybe_bootstrap_existing_members_if_leader(GuildId(11), ChannelId(13), 7, Some(42))
+        .await
+        .expect("leader bootstrap call succeeds");
+    assert!(bootstrapped);
+
+    // Even though target member was already marked in attempted_channel_member_additions,
+    // a targeted retry should still regenerate/store welcome for user 42.
+    let posts = server_state.add_member_posts.lock().await.clone();
+    assert_eq!(posts, vec![(11, 13, 42)]);
 }
 
 #[tokio::test]
