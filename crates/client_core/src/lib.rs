@@ -47,7 +47,7 @@ const LIVEKIT_E2EE_INFO_PREFIX: &[u8] = b"proto-rtc/livekit-e2ee/v1";
 const LIVEKIT_E2EE_APP_SALT: &[u8] = b"proto-rtc/livekit-e2ee-app-salt";
 const WELCOME_SYNC_RETRY_ATTEMPTS: usize = 12;
 const WELCOME_SYNC_RETRY_DELAY: Duration = Duration::from_millis(500);
-const BOOTSTRAP_REQUEST_MIN_INTERVAL: Duration = Duration::from_secs(3);
+const BOOTSTRAP_REQUEST_MIN_INTERVAL: Duration = Duration::from_secs(30);
 
 fn is_duplicate_member_add_error(err: &anyhow::Error) -> bool {
     err.to_string()
@@ -114,6 +114,11 @@ pub trait MlsSessionManager: Send + Sync {
         channel_id: ChannelId,
         key_package_bytes: &[u8],
     ) -> Result<MlsAddMemberOutcome>;
+    async fn group_contains_key_package_identity(
+        &self,
+        channel_id: ChannelId,
+        key_package_bytes: &[u8],
+    ) -> Result<bool>;
     async fn join_from_welcome(
         &self,
         guild_id: GuildId,
@@ -213,6 +218,17 @@ impl MlsSessionManager for MissingMlsSessionManager {
         _label: &str,
         _len: usize,
     ) -> Result<Vec<u8>> {
+        Err(anyhow!(
+            "no active MLS group available for channel {}",
+            channel_id.0
+        ))
+    }
+
+    async fn group_contains_key_package_identity(
+        &self,
+        channel_id: ChannelId,
+        _key_package_bytes: &[u8],
+    ) -> Result<bool> {
         Err(anyhow!(
             "no active MLS group available for channel {}",
             channel_id.0
@@ -945,7 +961,7 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
                                         return;
                                     }
                                     let _ = client_clone
-                                        .maybe_bootstrap_existing_members_if_moderator(
+                                        .maybe_bootstrap_existing_members_if_leader(
                                             guild_id,
                                             channel_id,
                                             current_user_id,
@@ -1324,6 +1340,37 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
                     continue;
                 }
             };
+            let is_already_in_group = match self
+                .mls_session_manager
+                .group_contains_key_package_identity(channel_id, &key_package_bytes)
+                .await
+            {
+                Ok(value) => value,
+                Err(err) => {
+                    warn!(
+                        guild_id = guild_id.0,
+                        channel_id = channel_id.0,
+                        target_user_id = member.user_id.0,
+                        "mls: failed to inspect MLS roster before add_member: {err}"
+                    );
+                    false
+                }
+            };
+            if is_already_in_group {
+                info!(
+                    guild_id = guild_id.0,
+                    channel_id = channel_id.0,
+                    target_user_id = member.user_id.0,
+                    "mls: add_member skipped because target already appears in MLS roster"
+                );
+                self.inner
+                    .lock()
+                    .await
+                    .attempted_channel_member_additions
+                    .insert((guild_id, channel_id, member.user_id.0));
+                continue;
+            }
+
             let add_member_outcome = match self
                 .mls_session_manager
                 .add_member(channel_id, &key_package_bytes)
@@ -1401,7 +1448,7 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
         Ok(())
     }
 
-    async fn maybe_bootstrap_existing_members_if_moderator(
+    async fn maybe_bootstrap_existing_members_if_leader(
         &self,
         guild_id: GuildId,
         channel_id: ChannelId,
@@ -1411,14 +1458,12 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
             Ok(members) => members,
             Err(_) => return Ok(false),
         };
-        let current_role = members
+        let is_leader = members
             .iter()
-            .find(|member| member.user_id.0 == current_user_id)
-            .map(|member| member.role);
-        if matches!(
-            current_role,
-            Some(shared::domain::Role::Owner | shared::domain::Role::Mod)
-        ) {
+            .map(|member| member.user_id.0)
+            .min()
+            .is_some_and(|leader_user_id| leader_user_id == current_user_id);
+        if is_leader {
             self.maybe_add_existing_members_to_channel_group(guild_id, channel_id)
                 .await?;
             return Ok(true);
@@ -1560,7 +1605,7 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
     ) -> Result<()> {
         let (_server_url, user_id, guild_id, channel_id) = self.active_context().await?;
         if let Err(err) = self
-            .maybe_bootstrap_existing_members_if_moderator(guild_id, channel_id, user_id)
+            .maybe_bootstrap_existing_members_if_leader(guild_id, channel_id, user_id)
             .await
         {
             let _ = self.events.send(ClientEvent::Error(format!(
@@ -1574,7 +1619,7 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
             .await?
         {
             let _ = self
-                .maybe_bootstrap_existing_members_if_moderator(guild_id, channel_id, user_id)
+                .maybe_bootstrap_existing_members_if_leader(guild_id, channel_id, user_id)
                 .await?;
             let _ = self.reconcile_mls_state_for_guild(guild_id).await;
 
@@ -1816,7 +1861,7 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
 
             let channel_id = channel.channel_id;
             let _ = self
-                .maybe_bootstrap_existing_members_if_moderator(guild_id, channel_id, user_id)
+                .maybe_bootstrap_existing_members_if_leader(guild_id, channel_id, user_id)
                 .await;
             let _ = self
                 .maybe_join_from_pending_welcome_with_retry(guild_id, channel_id)
@@ -2025,7 +2070,7 @@ impl<C: CryptoProvider + 'static> ClientHandle for Arc<RealtimeClient<C>> {
 
         let (_, current_user_id) = self.session().await?;
         let _ = self
-            .maybe_bootstrap_existing_members_if_moderator(guild_id, channel_id, current_user_id)
+            .maybe_bootstrap_existing_members_if_leader(guild_id, channel_id, current_user_id)
             .await?;
 
         let initialized = self
