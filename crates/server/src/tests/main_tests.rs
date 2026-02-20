@@ -254,6 +254,7 @@ async fn fetch_pending_welcome_succeeds_without_consuming_on_read() {
             GuildId(guild_id),
             ChannelId(channel_id),
             UserId(user_id),
+            None,
             welcome_bytes,
         )
         .await
@@ -345,6 +346,7 @@ async fn fetch_pending_welcome_rejects_non_member_and_does_not_consume() {
             GuildId(guild_id),
             ChannelId(channel_id),
             UserId(user_id),
+            None,
             b"single-use",
         )
         .await
