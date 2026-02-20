@@ -245,7 +245,7 @@ async fn key_package_endpoints_require_active_membership() {
     assert_eq!(banned_fetch_response.status(), StatusCode::FORBIDDEN);
 }
 #[tokio::test]
-async fn fetch_pending_welcome_succeeds_and_consumes_on_read() {
+async fn fetch_pending_welcome_succeeds_without_consuming_on_read() {
     let (app, storage, user_id, guild_id, channel_id) = test_app().await;
     let welcome_bytes = b"welcome-payload";
 
@@ -274,7 +274,7 @@ async fn fetch_pending_welcome_succeeds_and_consumes_on_read() {
     assert_eq!(dto.user_id, user_id);
     assert_eq!(dto.guild_id, guild_id);
     assert_eq!(dto.channel_id, channel_id);
-    assert!(dto.consumed_at.timestamp() > 0);
+    assert!(dto.consumed_at.is_none());
     assert_eq!(
         STANDARD.decode(dto.welcome_b64).expect("base64"),
         welcome_bytes
@@ -290,7 +290,7 @@ async fn fetch_pending_welcome_succeeds_and_consumes_on_read() {
         .oneshot(second_request)
         .await
         .expect("second response");
-    assert_eq!(second_response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(second_response.status(), StatusCode::OK);
 }
 
 #[tokio::test]
@@ -330,7 +330,7 @@ async fn store_pending_welcome_allows_target_to_fetch_and_join_later() {
         .await
         .expect("body");
     let dto: MlsWelcomeResponse = serde_json::from_slice(&body).expect("json");
-    assert!(dto.consumed_at.timestamp() > 0);
+    assert!(dto.consumed_at.is_none());
     assert_eq!(
         STANDARD.decode(dto.welcome_b64).expect("base64"),
         b"welcome-later"

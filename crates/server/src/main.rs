@@ -580,10 +580,10 @@ async fn fetch_pending_welcome(
     .await
     .map_err(|error| (api_error_status(&error), Json(error)))?;
 
-    let consumed_welcome = state
+    let pending_welcome = state
         .api
         .storage
-        .load_and_consume_pending_welcome(
+        .load_pending_welcome(
             GuildId(q.guild_id),
             ChannelId(q.channel_id),
             UserId(q.user_id),
@@ -609,8 +609,8 @@ async fn fetch_pending_welcome(
         user_id: q.user_id,
         guild_id: q.guild_id,
         channel_id: q.channel_id,
-        welcome_b64: STANDARD.encode(consumed_welcome.welcome_bytes),
-        consumed_at: consumed_welcome.consumed_at,
+        welcome_b64: STANDARD.encode(pending_welcome.welcome_bytes),
+        consumed_at: None,
     }))
 }
 

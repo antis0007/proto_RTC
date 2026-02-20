@@ -48,6 +48,12 @@ const LIVEKIT_E2EE_APP_SALT: &[u8] = b"proto-rtc/livekit-e2ee-app-salt";
 const WELCOME_SYNC_RETRY_ATTEMPTS: usize = 12;
 const WELCOME_SYNC_RETRY_DELAY: Duration = Duration::from_millis(500);
 
+fn is_duplicate_member_add_error(err: &anyhow::Error) -> bool {
+    err.to_string()
+        .to_ascii_lowercase()
+        .contains("duplicate signature key")
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct VoiceConnectionKey {
     guild_id: GuildId,
@@ -1257,6 +1263,20 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
             {
                 Ok(outcome) => outcome,
                 Err(err) => {
+                    if is_duplicate_member_add_error(&err) {
+                        info!(
+                            guild_id = guild_id.0,
+                            channel_id = channel_id.0,
+                            target_user_id = member.user_id.0,
+                            "mls: add_member skipped because target already appears in group"
+                        );
+                        self.inner
+                            .lock()
+                            .await
+                            .attempted_channel_member_additions
+                            .insert((guild_id, channel_id, member.user_id.0));
+                        continue;
+                    }
                     warn!(
                         guild_id = guild_id.0,
                         channel_id = channel_id.0,
