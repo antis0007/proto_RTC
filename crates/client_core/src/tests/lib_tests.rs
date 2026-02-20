@@ -619,7 +619,7 @@ struct FetchKeyPackageQuery {
 async fn onboarding_fetch_key_package(
     State(state): State<OnboardingServerState>,
     Query(q): Query<FetchKeyPackageQuery>,
- ) -> Result<Json<KeyPackageResponse>, StatusCode> {
+) -> Result<Json<KeyPackageResponse>, StatusCode> {
     let requested_user_id = q.target_user_id.unwrap_or(q.user_id);
     if *state.fail_key_package_fetch.lock().await && requested_user_id == 42 {
         return Err(StatusCode::NOT_FOUND);
@@ -629,7 +629,11 @@ async fn onboarding_fetch_key_package(
         guild_id: 11,
         user_id: requested_user_id,
         device_id: None,
-        key_package_b64: STANDARD.encode(if requested_user_id == 42 { b"target-kp".as_slice() } else { b"adder-kp".as_slice() }),
+        key_package_b64: STANDARD.encode(if requested_user_id == 42 {
+            b"target-kp".as_slice()
+        } else {
+            b"adder-kp".as_slice()
+        }),
     }))
 }
 
@@ -823,11 +827,11 @@ async fn added_member_retrieves_pending_welcome_and_auto_joins() {
     );
     assert!(
         bootstrap_requests.is_empty()
-            || bootstrap_requests
-                .iter()
-                .any(|(user_id, guild_id, channel_id, _target_user_id, _)| {
+            || bootstrap_requests.iter().any(
+                |(user_id, guild_id, channel_id, _target_user_id, _)| {
                     *user_id == 7 && *guild_id == 11 && *channel_id == 13
-                }),
+                }
+            ),
         "unexpected bootstrap requests: {bootstrap_requests:?}"
     );
 
@@ -1158,11 +1162,11 @@ async fn moderator_retries_member_bootstrap_after_new_member_joins() {
     );
     assert!(
         bootstrap_requests.is_empty()
-            || bootstrap_requests
-                .iter()
-                .any(|(user_id, guild_id, channel_id, _target_user_id, _)| {
+            || bootstrap_requests.iter().any(
+                |(user_id, guild_id, channel_id, _target_user_id, _)| {
                     *user_id == 7 && *guild_id == 11 && *channel_id == 13
-                }),
+                }
+            ),
         "unexpected bootstrap requests: {bootstrap_requests:?}"
     );
 
@@ -1254,14 +1258,14 @@ async fn missing_welcome_bootstrap_targets_requester_and_forces_retry_for_that_m
         posts = server_state.add_member_posts.lock().await.clone();
         bootstrap_requests = server_state.bootstrap_requests.lock().await.clone();
         if posts == vec![(11, 13, 42)]
-            || bootstrap_requests
-                .iter()
-                .any(|(user_id, guild_id, channel_id, target_user_id, _)| {
+            || bootstrap_requests.iter().any(
+                |(user_id, guild_id, channel_id, target_user_id, _)| {
                     *user_id == 7
                         && *guild_id == 11
                         && *channel_id == 13
                         && *target_user_id == Some(42)
-                })
+                },
+            )
         {
             break;
         }
