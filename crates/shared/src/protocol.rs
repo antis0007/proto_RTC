@@ -6,6 +6,16 @@ use crate::{
     error::ApiError,
 };
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MlsBootstrapReason {
+    #[default]
+    Unknown,
+    MissingPendingWelcome,
+    LocalStateMissing,
+    RecoveryWelcomeDuplicateMember,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum ClientRequest {
@@ -157,6 +167,10 @@ pub enum ServerEvent {
         guild_id: GuildId,
         channel_id: ChannelId,
         requesting_user_id: UserId,
+        #[serde(default)]
+        target_user_id: Option<UserId>,
+        #[serde(default)]
+        reason: MlsBootstrapReason,
     },
     FileStored {
         file_id: FileId,
