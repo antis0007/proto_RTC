@@ -20,9 +20,10 @@ use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
     Engine as _,
 };
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use shared::{
-    domain::{ChannelId, ChannelKind, FileId, GuildId, UserId},
+    domain::{ChannelId, ChannelKind, DeviceId, FileId, GuildId, UserId},
     error::{ApiError, ErrorCode},
     protocol::{AttachmentPayload, MlsBootstrapReason, ServerEvent},
 };
@@ -49,6 +50,40 @@ struct LoginRequest {
 #[derive(Debug, Deserialize, Serialize)]
 struct LoginResponse {
     user_id: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct RegisterDeviceRequest {
+    device_name: String,
+    device_public_identity: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeviceQuery {
+    user_id: i64,
+    device_id: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeviceRegisterQuery {
+    user_id: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeviceLinkStartQuery {
+    user_id: i64,
+    initiator_device_id: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeviceLinkCompleteQuery {
+    user_id: i64,
+    token_id: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeviceLinkStartRequest {
+    target_device_pubkey: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -120,6 +155,8 @@ struct StorePendingWelcomeQuery {
     guild_id: i64,
     channel_id: i64,
     target_user_id: i64,
+    #[serde(default)]
+    target_device_id: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -130,6 +167,8 @@ struct MlsBootstrapRequestQuery {
     #[serde(default)]
     target_user_id: Option<i64>,
     #[serde(default)]
+    target_device_id: Option<i64>,
+    #[serde(default)]
     reason: MlsBootstrapReason,
 }
 
@@ -139,6 +178,8 @@ struct RecoveryWelcomeQuery {
     guild_id: i64,
     channel_id: i64,
     target_user_id: i64,
+    #[serde(default)]
+    target_device_id: Option<i64>,
 }
 
 const MAX_ATTACHMENT_BYTES: usize = 8 * 1024 * 1024;
@@ -229,6 +270,11 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/healthz", get(healthz))
         .route("/login", post(login))
         .route("/guilds", get(http_list_guilds))
+        .route("/devices/register", post(register_device))
+        .route("/devices/me", get(get_my_device))
+        .route("/devices/link/start", post(start_device_link))
+        .route("/devices/link/complete", post(complete_device_link))
+        .route("/users/:user_id/devices", get(list_user_devices))
         .route("/guilds/:guild_id/channels", get(http_list_channels))
         .route("/guilds/:guild_id/members", get(http_list_members))
         .route("/channels/:channel_id/messages", get(http_list_messages))
@@ -330,6 +376,152 @@ async fn login(
     }
 
     Ok(Json(LoginResponse { user_id: user_id.0 }))
+}
+
+async fn register_device(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<DeviceRegisterQuery>,
+    Json(req): Json<RegisterDeviceRequest>,
+) -> Result<Json<shared::domain::DeviceSummary>, (StatusCode, Json<ApiError>)> {
+    let device = state
+        .api
+        .storage
+        .register_device(
+            UserId(q.user_id),
+            &req.device_name,
+            &req.device_public_identity,
+        )
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError::new(ErrorCode::Internal, e.to_string())),
+            )
+        })?;
+
+    Ok(Json(shared::domain::DeviceSummary {
+        device_id: device.device_id,
+        user_id: device.user_id,
+        device_name: device.device_name,
+        device_public_identity: device.device_public_identity,
+        is_revoked: device.is_revoked,
+    }))
+}
+
+async fn get_my_device(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<DeviceQuery>,
+) -> Result<Json<shared::domain::DeviceSummary>, (StatusCode, Json<ApiError>)> {
+    let device = state
+        .api
+        .storage
+        .get_device(UserId(q.user_id), DeviceId(q.device_id))
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError::new(ErrorCode::Internal, e.to_string())),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ApiError::new(ErrorCode::NotFound, "device not found")),
+            )
+        })?;
+
+    Ok(Json(shared::domain::DeviceSummary {
+        device_id: device.device_id,
+        user_id: device.user_id,
+        device_name: device.device_name,
+        device_public_identity: device.device_public_identity,
+        is_revoked: device.is_revoked,
+    }))
+}
+
+async fn start_device_link(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<DeviceLinkStartQuery>,
+    Json(req): Json<DeviceLinkStartRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
+    let expires_at = Utc::now() + chrono::Duration::minutes(10);
+    let token_id = state
+        .api
+        .storage
+        .create_device_link_token(
+            UserId(q.user_id),
+            DeviceId(q.initiator_device_id),
+            &req.target_device_pubkey,
+            expires_at,
+        )
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError::new(ErrorCode::Internal, e.to_string())),
+            )
+        })?;
+
+    Ok(Json(
+        serde_json::json!({ "token_id": token_id, "expires_at": expires_at }),
+    ))
+}
+
+async fn complete_device_link(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<DeviceLinkCompleteQuery>,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    let consumed = state
+        .api
+        .storage
+        .consume_device_link_token(UserId(q.user_id), q.token_id)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError::new(ErrorCode::Internal, e.to_string())),
+            )
+        })?;
+
+    if !consumed {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError::new(
+                ErrorCode::Validation,
+                "invalid or expired link token",
+            )),
+        ));
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn list_user_devices(
+    State(state): State<Arc<AppState>>,
+    Path(user_id): Path<i64>,
+    Query(q): Query<UserQuery>,
+) -> Result<Json<Vec<shared::domain::LinkedDeviceSummary>>, (StatusCode, Json<ApiError>)> {
+    if q.user_id != user_id {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ApiError::new(
+                ErrorCode::Forbidden,
+                "cannot list devices for another user",
+            )),
+        ));
+    }
+    let devices = state
+        .api
+        .storage
+        .list_devices_for_user(UserId(user_id))
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError::new(ErrorCode::Internal, e.to_string())),
+            )
+        })?;
+    Ok(Json(devices))
 }
 
 async fn upload_file(
@@ -517,7 +709,7 @@ async fn upload_key_package(
     let key_package_id = state
         .api
         .storage
-        .insert_key_package(guild_id, user_id, &body)
+        .insert_key_package(guild_id, user_id, q.device_id.map(DeviceId), &body)
         .await
         .map_err(|e| {
             (
@@ -550,10 +742,16 @@ async fn fetch_key_package(
         .await
         .map_err(|error| (api_error_status(&error), Json(error)))?;
 
-    let (key_package_id, key_package_bytes) = state
+    let target_user_id = q.target_user_id.unwrap_or(q.user_id);
+
+    let (key_package_id, key_package_device_id, key_package_bytes) = state
         .api
         .storage
-        .load_latest_key_package(GuildId(q.guild_id), UserId(q.user_id))
+        .load_latest_key_package(
+            GuildId(q.guild_id),
+            UserId(target_user_id),
+            q.target_device_id.map(DeviceId),
+        )
         .await
         .map_err(|e| {
             (
@@ -571,7 +769,8 @@ async fn fetch_key_package(
     Ok(Json(KeyPackageResponse {
         key_package_id,
         guild_id: q.guild_id,
-        user_id: q.user_id,
+        user_id: target_user_id,
+        device_id: key_package_device_id,
         key_package_b64: STANDARD.encode(key_package_bytes),
     }))
 }
@@ -601,7 +800,8 @@ async fn fetch_pending_welcome(
         .load_pending_welcome(
             GuildId(q.guild_id),
             ChannelId(q.channel_id),
-            UserId(q.user_id),
+            UserId(q.target_user_id.unwrap_or(q.user_id)),
+            q.target_device_id.map(DeviceId),
         )
         .await
         .map_err(|e| {
@@ -638,9 +838,10 @@ async fn fetch_pending_welcome(
     );
 
     Ok(Json(MlsWelcomeResponse {
-        user_id: q.user_id,
+        user_id: q.target_user_id.unwrap_or(q.user_id),
         guild_id: q.guild_id,
         channel_id: q.channel_id,
+        target_device_id: pending_welcome.target_device_id,
         welcome_b64: STANDARD.encode(pending_welcome.welcome_bytes),
         consumed_at: None,
     }))
@@ -686,6 +887,7 @@ async fn store_pending_welcome(
             GuildId(q.guild_id),
             ChannelId(q.channel_id),
             UserId(q.target_user_id),
+            q.target_device_id.map(DeviceId),
             &body,
         )
         .await
@@ -700,6 +902,7 @@ async fn store_pending_welcome(
         guild_id: GuildId(q.guild_id),
         channel_id: ChannelId(q.channel_id),
         target_user_id: UserId(q.target_user_id),
+        target_device_id: q.target_device_id.map(DeviceId),
     });
 
     info!(
@@ -741,6 +944,7 @@ async fn request_mls_bootstrap(
         channel_id: ChannelId(q.channel_id),
         requesting_user_id: UserId(q.user_id),
         target_user_id: q.target_user_id.map(UserId),
+        target_device_id: q.target_device_id.map(DeviceId),
         reason: q.reason,
     });
 
@@ -785,6 +989,7 @@ async fn issue_recovery_welcome(
             GuildId(q.guild_id),
             ChannelId(q.channel_id),
             UserId(q.target_user_id),
+            q.target_device_id.map(DeviceId),
         )
         .await
         .map_err(|e| {
@@ -810,6 +1015,7 @@ async fn issue_recovery_welcome(
             GuildId(q.guild_id),
             ChannelId(q.channel_id),
             UserId(q.target_user_id),
+            q.target_device_id.map(DeviceId),
             &latest_welcome.welcome_bytes,
         )
         .await
@@ -824,6 +1030,7 @@ async fn issue_recovery_welcome(
         guild_id: GuildId(q.guild_id),
         channel_id: ChannelId(q.channel_id),
         target_user_id: UserId(q.target_user_id),
+        target_device_id: q.target_device_id.map(DeviceId),
     });
 
     info!(
