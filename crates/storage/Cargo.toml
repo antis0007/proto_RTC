@@ -12,6 +12,7 @@ serde.workspace = true
 sqlx.workspace = true
 shared = { path = "../shared" }
 mls = { path = "../mls" }
+uuid.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

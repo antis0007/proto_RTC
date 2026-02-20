@@ -3,6 +3,7 @@ use std::{collections::HashMap, path::Path, sync::Arc};
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use mls::{MlsGroupHandle, MlsIdentity, MlsStore};
+use serde::{Deserialize, Serialize};
 use shared::domain::{ChannelId, GuildId};
 use storage::Storage;
 use tokio::sync::Mutex;
@@ -10,6 +11,14 @@ use tokio::sync::Mutex;
 use crate::{MlsAddMemberOutcome, MlsSessionManager};
 
 type SessionKey = (GuildId, ChannelId);
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PortableGroupStateV1 {
+    version: u8,
+    schema_version: i32,
+    group_state_blob: Vec<u8>,
+    key_material_blob: Vec<u8>,
+}
 
 pub struct DurableMlsSessionManager {
     store: Storage,
@@ -387,6 +396,65 @@ impl MlsSessionManager for DurableMlsSessionManager {
         channel_id: ChannelId,
     ) -> Result<bool> {
         DurableMlsSessionManager::reset_channel_group_state(self, guild_id, channel_id).await
+    }
+
+    async fn export_group_state(
+        &self,
+        guild_id: GuildId,
+        channel_id: ChannelId,
+    ) -> Result<Vec<u8>> {
+        let snapshot = self
+            .store
+            .load_group_state(self.user_id, &self.device_id, guild_id, channel_id)
+            .await?
+            .ok_or_else(|| {
+                anyhow!(
+                    "group state not found for guild {} channel {}",
+                    guild_id.0,
+                    channel_id.0
+                )
+            })?;
+        Ok(serde_json::to_vec(&PortableGroupStateV1 {
+            version: 1,
+            schema_version: snapshot.schema_version,
+            group_state_blob: snapshot.group_state_blob,
+            key_material_blob: snapshot.key_material_blob,
+        })?)
+    }
+
+    async fn import_group_state(
+        &self,
+        guild_id: GuildId,
+        channel_id: ChannelId,
+        state_blob: &[u8],
+    ) -> Result<()> {
+        let decoded: PortableGroupStateV1 = serde_json::from_slice(state_blob)?;
+        if decoded.version != 1 {
+            return Err(anyhow!(
+                "unsupported group state version {}",
+                decoded.version
+            ));
+        }
+
+        self.store
+            .save_group_state(
+                self.user_id,
+                &self.device_id,
+                guild_id,
+                channel_id,
+                mls::PersistedGroupSnapshot {
+                    schema_version: decoded.schema_version,
+                    group_state_blob: decoded.group_state_blob,
+                    key_material_blob: decoded.key_material_blob,
+                },
+            )
+            .await?;
+
+        {
+            let mut sessions = self.sessions.lock().await;
+            sessions.remove(&(guild_id, channel_id));
+        }
+        self.open_or_create_group(guild_id, channel_id).await
     }
 }
 

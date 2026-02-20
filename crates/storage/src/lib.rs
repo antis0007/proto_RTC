@@ -16,6 +16,7 @@ use shared::domain::{
     ChannelId, ChannelKind, DeviceId, DeviceLinkState, FileId, GuildId, LinkedDeviceSummary,
     MessageId, Role, UserId,
 };
+use uuid::Uuid;
 
 #[derive(Clone)]
 pub struct Storage {
@@ -78,6 +79,25 @@ pub struct StoredMember {
     pub username: String,
     pub role: Role,
     pub muted: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct StoredDeviceLinkToken {
+    pub token_id: i64,
+    pub user_id: UserId,
+    pub initiator_device_id: DeviceId,
+    pub target_device_pubkey: String,
+    pub token_secret: String,
+    pub expires_at: DateTime<Utc>,
+    pub consumed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct StoredDeviceLinkBundle {
+    pub token_id: i64,
+    pub source_device_id: DeviceId,
+    pub target_device_id: DeviceId,
+    pub bundle_json: String,
 }
 
 impl Storage {
@@ -543,18 +563,116 @@ impl Storage {
         target_device_pubkey: &str,
         expires_at: DateTime<Utc>,
     ) -> Result<i64> {
+        let token_secret = Uuid::new_v4().to_string();
         let row = sqlx::query(
-            "INSERT INTO device_link_tokens (user_id, initiator_device_id, target_device_pubkey, expires_at)
-             VALUES (?, ?, ?, ?)
+            "INSERT INTO device_link_tokens (user_id, initiator_device_id, target_device_pubkey, token_secret, expires_at)
+             VALUES (?, ?, ?, ?, ?)
              RETURNING token_id",
         )
         .bind(user_id.0)
         .bind(initiator_device_id.0)
         .bind(target_device_pubkey)
+        .bind(token_secret)
         .bind(expires_at)
         .fetch_one(&self.pool)
         .await?;
         Ok(row.get::<i64, _>(0))
+    }
+
+    pub async fn load_device_link_token(
+        &self,
+        user_id: UserId,
+        token_id: i64,
+    ) -> Result<Option<StoredDeviceLinkToken>> {
+        let row = sqlx::query(
+            "SELECT token_id, user_id, initiator_device_id, target_device_pubkey, token_secret, expires_at, consumed_at
+             FROM device_link_tokens
+             WHERE token_id = ? AND user_id = ?",
+        )
+        .bind(token_id)
+        .bind(user_id.0)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(|r| StoredDeviceLinkToken {
+            token_id: r.get(0),
+            user_id: UserId(r.get(1)),
+            initiator_device_id: DeviceId(r.get(2)),
+            target_device_pubkey: r.get(3),
+            token_secret: r.get(4),
+            expires_at: r.get(5),
+            consumed_at: r.get(6),
+        }))
+    }
+
+    pub async fn store_device_link_bundle(
+        &self,
+        user_id: UserId,
+        token_id: i64,
+        source_device_id: DeviceId,
+        target_device_id: DeviceId,
+        bundle_json: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO device_link_bundles (token_id, user_id, source_device_id, target_device_id, bundle_json)
+             VALUES (?, ?, ?, ?, ?)
+             ON CONFLICT(token_id) DO UPDATE SET
+               source_device_id = excluded.source_device_id,
+               target_device_id = excluded.target_device_id,
+               bundle_json = excluded.bundle_json,
+               uploaded_at = CURRENT_TIMESTAMP,
+               consumed_at = NULL",
+        )
+        .bind(token_id)
+        .bind(user_id.0)
+        .bind(source_device_id.0)
+        .bind(target_device_id.0)
+        .bind(bundle_json)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn consume_device_link_bundle(
+        &self,
+        user_id: UserId,
+        token_id: i64,
+    ) -> Result<Option<StoredDeviceLinkBundle>> {
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query(
+            "SELECT token_id, source_device_id, target_device_id, bundle_json
+             FROM device_link_bundles
+             WHERE token_id = ? AND user_id = ? AND consumed_at IS NULL",
+        )
+        .bind(token_id)
+        .bind(user_id.0)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let Some(row) = row else {
+            tx.commit().await?;
+            return Ok(None);
+        };
+
+        sqlx::query(
+            "UPDATE device_link_bundles SET consumed_at = CURRENT_TIMESTAMP WHERE token_id = ?",
+        )
+        .bind(token_id)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query("UPDATE device_link_tokens SET consumed_at = CURRENT_TIMESTAMP WHERE token_id = ? AND consumed_at IS NULL")
+            .bind(token_id)
+            .execute(&mut *tx)
+            .await?;
+
+        tx.commit().await?;
+        Ok(Some(StoredDeviceLinkBundle {
+            token_id: row.get(0),
+            source_device_id: DeviceId(row.get(1)),
+            target_device_id: DeviceId(row.get(2)),
+            bundle_json: row.get(3),
+        }))
     }
 
     pub async fn consume_device_link_token(&self, user_id: UserId, token_id: i64) -> Result<bool> {

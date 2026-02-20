@@ -10,18 +10,24 @@ use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
     Engine as _,
 };
+use chacha20poly1305::{
+    aead::{Aead, KeyInit},
+    ChaCha20Poly1305, Key, Nonce,
+};
+use chrono::Utc;
 use futures::StreamExt;
 use livekit_integration::{
     LiveKitRoomConnector, LiveKitRoomEvent, LiveKitRoomOptions, LiveKitRoomSession, LocalTrack,
 };
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use shared::{
     domain::{ChannelId, FileId, GuildId, MessageId},
     protocol::{
-        AttachmentPayload, ChannelSummary, ClientRequest, GuildSummary, KeyPackageResponse,
-        MemberSummary, MessagePayload, MlsBootstrapReason, ServerEvent, UploadKeyPackageResponse,
-        WelcomeResponse,
+        AttachmentPayload, ChannelStateRecord, ChannelSummary, ClientRequest,
+        EncryptedChannelStateBundleV1, GuildSummary, KeyPackageResponse, MemberSummary,
+        MessagePayload, MlsBootstrapReason, ServerEvent, UploadKeyPackageResponse, WelcomeResponse,
     },
 };
 use thiserror::Error;
@@ -31,6 +37,7 @@ use tokio::{
 };
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, error, info, warn};
+use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 use zeroize::Zeroize;
 
 pub mod error;
@@ -110,6 +117,35 @@ fn is_expected_historical_mls_decrypt_error(err: &anyhow::Error) -> bool {
         || msg.contains("message epoch")
         || msg.contains("secret tree")
         || msg.contains("unable to decrypt")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DecryptFailureKind {
+    ExpectedHistoricalGap,
+    EpochDriftResync,
+    MalformedCiphertext,
+    Unexpected,
+}
+
+fn classify_decrypt_failure(err: &anyhow::Error) -> DecryptFailureKind {
+    let msg = err.to_string().to_ascii_lowercase();
+    if msg.contains("invalid base64")
+        || msg.contains("deserialize")
+        || msg.contains("trailing data")
+    {
+        return DecryptFailureKind::MalformedCiphertext;
+    }
+    if is_wrong_epoch_error(err)
+        || msg.contains("secretreuseerror")
+        || msg.contains("requested secret was deleted")
+        || msg.contains("ciphertext generation out of bounds")
+    {
+        return DecryptFailureKind::EpochDriftResync;
+    }
+    if is_expected_historical_mls_decrypt_error(err) {
+        return DecryptFailureKind::ExpectedHistoricalGap;
+    }
+    DecryptFailureKind::Unexpected
 }
 
 fn welcome_retry_delay_with_jitter(
@@ -204,6 +240,14 @@ pub trait MlsSessionManager: Send + Sync {
         guild_id: GuildId,
         channel_id: ChannelId,
     ) -> Result<bool>;
+    async fn export_group_state(&self, guild_id: GuildId, channel_id: ChannelId)
+        -> Result<Vec<u8>>;
+    async fn import_group_state(
+        &self,
+        guild_id: GuildId,
+        channel_id: ChannelId,
+        state_blob: &[u8],
+    ) -> Result<()>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -313,6 +357,31 @@ impl MlsSessionManager for MissingMlsSessionManager {
         guild_id: GuildId,
         channel_id: ChannelId,
     ) -> Result<bool> {
+        Err(anyhow!(
+            "MLS backend unavailable for guild {} channel {}",
+            guild_id.0,
+            channel_id.0
+        ))
+    }
+
+    async fn export_group_state(
+        &self,
+        guild_id: GuildId,
+        channel_id: ChannelId,
+    ) -> Result<Vec<u8>> {
+        Err(anyhow!(
+            "MLS backend unavailable for guild {} channel {}",
+            guild_id.0,
+            channel_id.0
+        ))
+    }
+
+    async fn import_group_state(
+        &self,
+        guild_id: GuildId,
+        channel_id: ChannelId,
+        _state_blob: &[u8],
+    ) -> Result<()> {
         Err(anyhow!(
             "MLS backend unavailable for guild {} channel {}",
             guild_id.0,
@@ -2359,63 +2428,48 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
                 return Ok(());
             }
 
-            Err(err) => {
-                let msg_lower = err.to_string().to_ascii_lowercase();
+            Err(err) => match classify_decrypt_failure(&err) {
+                DecryptFailureKind::EpochDriftResync => {
+                    warn!(
+                        guild_id = guild_id.0,
+                        channel_id = message.channel_id.0,
+                        message_id = message.message_id.0,
+                        "mls: decrypt state-drift/epoch error; forcing welcome resync: {err}"
+                    );
 
-                // Case A: expected history gap for MLS (e.g. Bob joined after these messages existed).
-                // These messages are not decryptable by design; skip without surfacing an error.
-                if is_expected_historical_mls_decrypt_error(&err) {
-                    // Distinguish likely "state drift" from "pre-join historical ciphertext".
-                    let looks_transient_state_drift = msg_lower.contains("wrong epoch")
-                        || msg_lower.contains("secretreuseerror")
-                        || msg_lower.contains("requested secret was deleted")
-                        || msg_lower.contains("ciphertext generation out of bounds");
-
-                    if looks_transient_state_drift {
-                        warn!(
-                            guild_id = guild_id.0,
-                            channel_id = message.channel_id.0,
-                            message_id = message.message_id.0,
-                            "mls: decrypt state-drift/epoch error; forcing welcome resync: {err}"
-                        );
-
-                        {
-                            let mut guard = self.inner.lock().await;
-                            guard
-                                .initialized_mls_channels
-                                .remove(&(guild_id, message.channel_id));
-                            clear_inflight(&mut guard);
-                        }
-
-                        let _ = self
-                            .maybe_join_from_pending_welcome_with_retry(
-                                guild_id,
-                                message.channel_id,
-                            )
-                            .await;
-
-                        return Ok(());
+                    {
+                        let mut guard = self.inner.lock().await;
+                        guard
+                            .initialized_mls_channels
+                            .remove(&(guild_id, message.channel_id));
+                        clear_inflight(&mut guard);
                     }
 
-                    // Historical pre-join ciphertext (AEAD auth failure is common here).
-                    // This is expected and should not block history loading or spam errors.
+                    let _ = self
+                        .maybe_join_from_pending_welcome_with_retry(guild_id, message.channel_id)
+                        .await;
+
+                    return Ok(());
+                }
+                DecryptFailureKind::ExpectedHistoricalGap
+                | DecryptFailureKind::MalformedCiphertext => {
                     debug!(
                         guild_id = guild_id.0,
                         channel_id = message.channel_id.0,
                         message_id = message.message_id.0,
-                        "mls: skipping undecryptable historical message for current member: {err}"
+                        "mls: skipping undecryptable historical message: {err}"
                     );
 
                     let mut guard = self.inner.lock().await;
                     mark_processed(&mut guard);
                     return Ok(());
                 }
-
-                // Case B: truly unexpected decrypt failure.
-                let mut guard = self.inner.lock().await;
-                mark_processed(&mut guard);
-                return Err(err);
-            }
+                DecryptFailureKind::Unexpected => {
+                    let mut guard = self.inner.lock().await;
+                    mark_processed(&mut guard);
+                    return Err(err);
+                }
+            },
         };
 
         // Empty plaintext usually means commit/proposal/no-op. Count as processed.
@@ -2729,6 +2783,106 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
             .send()
             .await?
             .error_for_status()?;
+        Ok(())
+    }
+
+    pub async fn export_encrypted_channel_state_bundle(
+        &self,
+        source_device_id: i64,
+        target_device_id: i64,
+        target_device_pubkey_b64: &str,
+        channels: &[(GuildId, ChannelId)],
+    ) -> Result<EncryptedChannelStateBundleV1> {
+        let mut records = Vec::with_capacity(channels.len());
+        let mut plaintext_blobs = Vec::with_capacity(channels.len());
+
+        for (guild_id, channel_id) in channels {
+            let state_blob = self
+                .mls_session_manager
+                .export_group_state(*guild_id, *channel_id)
+                .await?;
+            let state_hash = Sha256::digest(&state_blob);
+            plaintext_blobs.push(state_blob.clone());
+            records.push(ChannelStateRecord {
+                guild_id: *guild_id,
+                channel_id: *channel_id,
+                mls_group_state_blob_b64: STANDARD.encode(&state_blob),
+                checkpoint_epoch: 0,
+                last_message_id_seen: None,
+                state_hash_b64: STANDARD.encode(state_hash),
+            });
+        }
+
+        let aad = format!(
+            "proto-rtc:channel-state-bundle:v1:{}:{}",
+            source_device_id, target_device_id
+        )
+        .into_bytes();
+        let plaintext = serde_json::to_vec(&records)?;
+
+        let target_pk_bytes = STANDARD
+            .decode(target_device_pubkey_b64)
+            .map_err(|e| anyhow!("invalid target device key: {e}"))?;
+        let target_arr: [u8; 32] = target_pk_bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow!("target device key must be 32 bytes"))?;
+        let target_pub = X25519PublicKey::from(target_arr);
+
+        let eph_seed: [u8; 32] =
+            Sha256::digest(format!("{}:{}", source_device_id, Utc::now())).into();
+        let eph_secret = StaticSecret::from(eph_seed);
+        let eph_pub = X25519PublicKey::from(&eph_secret);
+        let shared = eph_secret.diffie_hellman(&target_pub);
+        let key = Key::from_slice(shared.as_bytes());
+        let cipher = ChaCha20Poly1305::new(key);
+        let nonce_hash = Sha256::digest(format!("nonce:{}", Utc::now()));
+        let nonce = Nonce::from_slice(&nonce_hash[..12]);
+        let ciphertext = cipher
+            .encrypt(
+                nonce,
+                chacha20poly1305::aead::Payload {
+                    msg: &plaintext,
+                    aad: &aad,
+                },
+            )
+            .map_err(|e| anyhow!("bundle encryption failed: {e}"))?;
+
+        let mut sig_payload = Vec::new();
+        sig_payload.extend_from_slice(eph_pub.as_bytes());
+        sig_payload.extend_from_slice(nonce);
+        sig_payload.extend_from_slice(&ciphertext);
+        let signature = Sha256::digest(&sig_payload);
+
+        Ok(EncryptedChannelStateBundleV1 {
+            version: 1,
+            source_device_id: shared::domain::DeviceId(source_device_id),
+            target_device_id: shared::domain::DeviceId(target_device_id),
+            created_at: Utc::now(),
+            channels: records,
+            nonce_b64: STANDARD.encode(nonce),
+            ciphertext_b64: STANDARD
+                .encode([eph_pub.as_bytes().as_slice(), ciphertext.as_slice()].concat()),
+            aad_b64: STANDARD.encode(aad),
+            signature_b64: STANDARD.encode(signature),
+        })
+    }
+
+    pub async fn import_channel_state_bundle(
+        &self,
+        bundle: &EncryptedChannelStateBundleV1,
+    ) -> Result<()> {
+        for record in &bundle.channels {
+            let state_blob = STANDARD.decode(&record.mls_group_state_blob_b64)?;
+            self.mls_session_manager
+                .import_group_state(record.guild_id, record.channel_id, &state_blob)
+                .await?;
+            self.inner
+                .lock()
+                .await
+                .initialized_mls_channels
+                .insert((record.guild_id, record.channel_id));
+        }
         Ok(())
     }
 }

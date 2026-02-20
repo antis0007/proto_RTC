@@ -25,7 +25,10 @@ use serde::{Deserialize, Serialize};
 use shared::{
     domain::{ChannelId, ChannelKind, DeviceId, FileId, GuildId, UserId},
     error::{ApiError, ErrorCode},
-    protocol::{AttachmentPayload, MlsBootstrapReason, ServerEvent},
+    protocol::{
+        AttachmentPayload, DeviceLinkBundleFetchRequest, DeviceLinkBundleUploadRequest,
+        DeviceLinkStartResponse, MlsBootstrapReason, ServerEvent,
+    },
 };
 use storage::Storage;
 use tokio::sync::broadcast;
@@ -72,13 +75,18 @@ struct DeviceRegisterQuery {
 #[derive(Debug, Deserialize)]
 struct DeviceLinkStartQuery {
     user_id: i64,
-    initiator_device_id: i64,
+    target_device_id: i64,
 }
 
 #[derive(Debug, Deserialize)]
 struct DeviceLinkCompleteQuery {
     user_id: i64,
     token_id: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeviceLinkBundleFetchQuery {
+    user_id: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -273,6 +281,8 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/devices/register", post(register_device))
         .route("/devices/me", get(get_my_device))
         .route("/devices/link/start", post(start_device_link))
+        .route("/devices/link/bundle", post(upload_device_link_bundle))
+        .route("/devices/link/bundle/fetch", post(fetch_device_link_bundle))
         .route("/devices/link/complete", post(complete_device_link))
         .route("/users/:user_id/devices", get(list_user_devices))
         .route("/guilds/:guild_id/channels", get(http_list_channels))
@@ -443,14 +453,35 @@ async fn start_device_link(
     State(state): State<Arc<AppState>>,
     Query(q): Query<DeviceLinkStartQuery>,
     Json(req): Json<DeviceLinkStartRequest>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let expires_at = Utc::now() + chrono::Duration::minutes(10);
+) -> Result<Json<DeviceLinkStartResponse>, (StatusCode, Json<ApiError>)> {
+    let expires_at = Utc::now() + chrono::Duration::minutes(3);
+    let target_device = state
+        .api
+        .storage
+        .get_device(UserId(q.user_id), DeviceId(q.target_device_id))
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError::new(ErrorCode::Internal, e.to_string())),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ApiError::new(
+                    ErrorCode::NotFound,
+                    "target device not found",
+                )),
+            )
+        })?;
+
     let token_id = state
         .api
         .storage
         .create_device_link_token(
             UserId(q.user_id),
-            DeviceId(q.initiator_device_id),
+            DeviceId(q.target_device_id),
             &req.target_device_pubkey,
             expires_at,
         )
@@ -462,9 +493,175 @@ async fn start_device_link(
             )
         })?;
 
-    Ok(Json(
-        serde_json::json!({ "token_id": token_id, "expires_at": expires_at }),
-    ))
+    let token = state
+        .api
+        .storage
+        .load_device_link_token(UserId(q.user_id), token_id)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError::new(ErrorCode::Internal, e.to_string())),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError::new(
+                    ErrorCode::Internal,
+                    "link token missing after creation",
+                )),
+            )
+        })?;
+
+    let _ = target_device;
+
+    Ok(Json(DeviceLinkStartResponse {
+        token_id,
+        token_secret: token.token_secret,
+        expires_at,
+    }))
+}
+
+async fn upload_device_link_bundle(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<UserQuery>,
+    Json(req): Json<DeviceLinkBundleUploadRequest>,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    let token = state
+        .api
+        .storage
+        .load_device_link_token(UserId(q.user_id), req.token_id)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError::new(ErrorCode::Internal, e.to_string())),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ApiError::new(ErrorCode::NotFound, "link token not found")),
+            )
+        })?;
+
+    if token.token_secret != req.token_secret
+        || token.expires_at <= Utc::now()
+        || token.consumed_at.is_some()
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError::new(
+                ErrorCode::Validation,
+                "invalid or expired link token",
+            )),
+        ));
+    }
+
+    let bundle_json = serde_json::to_string(&req.bundle).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ApiError::new(
+                ErrorCode::Validation,
+                format!("invalid bundle payload: {e}"),
+            )),
+        )
+    })?;
+
+    state
+        .api
+        .storage
+        .store_device_link_bundle(
+            UserId(q.user_id),
+            req.token_id,
+            req.source_device_id,
+            req.bundle.target_device_id,
+            &bundle_json,
+        )
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError::new(ErrorCode::Internal, e.to_string())),
+            )
+        })?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn fetch_device_link_bundle(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<DeviceLinkBundleFetchQuery>,
+    Json(req): Json<DeviceLinkBundleFetchRequest>,
+) -> Result<Json<shared::protocol::EncryptedChannelStateBundleV1>, (StatusCode, Json<ApiError>)> {
+    let token = state
+        .api
+        .storage
+        .load_device_link_token(UserId(q.user_id), req.token_id)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError::new(ErrorCode::Internal, e.to_string())),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ApiError::new(ErrorCode::NotFound, "link token not found")),
+            )
+        })?;
+
+    if token.token_secret != req.token_secret || token.expires_at <= Utc::now() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError::new(
+                ErrorCode::Validation,
+                "invalid or expired link token",
+            )),
+        ));
+    }
+
+    if token.initiator_device_id != req.target_device_id {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ApiError::new(ErrorCode::Forbidden, "token/device mismatch")),
+        ));
+    }
+
+    let bundle = state
+        .api
+        .storage
+        .consume_device_link_bundle(UserId(q.user_id), req.token_id)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError::new(ErrorCode::Internal, e.to_string())),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ApiError::new(
+                    ErrorCode::NotFound,
+                    "bundle not found or already consumed",
+                )),
+            )
+        })?;
+
+    let decoded = serde_json::from_str(&bundle.bundle_json).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError::new(
+                ErrorCode::Internal,
+                format!("bundle decode failed: {e}"),
+            )),
+        )
+    })?;
+
+    Ok(Json(decoded))
 }
 
 async fn complete_device_link(

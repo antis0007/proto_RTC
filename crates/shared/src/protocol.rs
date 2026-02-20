@@ -98,6 +98,52 @@ pub struct WelcomeResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelStateRecord {
+    pub guild_id: GuildId,
+    pub channel_id: ChannelId,
+    pub mls_group_state_blob_b64: String,
+    pub checkpoint_epoch: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_message_id_seen: Option<MessageId>,
+    pub state_hash_b64: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EncryptedChannelStateBundleV1 {
+    pub version: u8,
+    pub source_device_id: DeviceId,
+    pub target_device_id: DeviceId,
+    pub created_at: DateTime<Utc>,
+    pub channels: Vec<ChannelStateRecord>,
+    pub nonce_b64: String,
+    pub ciphertext_b64: String,
+    pub aad_b64: String,
+    pub signature_b64: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviceLinkStartResponse {
+    pub token_id: i64,
+    pub token_secret: String,
+    pub expires_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviceLinkBundleUploadRequest {
+    pub token_id: i64,
+    pub token_secret: String,
+    pub source_device_id: DeviceId,
+    pub bundle: EncryptedChannelStateBundleV1,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviceLinkBundleFetchRequest {
+    pub token_id: i64,
+    pub token_secret: String,
+    pub target_device_id: DeviceId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessagePayload {
     pub message_id: MessageId,
     pub channel_id: ChannelId,
