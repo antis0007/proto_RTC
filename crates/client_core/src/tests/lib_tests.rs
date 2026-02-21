@@ -23,6 +23,7 @@ struct TestMlsSessionManager {
     decrypted_ciphertexts: Arc<Mutex<Vec<Vec<u8>>>>,
     has_persisted_group_state: bool,
     open_or_create_calls: Arc<Mutex<u32>>,
+    exported_group_state: Vec<u8>,
 }
 
 impl TestMlsSessionManager {
@@ -38,6 +39,7 @@ impl TestMlsSessionManager {
             decrypted_ciphertexts: Arc::new(Mutex::new(Vec::new())),
             has_persisted_group_state: false,
             open_or_create_calls: Arc::new(Mutex::new(0)),
+            exported_group_state: b"group-state".to_vec(),
         }
     }
 
@@ -53,6 +55,7 @@ impl TestMlsSessionManager {
             decrypted_ciphertexts: Arc::new(Mutex::new(Vec::new())),
             has_persisted_group_state: false,
             open_or_create_calls: Arc::new(Mutex::new(0)),
+            exported_group_state: Vec::new(),
         }
     }
 
@@ -201,6 +204,23 @@ impl MlsSessionManager for TestMlsSessionManager {
             return Err(anyhow!(err.clone()));
         }
         Ok(self.exported_secret.clone())
+    }
+
+    async fn export_group_state(
+        &self,
+        _guild_id: GuildId,
+        _channel_id: ChannelId,
+    ) -> Result<Vec<u8>> {
+        Ok(self.exported_group_state.clone())
+    }
+
+    async fn import_group_state(
+        &self,
+        _guild_id: GuildId,
+        _channel_id: ChannelId,
+        _state_blob: &[u8],
+    ) -> Result<()> {
+        Ok(())
     }
 }
 
