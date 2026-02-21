@@ -12,6 +12,21 @@ struct ServerState {
     tx: Arc<Mutex<Option<oneshot::Sender<SendMessageHttpRequest>>>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UploadCallRecord {
+    user_id: String,
+    guild_id: String,
+    channel_id: String,
+    filename: String,
+    mime_type: String,
+}
+
+#[derive(Clone)]
+struct MessageAndUploadServerState {
+    message_tx: Arc<Mutex<Option<oneshot::Sender<SendMessageHttpRequest>>>>,
+    upload_tx: Arc<Mutex<Option<oneshot::Sender<UploadCallRecord>>>>,
+}
+
 struct TestMlsSessionManager {
     encrypt_ciphertext: Vec<u8>,
     decrypt_plaintext: Vec<u8>,
@@ -239,6 +254,49 @@ async fn handle_send_message(
     }
 }
 
+#[derive(Deserialize)]
+struct UploadQuery {
+    user_id: String,
+    guild_id: String,
+    channel_id: String,
+    filename: String,
+    mime_type: String,
+}
+
+#[derive(Serialize)]
+struct UploadResponse {
+    file_id: i64,
+    size_bytes: usize,
+}
+
+async fn handle_send_message_with_upload_state(
+    State(state): State<MessageAndUploadServerState>,
+    Json(payload): Json<SendMessageHttpRequest>,
+) {
+    if let Some(tx) = state.message_tx.lock().await.take() {
+        let _ = tx.send(payload);
+    }
+}
+
+async fn handle_upload(
+    State(state): State<MessageAndUploadServerState>,
+    Query(q): Query<UploadQuery>,
+) -> Json<UploadResponse> {
+    if let Some(tx) = state.upload_tx.lock().await.take() {
+        let _ = tx.send(UploadCallRecord {
+            user_id: q.user_id,
+            guild_id: q.guild_id,
+            channel_id: q.channel_id,
+            filename: q.filename,
+            mime_type: q.mime_type,
+        });
+    }
+    Json(UploadResponse {
+        file_id: 77,
+        size_bytes: 20,
+    })
+}
+
 async fn spawn_message_server() -> Result<(String, oneshot::Receiver<SendMessageHttpRequest>)> {
     std::env::set_var("NO_PROXY", "127.0.0.1,localhost");
     let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -254,6 +312,34 @@ async fn spawn_message_server() -> Result<(String, oneshot::Receiver<SendMessage
         let _ = axum::serve(listener, app).await;
     });
     Ok((format!("http://{addr}"), rx))
+}
+
+async fn spawn_message_and_upload_server() -> Result<(
+    String,
+    oneshot::Receiver<SendMessageHttpRequest>,
+    oneshot::Receiver<UploadCallRecord>,
+)> {
+    std::env::set_var("NO_PROXY", "127.0.0.1,localhost");
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+
+    let (message_tx, message_rx) = oneshot::channel();
+    let (upload_tx, upload_rx) = oneshot::channel();
+    let state = MessageAndUploadServerState {
+        message_tx: Arc::new(Mutex::new(Some(message_tx))),
+        upload_tx: Arc::new(Mutex::new(Some(upload_tx))),
+    };
+
+    let app = Router::new()
+        .route("/messages", post(handle_send_message_with_upload_state))
+        .route("/files/upload", post(handle_upload))
+        .with_state(state);
+
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    Ok((format!("http://{addr}"), message_rx, upload_rx))
 }
 
 #[tokio::test]
@@ -349,6 +435,62 @@ async fn send_message_restores_persisted_mls_state_automatically() {
         payload.ciphertext_b64,
         STANDARD.encode("mls-ciphertext".as_bytes())
     );
+}
+
+#[tokio::test]
+async fn send_message_with_attachment_uploads_then_posts_message_with_attachment_payload() {
+    let (server_url, message_rx, upload_rx) = spawn_message_and_upload_server()
+        .await
+        .expect("spawn server");
+    let client = RealtimeClient::new_with_mls_session_manager(
+        PassthroughCrypto,
+        Arc::new(TestMlsSessionManager::ok(
+            b"mls-ciphertext-with-attachment".to_vec(),
+            Vec::new(),
+        )),
+    );
+
+    {
+        let mut inner = client.inner.lock().await;
+        inner.server_url = Some(server_url);
+        inner.user_id = Some(7);
+        inner.device_id = Some(1);
+        inner.selected_guild = Some(GuildId(11));
+        inner.selected_channel = Some(ChannelId(13));
+        inner
+            .initialized_mls_channels
+            .insert((GuildId(11), ChannelId(13)));
+    }
+
+    client
+        .send_message_with_attachment(
+            "caption",
+            AttachmentUpload {
+                filename: "example.txt".to_string(),
+                mime_type: Some("text/plain".to_string()),
+                ciphertext: b"encrypted-file-bytes".to_vec(),
+            },
+        )
+        .await
+        .expect("send with attachment");
+
+    let upload = upload_rx.await.expect("upload payload");
+    assert_eq!(upload.user_id, "7");
+    assert_eq!(upload.guild_id, "11");
+    assert_eq!(upload.channel_id, "13");
+    assert_eq!(upload.filename, "example.txt");
+    assert_eq!(upload.mime_type, "text/plain");
+
+    let message = message_rx.await.expect("message payload");
+    assert_eq!(
+        message.ciphertext_b64,
+        STANDARD.encode("mls-ciphertext-with-attachment".as_bytes())
+    );
+    let attachment = message.attachment.expect("attachment in message payload");
+    assert_eq!(attachment.file_id, FileId(77));
+    assert_eq!(attachment.filename, "example.txt");
+    assert_eq!(attachment.size_bytes, 20);
+    assert_eq!(attachment.mime_type.as_deref(), Some("text/plain"));
 }
 
 fn sample_message() -> MessagePayload {
@@ -493,6 +635,53 @@ async fn suppresses_non_application_messages_after_decrypt() {
 }
 
 #[tokio::test]
+async fn emits_attachment_only_message_when_plaintext_is_empty() {
+    let client = RealtimeClient::new_with_mls_session_manager(
+        PassthroughCrypto,
+        Arc::new(TestMlsSessionManager::ok(Vec::new(), Vec::new())),
+    );
+    {
+        let mut inner = client.inner.lock().await;
+        inner.user_id = Some(99);
+        inner.device_id = Some(1);
+        inner.channel_guilds.insert(ChannelId(3), GuildId(11));
+        inner
+            .initialized_mls_channels
+            .insert((GuildId(11), ChannelId(3)));
+    }
+
+    let mut message = sample_message();
+    message.attachment = Some(AttachmentPayload {
+        file_id: FileId(77),
+        filename: "example.txt".to_string(),
+        size_bytes: 20,
+        mime_type: Some("text/plain".to_string()),
+    });
+
+    let mut rx = client.subscribe_events();
+    client
+        .emit_decrypted_message(&message)
+        .await
+        .expect("attachment-only message should emit");
+
+    let event = rx.recv().await.expect("message event");
+    match event {
+        ClientEvent::MessageDecrypted {
+            message: emitted,
+            plaintext,
+        } => {
+            let attachment = emitted.attachment.expect("attachment payload");
+            assert_eq!(attachment.file_id, FileId(77));
+            assert_eq!(attachment.filename, "example.txt");
+            assert_eq!(attachment.size_bytes, 20);
+            assert_eq!(attachment.mime_type.as_deref(), Some("text/plain"));
+            assert_eq!(plaintext, "");
+        }
+        other => panic!("unexpected event: {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn emit_decrypted_message_skips_when_uninitialized_and_no_welcome() {
     let manager = TestMlsSessionManager::ok(Vec::new(), b"hello".to_vec());
     let decrypt_inputs = manager.decrypted_ciphertexts.clone();
@@ -604,6 +793,7 @@ struct OnboardingServerState {
     welcome_fetches: Arc<Mutex<u32>>,
     welcome_ready_after_fetches: Arc<Mutex<u32>>,
     add_member_posts: Arc<Mutex<Vec<(i64, i64, i64)>>>,
+    welcome_target_devices: Arc<Mutex<Vec<Option<i64>>>>,
     stored_ciphertexts: Arc<Mutex<Vec<String>>>,
     include_target_member: Arc<Mutex<bool>>,
     fail_member_fetch: Arc<Mutex<bool>>,
@@ -654,7 +844,7 @@ async fn onboarding_fetch_key_package(
         key_package_id: 1,
         guild_id: 11,
         user_id: requested_user_id,
-        device_id: None,
+        device_id: Some(shared::domain::DeviceId(42)),
         key_package_b64: STANDARD.encode(if requested_user_id == 42 {
             b"target-kp".as_slice()
         } else {
@@ -669,6 +859,7 @@ struct StoreWelcomeQuery {
     guild_id: i64,
     channel_id: i64,
     target_user_id: i64,
+    target_device_id: Option<i64>,
 }
 
 async fn onboarding_store_welcome(
@@ -681,6 +872,11 @@ async fn onboarding_store_welcome(
         .lock()
         .await
         .push((q.guild_id, q.channel_id, q.target_user_id));
+    state
+        .welcome_target_devices
+        .lock()
+        .await
+        .push(q.target_device_id);
     if q.user_id == 7 {
         let encoded = STANDARD.encode(body);
         *state.pending_welcome_b64.lock().await = Some(encoded);
@@ -787,6 +983,7 @@ async fn spawn_onboarding_server() -> Result<(String, OnboardingServerState)> {
         welcome_fetches: Arc::new(Mutex::new(0)),
         welcome_ready_after_fetches: Arc::new(Mutex::new(0)),
         add_member_posts: Arc::new(Mutex::new(Vec::new())),
+        welcome_target_devices: Arc::new(Mutex::new(Vec::new())),
         stored_ciphertexts: Arc::new(Mutex::new(Vec::new())),
         include_target_member: Arc::new(Mutex::new(true)),
         fail_member_fetch: Arc::new(Mutex::new(false)),
@@ -846,10 +1043,15 @@ async fn added_member_retrieves_pending_welcome_and_auto_joins() {
         .expect("adder select");
 
     let posts = server_state.add_member_posts.lock().await.clone();
+    let target_devices = server_state.welcome_target_devices.lock().await.clone();
     let bootstrap_requests = server_state.bootstrap_requests.lock().await.clone();
     assert!(
         posts.is_empty() || posts == vec![(11, 13, 42)],
         "unexpected welcome store records: {posts:?}"
+    );
+    assert!(
+        target_devices.is_empty() || target_devices == vec![Some(42)],
+        "unexpected welcome target device records: {target_devices:?}"
     );
     assert!(
         bootstrap_requests.is_empty()
@@ -1181,10 +1383,15 @@ async fn moderator_retries_member_bootstrap_after_new_member_joins() {
         .expect("send triggers add-member retry");
 
     let posts = server_state.add_member_posts.lock().await.clone();
+    let target_devices = server_state.welcome_target_devices.lock().await.clone();
     let bootstrap_requests = server_state.bootstrap_requests.lock().await.clone();
     assert!(
         posts.is_empty() || posts == vec![(11, 13, 42)],
         "unexpected welcome store records: {posts:?}"
+    );
+    assert!(
+        target_devices.is_empty() || target_devices == vec![Some(42)],
+        "unexpected welcome target device records: {target_devices:?}"
     );
     assert!(
         bootstrap_requests.is_empty()
@@ -1271,7 +1478,13 @@ async fn missing_welcome_bootstrap_targets_requester_and_forces_retry_for_that_m
     }
 
     let bootstrapped = leader
-        .maybe_bootstrap_existing_members_if_leader(GuildId(11), ChannelId(13), 7, Some(42))
+        .maybe_bootstrap_existing_members_if_leader(
+            GuildId(11),
+            ChannelId(13),
+            7,
+            Some(42),
+            Some(42),
+        )
         .await
         .expect("leader bootstrap call succeeds");
     assert!(bootstrapped);

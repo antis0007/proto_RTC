@@ -424,12 +424,8 @@ impl<S: MlsStore> MlsGroupHandle<S> {
             Ok(p) => p,
             Err(e) => {
                 let s = e.to_string();
-                // Replay / stale epoch / FS-pruned secrets should be a no-op in chat history paths.
-                if s.contains("Wrong Epoch")
-                    || s.contains("Message epoch differs from the group's epoch")
-                    || s.contains("SecretReuseError")
-                    || s.contains("requested secret was deleted")
-                {
+                // Replay / FS-pruned secrets can happen in history fetch paths and are safe to skip.
+                if s.contains("SecretReuseError") || s.contains("requested secret was deleted") {
                     return Ok(Vec::new());
                 }
                 return Err(anyhow!("failed to process MLS message: {e}"));
@@ -816,6 +812,83 @@ mod tests {
             .expect("decrypt app message");
 
         assert_eq!(plaintext, b"hello bob");
+    }
+
+    #[tokio::test]
+    async fn decrypt_application_returns_error_when_commit_epoch_is_missing() {
+        let guild_id = GuildId(1);
+        let channel_id = ChannelId(99);
+
+        let store = MemoryStore::default();
+
+        let mut alice = MlsGroupHandle::new(
+            store.clone(),
+            1,
+            "device-alice",
+            guild_id,
+            channel_id,
+            MlsIdentity::new_with_name(b"alice".to_vec()).expect("alice identity"),
+        )
+        .await
+        .expect("alice handle");
+        alice
+            .create_group(channel_id)
+            .await
+            .expect("create alice group");
+
+        let mut bob = MlsGroupHandle::new(
+            store.clone(),
+            2,
+            "device-bob",
+            guild_id,
+            channel_id,
+            MlsIdentity::new_with_name(b"bob".to_vec()).expect("bob identity"),
+        )
+        .await
+        .expect("bob handle");
+
+        let bob_kp = bob.key_package_bytes().await.expect("bob key package");
+        let (_commit_ab, welcome_ab) = alice.add_member(&bob_kp).await.expect("add bob");
+        bob.join_group_from_welcome(&welcome_ab.expect("welcome bob"))
+            .await
+            .expect("bob joins");
+
+        let mut charlie = MlsGroupHandle::new(
+            store.clone(),
+            3,
+            "device-charlie",
+            guild_id,
+            channel_id,
+            MlsIdentity::new_with_name(b"charlie".to_vec()).expect("charlie identity"),
+        )
+        .await
+        .expect("charlie handle");
+        let charlie_kp = charlie
+            .key_package_bytes()
+            .await
+            .expect("charlie key package");
+
+        let (_commit_ac, _welcome_ac) = alice
+            .add_member(&charlie_kp)
+            .await
+            .expect("add charlie and advance epoch");
+
+        // Bob never processes Alice's commit that advanced the epoch.
+        let ct = alice
+            .encrypt_application(b"hello after epoch advance")
+            .expect("alice encrypt");
+        let err = bob
+            .decrypt_application(&ct)
+            .await
+            .expect_err("bob should fail when missing commit epoch");
+
+        assert!(
+            err.to_string().contains("Wrong Epoch")
+                || err
+                    .to_string()
+                    .contains("Message epoch differs from the group's epoch"),
+            "unexpected error: {err:#}"
+        );
     }
 
     #[tokio::test]
