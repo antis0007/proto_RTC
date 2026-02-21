@@ -2548,8 +2548,17 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
             },
         };
 
-        // Empty plaintext usually means commit/proposal/no-op. Count as processed.
+        // Empty plaintext usually means commit/proposal/no-op. However, attachment-only
+        // chat messages intentionally carry empty text and must still be emitted.
         if plaintext_bytes.is_empty() {
+            if message.attachment.is_some() {
+                let _ = self.events.send(ClientEvent::MessageDecrypted {
+                    message: message.clone(),
+                    plaintext: String::new(),
+                });
+                self.mark_message_processed(msg_key).await;
+                return Ok(());
+            }
             self.mark_message_processed(msg_key).await;
             return Ok(());
         }

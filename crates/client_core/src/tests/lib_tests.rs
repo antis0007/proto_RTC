@@ -635,6 +635,53 @@ async fn suppresses_non_application_messages_after_decrypt() {
 }
 
 #[tokio::test]
+async fn emits_attachment_only_message_when_plaintext_is_empty() {
+    let client = RealtimeClient::new_with_mls_session_manager(
+        PassthroughCrypto,
+        Arc::new(TestMlsSessionManager::ok(Vec::new(), Vec::new())),
+    );
+    {
+        let mut inner = client.inner.lock().await;
+        inner.user_id = Some(99);
+        inner.device_id = Some(1);
+        inner.channel_guilds.insert(ChannelId(3), GuildId(11));
+        inner
+            .initialized_mls_channels
+            .insert((GuildId(11), ChannelId(3)));
+    }
+
+    let mut message = sample_message();
+    message.attachment = Some(AttachmentPayload {
+        file_id: FileId(77),
+        filename: "example.txt".to_string(),
+        size_bytes: 20,
+        mime_type: Some("text/plain".to_string()),
+    });
+
+    let mut rx = client.subscribe_events();
+    client
+        .emit_decrypted_message(&message)
+        .await
+        .expect("attachment-only message should emit");
+
+    let event = rx.recv().await.expect("message event");
+    match event {
+        ClientEvent::MessageDecrypted {
+            message: emitted,
+            plaintext,
+        } => {
+            let attachment = emitted.attachment.expect("attachment payload");
+            assert_eq!(attachment.file_id, FileId(77));
+            assert_eq!(attachment.filename, "example.txt");
+            assert_eq!(attachment.size_bytes, 20);
+            assert_eq!(attachment.mime_type.as_deref(), Some("text/plain"));
+            assert_eq!(plaintext, "");
+        }
+        other => panic!("unexpected event: {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn emit_decrypted_message_skips_when_uninitialized_and_no_welcome() {
     let manager = TestMlsSessionManager::ok(Vec::new(), b"hello".to_vec());
     let decrypt_inputs = manager.decrypted_ciphertexts.clone();
