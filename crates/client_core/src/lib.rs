@@ -237,17 +237,35 @@ pub trait MlsSessionManager: Send + Sync {
     ) -> Result<Vec<u8>>;
     async fn reset_channel_group_state(
         &self,
+        _guild_id: GuildId,
+        _channel_id: ChannelId,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+    async fn export_group_state(
+        &self,
         guild_id: GuildId,
         channel_id: ChannelId,
-    ) -> Result<bool>;
-    async fn export_group_state(&self, guild_id: GuildId, channel_id: ChannelId)
-        -> Result<Vec<u8>>;
+    ) -> Result<Vec<u8>> {
+        Err(anyhow!(
+            "MLS group export unavailable for guild {} channel {}",
+            guild_id.0,
+            channel_id.0
+        ))
+    }
     async fn import_group_state(
         &self,
         guild_id: GuildId,
         channel_id: ChannelId,
         state_blob: &[u8],
-    ) -> Result<()>;
+    ) -> Result<()> {
+        let _ = state_blob;
+        Err(anyhow!(
+            "MLS group import unavailable for guild {} channel {}",
+            guild_id.0,
+            channel_id.0
+        ))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2278,6 +2296,36 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
         Ok((server_url, user_id, guild_id, channel_id))
     }
 
+    async fn clear_inflight_message(&self, msg_key: (ChannelId, MessageId)) {
+        self.inner
+            .lock()
+            .await
+            .inflight_inbound_message_ids
+            .remove(&msg_key);
+    }
+
+    fn mark_message_processed_in_state(
+        state: &mut RealtimeClientState,
+        msg_key: (ChannelId, MessageId),
+    ) {
+        state.inflight_inbound_message_ids.remove(&msg_key);
+
+        if state.processed_inbound_message_ids.insert(msg_key) {
+            state.processed_inbound_message_order.push_back(msg_key);
+
+            while state.processed_inbound_message_order.len() > PROCESSED_MESSAGE_CACHE_MAX {
+                if let Some(old) = state.processed_inbound_message_order.pop_front() {
+                    state.processed_inbound_message_ids.remove(&old);
+                }
+            }
+        }
+    }
+
+    async fn mark_message_processed(&self, msg_key: (ChannelId, MessageId)) {
+        let mut guard = self.inner.lock().await;
+        Self::mark_message_processed_in_state(&mut guard, msg_key);
+    }
+
     async fn emit_decrypted_message(&self, message: &MessagePayload) -> Result<()> {
         let msg_key = (message.channel_id, message.message_id);
 
@@ -2333,24 +2381,6 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
             }
         };
 
-        let mark_processed = |state: &mut RealtimeClientState| {
-            state.inflight_inbound_message_ids.remove(&msg_key);
-
-            if state.processed_inbound_message_ids.insert(msg_key) {
-                state.processed_inbound_message_order.push_back(msg_key);
-
-                while state.processed_inbound_message_order.len() > PROCESSED_MESSAGE_CACHE_MAX {
-                    if let Some(old) = state.processed_inbound_message_order.pop_front() {
-                        state.processed_inbound_message_ids.remove(&old);
-                    }
-                }
-            }
-        };
-
-        let clear_inflight = |state: &mut RealtimeClientState| {
-            state.inflight_inbound_message_ids.remove(&msg_key);
-        };
-
         // Self-sent messages: emit cached plaintext and mark processed.
         if message.sender_id.0 == user_id {
             if let Some(plaintext) = pending_plaintext {
@@ -2359,9 +2389,7 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
                     plaintext,
                 });
             }
-
-            let mut guard = self.inner.lock().await;
-            mark_processed(&mut guard);
+            self.mark_message_processed(msg_key).await;
             return Ok(());
         }
 
@@ -2379,8 +2407,7 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
                 .await
             {
                 // Not ready yet: allow a future retry.
-                let mut guard = self.inner.lock().await;
-                clear_inflight(&mut guard);
+                self.clear_inflight_message(msg_key).await;
                 return Ok(());
             }
         }
@@ -2389,8 +2416,7 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
             Ok(c) => c,
             Err(e) => {
                 // Bad payload is permanent: mark processed to avoid infinite loops.
-                let mut guard = self.inner.lock().await;
-                mark_processed(&mut guard);
+                self.mark_message_processed(msg_key).await;
 
                 return Err(anyhow!(
                     "invalid base64 ciphertext for message {}: {}",
@@ -2420,7 +2446,7 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
                     guard
                         .initialized_mls_channels
                         .remove(&(guild_id, message.channel_id));
-                    clear_inflight(&mut guard);
+                    guard.inflight_inbound_message_ids.remove(&msg_key);
                 }
 
                 self.force_mls_resync_for_channel(guild_id, message.channel_id)
@@ -2442,7 +2468,7 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
                         guard
                             .initialized_mls_channels
                             .remove(&(guild_id, message.channel_id));
-                        clear_inflight(&mut guard);
+                        guard.inflight_inbound_message_ids.remove(&msg_key);
                     }
 
                     let _ = self
@@ -2460,13 +2486,11 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
                         "mls: skipping undecryptable historical message: {err}"
                     );
 
-                    let mut guard = self.inner.lock().await;
-                    mark_processed(&mut guard);
+                    self.mark_message_processed(msg_key).await;
                     return Ok(());
                 }
                 DecryptFailureKind::Unexpected => {
-                    let mut guard = self.inner.lock().await;
-                    mark_processed(&mut guard);
+                    self.mark_message_processed(msg_key).await;
                     return Err(err);
                 }
             },
@@ -2474,8 +2498,7 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
 
         // Empty plaintext usually means commit/proposal/no-op. Count as processed.
         if plaintext_bytes.is_empty() {
-            let mut guard = self.inner.lock().await;
-            mark_processed(&mut guard);
+            self.mark_message_processed(msg_key).await;
             return Ok(());
         }
 
@@ -2485,8 +2508,7 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
             plaintext,
         });
 
-        let mut guard = self.inner.lock().await;
-        mark_processed(&mut guard);
+        self.mark_message_processed(msg_key).await;
 
         Ok(())
     }
