@@ -604,6 +604,7 @@ struct OnboardingServerState {
     welcome_fetches: Arc<Mutex<u32>>,
     welcome_ready_after_fetches: Arc<Mutex<u32>>,
     add_member_posts: Arc<Mutex<Vec<(i64, i64, i64)>>>,
+    welcome_target_devices: Arc<Mutex<Vec<Option<i64>>>>,
     stored_ciphertexts: Arc<Mutex<Vec<String>>>,
     include_target_member: Arc<Mutex<bool>>,
     fail_member_fetch: Arc<Mutex<bool>>,
@@ -654,7 +655,7 @@ async fn onboarding_fetch_key_package(
         key_package_id: 1,
         guild_id: 11,
         user_id: requested_user_id,
-        device_id: None,
+        device_id: Some(shared::domain::DeviceId(42)),
         key_package_b64: STANDARD.encode(if requested_user_id == 42 {
             b"target-kp".as_slice()
         } else {
@@ -669,6 +670,7 @@ struct StoreWelcomeQuery {
     guild_id: i64,
     channel_id: i64,
     target_user_id: i64,
+    target_device_id: Option<i64>,
 }
 
 async fn onboarding_store_welcome(
@@ -681,6 +683,11 @@ async fn onboarding_store_welcome(
         .lock()
         .await
         .push((q.guild_id, q.channel_id, q.target_user_id));
+    state
+        .welcome_target_devices
+        .lock()
+        .await
+        .push(q.target_device_id);
     if q.user_id == 7 {
         let encoded = STANDARD.encode(body);
         *state.pending_welcome_b64.lock().await = Some(encoded);
@@ -787,6 +794,7 @@ async fn spawn_onboarding_server() -> Result<(String, OnboardingServerState)> {
         welcome_fetches: Arc::new(Mutex::new(0)),
         welcome_ready_after_fetches: Arc::new(Mutex::new(0)),
         add_member_posts: Arc::new(Mutex::new(Vec::new())),
+        welcome_target_devices: Arc::new(Mutex::new(Vec::new())),
         stored_ciphertexts: Arc::new(Mutex::new(Vec::new())),
         include_target_member: Arc::new(Mutex::new(true)),
         fail_member_fetch: Arc::new(Mutex::new(false)),
@@ -846,10 +854,15 @@ async fn added_member_retrieves_pending_welcome_and_auto_joins() {
         .expect("adder select");
 
     let posts = server_state.add_member_posts.lock().await.clone();
+    let target_devices = server_state.welcome_target_devices.lock().await.clone();
     let bootstrap_requests = server_state.bootstrap_requests.lock().await.clone();
     assert!(
         posts.is_empty() || posts == vec![(11, 13, 42)],
         "unexpected welcome store records: {posts:?}"
+    );
+    assert!(
+        target_devices.is_empty() || target_devices == vec![Some(42)],
+        "unexpected welcome target device records: {target_devices:?}"
     );
     assert!(
         bootstrap_requests.is_empty()
@@ -1181,10 +1194,15 @@ async fn moderator_retries_member_bootstrap_after_new_member_joins() {
         .expect("send triggers add-member retry");
 
     let posts = server_state.add_member_posts.lock().await.clone();
+    let target_devices = server_state.welcome_target_devices.lock().await.clone();
     let bootstrap_requests = server_state.bootstrap_requests.lock().await.clone();
     assert!(
         posts.is_empty() || posts == vec![(11, 13, 42)],
         "unexpected welcome store records: {posts:?}"
+    );
+    assert!(
+        target_devices.is_empty() || target_devices == vec![Some(42)],
+        "unexpected welcome target device records: {target_devices:?}"
     );
     assert!(
         bootstrap_requests.is_empty()

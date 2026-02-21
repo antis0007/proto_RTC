@@ -1281,7 +1281,11 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
         Ok(response.key_package_id)
     }
 
-    pub async fn fetch_key_package(&self, user_id: i64, guild_id: GuildId) -> Result<Vec<u8>> {
+    pub async fn fetch_key_package(
+        &self,
+        user_id: i64,
+        guild_id: GuildId,
+    ) -> Result<(Vec<u8>, Option<i64>)> {
         let (server_url, current_user_id, _current_device_id) = self.session().await?;
         let response: KeyPackageResponse = self
             .http
@@ -1301,9 +1305,10 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
             return Err(anyhow!("server returned mismatched key package metadata"));
         }
 
-        STANDARD
+        let key_package_bytes = STANDARD
             .decode(response.key_package_b64)
-            .map_err(|e| anyhow!("invalid key package payload from server: {e}"))
+            .map_err(|e| anyhow!("invalid key package payload from server: {e}"))?;
+        Ok((key_package_bytes, response.device_id.map(|id| id.0)))
     }
 
     fn guild_id_from_invite(invite_code: &str) -> Option<GuildId> {
@@ -1351,9 +1356,10 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
         guild_id: GuildId,
         channel_id: ChannelId,
         target_user_id: i64,
+        target_device_id: Option<i64>,
         welcome_bytes: &[u8],
     ) -> Result<()> {
-        let (server_url, current_user_id, device_id) = self.session().await?;
+        let (server_url, current_user_id, _device_id) = self.session().await?;
         info!(
             guild_id = guild_id.0,
             channel_id = channel_id.0,
@@ -1361,15 +1367,16 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
             actor_user_id = current_user_id,
             "mls: storing pending welcome"
         );
-        self.http
-            .post(format!("{server_url}/mls/welcome"))
-            .query(&[
-                ("user_id", current_user_id),
-                ("guild_id", guild_id.0),
-                ("channel_id", channel_id.0),
-                ("target_user_id", target_user_id),
-                ("target_device_id", device_id),
-            ])
+        let mut request = self.http.post(format!("{server_url}/mls/welcome")).query(&[
+            ("user_id", current_user_id),
+            ("guild_id", guild_id.0),
+            ("channel_id", channel_id.0),
+            ("target_user_id", target_user_id),
+        ]);
+        if let Some(target_device_id) = target_device_id {
+            request = request.query(&[("target_device_id", target_device_id)]);
+        }
+        request
             .body(welcome_bytes.to_vec())
             .send()
             .await?
@@ -1388,9 +1395,10 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
         guild_id: GuildId,
         channel_id: ChannelId,
         target_user_id: i64,
+        target_device_id: Option<i64>,
     ) -> Result<()> {
-        let (server_url, current_user_id, device_id) = self.session().await?;
-        let response = self
+        let (server_url, current_user_id, _device_id) = self.session().await?;
+        let mut request = self
             .http
             .post(format!("{server_url}/mls/welcome/recovery"))
             .query(&[
@@ -1398,10 +1406,11 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
                 ("guild_id", guild_id.0),
                 ("channel_id", channel_id.0),
                 ("target_user_id", target_user_id),
-                ("target_device_id", device_id),
-            ])
-            .send()
-            .await?;
+            ]);
+        if let Some(target_device_id) = target_device_id {
+            request = request.query(&[("target_device_id", target_device_id)]);
+        }
+        let response = request.send().await?;
 
         let status = response.status();
         if status.is_success() {
@@ -1984,8 +1993,11 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
                 continue;
             }
 
-            let key_package_bytes = match self.fetch_key_package(member.user_id.0, guild_id).await {
-                Ok(bytes) => bytes,
+            let (key_package_bytes, target_key_package_device_id) = match self
+                .fetch_key_package(member.user_id.0, guild_id)
+                .await
+            {
+                Ok(result) => result,
                 Err(err) => {
                     if target_user_id.is_some_and(|target| target == member.user_id.0) {
                         let mut recovered_key_package = None;
@@ -1994,8 +2006,8 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
                                 welcome_retry_delay_with_jitter(attempt, guild_id, channel_id);
                             tokio::time::sleep(delay).await;
                             match self.fetch_key_package(member.user_id.0, guild_id).await {
-                                Ok(bytes) => {
-                                    recovered_key_package = Some(bytes);
+                                Ok(result) => {
+                                    recovered_key_package = Some(result);
                                     break;
                                 }
                                 Err(retry_err) => {
@@ -2010,8 +2022,8 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
                                 }
                             }
                         }
-                        if let Some(bytes) = recovered_key_package {
-                            bytes
+                        if let Some(result) = recovered_key_package {
+                            result
                         } else {
                             let wrapped_err = anyhow!(
                                 "targeted key package fetch failed after retries for user {}",
@@ -2082,7 +2094,12 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
                     "mls: target already in MLS roster; requesting recovery welcome"
                 );
                 if let Err(err) = self
-                    .request_recovery_welcome(guild_id, channel_id, member.user_id.0)
+                    .request_recovery_welcome(
+                        guild_id,
+                        channel_id,
+                        member.user_id.0,
+                        target_key_package_device_id,
+                    )
                     .await
                 {
                     warn!(
@@ -2127,7 +2144,12 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
                             "mls: add_member duplicate detected; requesting recovery welcome"
                         );
                         if let Err(recovery_err) = self
-                            .request_recovery_welcome(guild_id, channel_id, member.user_id.0)
+                            .request_recovery_welcome(
+                                guild_id,
+                                channel_id,
+                                member.user_id.0,
+                                target_key_package_device_id,
+                            )
                             .await
                         {
                             warn!(
@@ -2190,6 +2212,7 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
                     guild_id,
                     channel_id,
                     member.user_id.0,
+                    target_key_package_device_id,
                     &add_member_outcome.welcome_bytes,
                 )
                 .await
