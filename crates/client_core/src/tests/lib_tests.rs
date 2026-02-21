@@ -211,6 +211,9 @@ impl MlsSessionManager for TestMlsSessionManager {
         _guild_id: GuildId,
         _channel_id: ChannelId,
     ) -> Result<Vec<u8>> {
+        if let Some(err) = &self.fail_with {
+            return Err(anyhow!(err.clone()));
+        }
         Ok(self.exported_group_state.clone())
     }
 
@@ -220,6 +223,9 @@ impl MlsSessionManager for TestMlsSessionManager {
         _channel_id: ChannelId,
         _state_blob: &[u8],
     ) -> Result<()> {
+        if let Some(err) = &self.fail_with {
+            return Err(anyhow!(err.clone()));
+        }
         Ok(())
     }
 }
