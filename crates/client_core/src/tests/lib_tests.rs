@@ -12,6 +12,21 @@ struct ServerState {
     tx: Arc<Mutex<Option<oneshot::Sender<SendMessageHttpRequest>>>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UploadCallRecord {
+    user_id: String,
+    guild_id: String,
+    channel_id: String,
+    filename: String,
+    mime_type: String,
+}
+
+#[derive(Clone)]
+struct MessageAndUploadServerState {
+    message_tx: Arc<Mutex<Option<oneshot::Sender<SendMessageHttpRequest>>>>,
+    upload_tx: Arc<Mutex<Option<oneshot::Sender<UploadCallRecord>>>>,
+}
+
 struct TestMlsSessionManager {
     encrypt_ciphertext: Vec<u8>,
     decrypt_plaintext: Vec<u8>,
@@ -239,6 +254,49 @@ async fn handle_send_message(
     }
 }
 
+#[derive(Deserialize)]
+struct UploadQuery {
+    user_id: String,
+    guild_id: String,
+    channel_id: String,
+    filename: String,
+    mime_type: String,
+}
+
+#[derive(Serialize)]
+struct UploadResponse {
+    file_id: i64,
+    size_bytes: usize,
+}
+
+async fn handle_send_message_with_upload_state(
+    State(state): State<MessageAndUploadServerState>,
+    Json(payload): Json<SendMessageHttpRequest>,
+) {
+    if let Some(tx) = state.message_tx.lock().await.take() {
+        let _ = tx.send(payload);
+    }
+}
+
+async fn handle_upload(
+    State(state): State<MessageAndUploadServerState>,
+    Query(q): Query<UploadQuery>,
+) -> Json<UploadResponse> {
+    if let Some(tx) = state.upload_tx.lock().await.take() {
+        let _ = tx.send(UploadCallRecord {
+            user_id: q.user_id,
+            guild_id: q.guild_id,
+            channel_id: q.channel_id,
+            filename: q.filename,
+            mime_type: q.mime_type,
+        });
+    }
+    Json(UploadResponse {
+        file_id: 77,
+        size_bytes: 20,
+    })
+}
+
 async fn spawn_message_server() -> Result<(String, oneshot::Receiver<SendMessageHttpRequest>)> {
     std::env::set_var("NO_PROXY", "127.0.0.1,localhost");
     let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -254,6 +312,34 @@ async fn spawn_message_server() -> Result<(String, oneshot::Receiver<SendMessage
         let _ = axum::serve(listener, app).await;
     });
     Ok((format!("http://{addr}"), rx))
+}
+
+async fn spawn_message_and_upload_server() -> Result<(
+    String,
+    oneshot::Receiver<SendMessageHttpRequest>,
+    oneshot::Receiver<UploadCallRecord>,
+)> {
+    std::env::set_var("NO_PROXY", "127.0.0.1,localhost");
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+
+    let (message_tx, message_rx) = oneshot::channel();
+    let (upload_tx, upload_rx) = oneshot::channel();
+    let state = MessageAndUploadServerState {
+        message_tx: Arc::new(Mutex::new(Some(message_tx))),
+        upload_tx: Arc::new(Mutex::new(Some(upload_tx))),
+    };
+
+    let app = Router::new()
+        .route("/messages", post(handle_send_message_with_upload_state))
+        .route("/files/upload", post(handle_upload))
+        .with_state(state);
+
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    Ok((format!("http://{addr}"), message_rx, upload_rx))
 }
 
 #[tokio::test]
@@ -349,6 +435,62 @@ async fn send_message_restores_persisted_mls_state_automatically() {
         payload.ciphertext_b64,
         STANDARD.encode("mls-ciphertext".as_bytes())
     );
+}
+
+#[tokio::test]
+async fn send_message_with_attachment_uploads_then_posts_message_with_attachment_payload() {
+    let (server_url, message_rx, upload_rx) = spawn_message_and_upload_server()
+        .await
+        .expect("spawn server");
+    let client = RealtimeClient::new_with_mls_session_manager(
+        PassthroughCrypto,
+        Arc::new(TestMlsSessionManager::ok(
+            b"mls-ciphertext-with-attachment".to_vec(),
+            Vec::new(),
+        )),
+    );
+
+    {
+        let mut inner = client.inner.lock().await;
+        inner.server_url = Some(server_url);
+        inner.user_id = Some(7);
+        inner.device_id = Some(1);
+        inner.selected_guild = Some(GuildId(11));
+        inner.selected_channel = Some(ChannelId(13));
+        inner
+            .initialized_mls_channels
+            .insert((GuildId(11), ChannelId(13)));
+    }
+
+    client
+        .send_message_with_attachment(
+            "caption",
+            AttachmentUpload {
+                filename: "example.txt".to_string(),
+                mime_type: Some("text/plain".to_string()),
+                ciphertext: b"encrypted-file-bytes".to_vec(),
+            },
+        )
+        .await
+        .expect("send with attachment");
+
+    let upload = upload_rx.await.expect("upload payload");
+    assert_eq!(upload.user_id, "7");
+    assert_eq!(upload.guild_id, "11");
+    assert_eq!(upload.channel_id, "13");
+    assert_eq!(upload.filename, "example.txt");
+    assert_eq!(upload.mime_type, "text/plain");
+
+    let message = message_rx.await.expect("message payload");
+    assert_eq!(
+        message.ciphertext_b64,
+        STANDARD.encode("mls-ciphertext-with-attachment".as_bytes())
+    );
+    let attachment = message.attachment.expect("attachment in message payload");
+    assert_eq!(attachment.file_id, FileId(77));
+    assert_eq!(attachment.filename, "example.txt");
+    assert_eq!(attachment.size_bytes, 20);
+    assert_eq!(attachment.mime_type.as_deref(), Some("text/plain"));
 }
 
 fn sample_message() -> MessagePayload {
