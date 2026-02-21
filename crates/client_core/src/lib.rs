@@ -1158,6 +1158,7 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
                                 channel_id,
                                 requesting_user_id,
                                 target_user_id,
+                                target_device_id,
                                 reason,
                                 ..
                             } = event
@@ -1193,6 +1194,7 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
                                             channel_id,
                                             current_user_id,
                                             target_user_id.map(|id| id.0),
+                                            target_device_id.map(|id| id.0),
                                         )
                                         .await
                                     {
@@ -1285,21 +1287,21 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
         &self,
         user_id: i64,
         guild_id: GuildId,
+        target_device_id: Option<i64>,
     ) -> Result<(Vec<u8>, Option<i64>)> {
         let (server_url, current_user_id, _current_device_id) = self.session().await?;
-        let response: KeyPackageResponse = self
+        let mut request = self
             .http
             .get(format!("{server_url}/mls/key_packages"))
             .query(&[
                 ("user_id", current_user_id),
                 ("guild_id", guild_id.0),
                 ("target_user_id", user_id),
-            ])
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+            ]);
+        if let Some(target_device_id) = target_device_id {
+            request = request.query(&[("target_device_id", target_device_id)]);
+        }
+        let response: KeyPackageResponse = request.send().await?.error_for_status()?.json().await?;
 
         if response.user_id != user_id || response.guild_id != guild_id.0 {
             return Err(anyhow!("server returned mismatched key package metadata"));
@@ -1548,6 +1550,7 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
                 channel_id,
                 user_id,
                 target_user_id,
+                None,
             )
             .await
         {
@@ -1961,6 +1964,7 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
         guild_id: GuildId,
         channel_id: ChannelId,
         target_user_id: Option<i64>,
+        target_device_id: Option<i64>,
     ) -> Result<()> {
         let (_server_url, current_user_id, _) = self.session().await?;
         self.mls_session_manager
@@ -1994,7 +1998,17 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
             }
 
             let (key_package_bytes, target_key_package_device_id) = match self
-                .fetch_key_package(member.user_id.0, guild_id)
+                .fetch_key_package(
+                    member.user_id.0,
+                    guild_id,
+                    target_user_id.and_then(|target| {
+                        if target == member.user_id.0 {
+                            target_device_id
+                        } else {
+                            None
+                        }
+                    }),
+                )
                 .await
             {
                 Ok(result) => result,
@@ -2005,7 +2019,20 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
                             let delay =
                                 welcome_retry_delay_with_jitter(attempt, guild_id, channel_id);
                             tokio::time::sleep(delay).await;
-                            match self.fetch_key_package(member.user_id.0, guild_id).await {
+                            match self
+                                .fetch_key_package(
+                                    member.user_id.0,
+                                    guild_id,
+                                    target_user_id.and_then(|target| {
+                                        if target == member.user_id.0 {
+                                            target_device_id
+                                        } else {
+                                            None
+                                        }
+                                    }),
+                                )
+                                .await
+                            {
                                 Ok(result) => {
                                     recovered_key_package = Some(result);
                                     break;
@@ -2253,6 +2280,7 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
         channel_id: ChannelId,
         current_user_id: i64,
         target_user_id: Option<i64>,
+        target_device_id: Option<i64>,
     ) -> Result<bool> {
         if !self.try_begin_bootstrap(guild_id, channel_id).await {
             info!(
@@ -2287,6 +2315,7 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
                     guild_id,
                     channel_id,
                     target_user_id,
+                    target_device_id,
                 )
                 .await?;
                 return Ok(true);
@@ -2544,7 +2573,7 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
     ) -> Result<()> {
         // Let leader do a single bootstrap attempt.
         if let Err(err) = self
-            .maybe_bootstrap_existing_members_if_leader(guild_id, channel_id, user_id, None)
+            .maybe_bootstrap_existing_members_if_leader(guild_id, channel_id, user_id, None, None)
             .await
         {
             self.emit_mls_failure_event(
@@ -2602,7 +2631,7 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
         self.ensure_channel_ready_for_send(guild_id, channel_id, user_id)
             .await?;
         if let Err(err) = self
-            .maybe_bootstrap_existing_members_if_leader(guild_id, channel_id, user_id, None)
+            .maybe_bootstrap_existing_members_if_leader(guild_id, channel_id, user_id, None, None)
             .await
         {
             self.emit_mls_failure_event(
@@ -2629,7 +2658,9 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
             .await?
         {
             let _ = self
-                .maybe_bootstrap_existing_members_if_leader(guild_id, channel_id, user_id, None)
+                .maybe_bootstrap_existing_members_if_leader(
+                    guild_id, channel_id, user_id, None, None,
+                )
                 .await?;
             if let Err(err) = self.reconcile_mls_state_for_guild(guild_id).await {
                 self.emit_mls_failure_event(
@@ -3045,7 +3076,9 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
 
             // 3) Only then let leader bootstrap membership for channel
             if let Err(err) = self
-                .maybe_bootstrap_existing_members_if_leader(guild_id, channel_id, user_id, None)
+                .maybe_bootstrap_existing_members_if_leader(
+                    guild_id, channel_id, user_id, None, None,
+                )
                 .await
             {
                 self.emit_mls_failure_event(
@@ -3297,7 +3330,13 @@ impl<C: CryptoProvider + 'static> ClientHandle for Arc<RealtimeClient<C>> {
 
         let (_, current_user_id, _) = self.session().await?;
         let _ = self
-            .maybe_bootstrap_existing_members_if_leader(guild_id, channel_id, current_user_id, None)
+            .maybe_bootstrap_existing_members_if_leader(
+                guild_id,
+                channel_id,
+                current_user_id,
+                None,
+                None,
+            )
             .await?;
 
         let initialized = self

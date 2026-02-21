@@ -1289,7 +1289,13 @@ async fn missing_welcome_bootstrap_targets_requester_and_forces_retry_for_that_m
     }
 
     let bootstrapped = leader
-        .maybe_bootstrap_existing_members_if_leader(GuildId(11), ChannelId(13), 7, Some(42))
+        .maybe_bootstrap_existing_members_if_leader(
+            GuildId(11),
+            ChannelId(13),
+            7,
+            Some(42),
+            Some(42),
+        )
         .await
         .expect("leader bootstrap call succeeds");
     assert!(bootstrapped);
