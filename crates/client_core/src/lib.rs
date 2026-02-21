@@ -2615,11 +2615,77 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
             return Ok(());
         }
 
+        // Aggressive foreground recovery for immediate UX (send button path).
+        // This avoids getting stuck behind cooldown/rate-limit windows after invite/join races.
+        if self
+            .request_immediate_mls_sync_for_channel(guild_id, channel_id, user_id)
+            .await?
+        {
+            return Ok(());
+        }
+
         Err(anyhow!(
             "MLS state for guild {} channel {} is not ready yet; wait for secure session sync",
             guild_id.0,
             channel_id.0
         ))
+    }
+
+    async fn request_immediate_mls_sync_for_channel(
+        &self,
+        guild_id: GuildId,
+        channel_id: ChannelId,
+        user_id: i64,
+    ) -> Result<bool> {
+        {
+            let mut guard = self.inner.lock().await;
+            guard
+                .welcome_sync_retry_after
+                .remove(&(guild_id, channel_id));
+            guard
+                .bootstrap_request_last_sent
+                .remove(&(guild_id, channel_id));
+        }
+
+        for _ in 0..3 {
+            if self
+                .ensure_mls_channel_initialized(guild_id, channel_id)
+                .await?
+            {
+                return Ok(true);
+            }
+
+            if let Err(err) = self
+                .request_mls_bootstrap(
+                    guild_id,
+                    channel_id,
+                    Some(user_id),
+                    MlsBootstrapReason::MissingPendingWelcome,
+                )
+                .await
+            {
+                self.emit_mls_failure_event(
+                    MlsFailureCategory::WelcomeFetch,
+                    guild_id,
+                    Some(channel_id),
+                    Some(user_id),
+                    Some(user_id),
+                    "request_immediate_mls_sync_for_channel.bootstrap_request",
+                    &err,
+                );
+            }
+
+            if self
+                .maybe_join_from_pending_welcome_with_retry(guild_id, channel_id)
+                .await?
+            {
+                return Ok(true);
+            }
+
+            tokio::time::sleep(Duration::from_millis(120)).await;
+        }
+
+        Ok(false)
     }
 
     async fn send_message_with_attachment_impl(
@@ -3074,7 +3140,48 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
                 continue;
             }
 
-            // 3) Only then let leader bootstrap membership for channel
+            // 3) As joiner/non-leader, proactively request bootstrap for this channel
+            // and immediately retry welcome fetch so the channel is ready without restart.
+            if let Err(err) = self
+                .request_mls_bootstrap(
+                    guild_id,
+                    channel_id,
+                    Some(user_id),
+                    MlsBootstrapReason::MissingPendingWelcome,
+                )
+                .await
+            {
+                self.emit_mls_failure_event(
+                    MlsFailureCategory::WelcomeFetch,
+                    guild_id,
+                    Some(channel_id),
+                    Some(user_id),
+                    Some(user_id),
+                    "prewarm_mls_for_guild_channels.request_bootstrap",
+                    &err,
+                );
+            }
+
+            if let Err(err) = self
+                .maybe_join_from_pending_welcome_with_retry(guild_id, channel_id)
+                .await
+            {
+                self.emit_mls_failure_event(
+                    MlsFailureCategory::WelcomeFetch,
+                    guild_id,
+                    Some(channel_id),
+                    Some(user_id),
+                    Some(user_id),
+                    "prewarm_mls_for_guild_channels.post_bootstrap_welcome_sync",
+                    &err,
+                );
+            }
+
+            if self.is_mls_channel_initialized(guild_id, channel_id).await {
+                continue;
+            }
+
+            // 4) Only then let leader bootstrap membership for channel
             if let Err(err) = self
                 .maybe_bootstrap_existing_members_if_leader(
                     guild_id, channel_id, user_id, None, None,
@@ -3413,6 +3520,9 @@ impl<C: CryptoProvider + 'static> ClientHandle for Arc<RealtimeClient<C>> {
         text: &str,
         attachment: AttachmentUpload,
     ) -> Result<()> {
+        let (_server_url, user_id, guild_id, channel_id) = self.active_context().await?;
+        self.ensure_channel_ready_for_send(guild_id, channel_id, user_id)
+            .await?;
         let uploaded = self.upload_attachment(attachment).await?;
         self.send_message_with_attachment_impl(text, Some(uploaded))
             .await
