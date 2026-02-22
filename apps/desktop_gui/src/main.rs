@@ -2626,6 +2626,7 @@ impl DesktopGuiApp {
                                     .inner_margin(egui::Margin::same(0)),
                             )
                             .show_inside(ui, |ui| {
+                                ui.add_space(6.0);
                                 ui.label(
                                     egui::RichText::new("SERVERS")
                                         .size(11.0)
@@ -2643,9 +2644,7 @@ impl DesktopGuiApp {
                                                 egui::RichText::new(&guild.name).size(12.0),
                                             )
                                             .min_size(egui::vec2(ui.available_width(), 42.0))
-                                            .corner_radius(egui::CornerRadius::same(
-                                                self.theme.panel_rounding.min(8),
-                                            ));
+                                            .corner_radius(egui::CornerRadius::same(4));
 
                                             b = if selected {
                                                 b.fill(palette.nav_item_active).stroke(
@@ -2831,6 +2830,36 @@ impl DesktopGuiApp {
             ),
         );
 
+        let stroke_col = egui::Color32::from_rgb(40, 41, 46);
+        ui.painter().line_segment(
+            [
+                egui::pos2(bottom_rect.left(), bottom_rect.top()),
+                egui::pos2(bottom_rect.right(), bottom_rect.top()),
+            ],
+            egui::Stroke::new(1.0, stroke_col),
+        );
+        ui.painter().line_segment(
+            [
+                egui::pos2(bottom_rect.left(), bottom_rect.top()),
+                egui::pos2(bottom_rect.left(), bottom_rect.bottom()),
+            ],
+            egui::Stroke::new(1.0, stroke_col),
+        );
+        ui.painter().line_segment(
+            [
+                egui::pos2(bottom_rect.right(), bottom_rect.top()),
+                egui::pos2(bottom_rect.right(), bottom_rect.bottom()),
+            ],
+            egui::Stroke::new(1.0, stroke_col),
+        );
+        ui.painter().line_segment(
+            [
+                egui::pos2(top_rect.right(), top_rect.top()),
+                egui::pos2(top_rect.right(), top_rect.bottom()),
+            ],
+            egui::Stroke::new(1.0, stroke_col),
+        );
+
         if splitter_resp.hovered() || splitter_resp.dragged() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
         }
@@ -2841,12 +2870,10 @@ impl DesktopGuiApp {
         ui: &mut egui::Ui,
         discord_dark: Option<DiscordDarkPalette>,
     ) {
+        let palette =
+            discord_dark.unwrap_or_else(|| theme_discord_dark_palette(self.theme).unwrap());
         egui::Frame::new()
-            .fill(
-                discord_dark
-                    .map(|p| p.members_background)
-                    .unwrap_or(ui.visuals().panel_fill),
-            )
+            .fill(palette.members_background)
             .inner_margin(egui::Margin::symmetric(10, 8))
             .show(ui, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
@@ -2856,22 +2883,22 @@ impl DesktopGuiApp {
                             ui.label(
                                 egui::RichText::new(format!("ONLINE — {online}"))
                                     .size(11.0)
-                                    .weak()
+                                    .color(palette.message_hint_text)
                                     .strong(),
                             );
                             for m in members.iter().filter(|m| !m.muted) {
-                                self.render_member_row(ui, m, true, discord_dark);
+                                self.render_member_row(ui, m, true, Some(palette));
                             }
-                            ui.add_space(8.0);
+                            ui.add_space(10.0);
                             let offline = members.iter().filter(|m| m.muted).count();
                             ui.label(
                                 egui::RichText::new(format!("OFFLINE — {offline}"))
                                     .size(11.0)
-                                    .weak()
+                                    .color(palette.message_hint_text)
                                     .strong(),
                             );
                             for m in members.iter().filter(|m| m.muted) {
-                                self.render_member_row(ui, m, false, discord_dark);
+                                self.render_member_row(ui, m, false, Some(palette));
                             }
                         }
                     }
@@ -2886,17 +2913,14 @@ impl DesktopGuiApp {
         online: bool,
         discord_dark: Option<DiscordDarkPalette>,
     ) {
+        let palette =
+            discord_dark.unwrap_or_else(|| theme_discord_dark_palette(self.theme).unwrap());
         let (rect, _) =
             ui.allocate_exact_size(egui::vec2(ui.available_width(), 38.0), egui::Sense::hover());
         let hovered = ui.rect_contains_pointer(rect);
         if hovered {
-            ui.painter().rect_filled(
-                rect,
-                egui::CornerRadius::same(4),
-                discord_dark
-                    .map(|p| p.members_hover)
-                    .unwrap_or(ui.visuals().faint_bg_color),
-            );
+            ui.painter()
+                .rect_filled(rect, egui::CornerRadius::same(4), palette.members_hover);
         }
         let row = rect.shrink2(egui::vec2(6.0, 4.0));
         let avatar_rect = egui::Rect::from_min_size(
@@ -2926,13 +2950,30 @@ impl DesktopGuiApp {
             egui::pos2(row.right(), row.bottom()),
         );
         ui_in_rect(ui, text_rect, |ui| {
-            ui.label(egui::RichText::new(&m.username).size(13.0));
-            let role = match m.role {
-                Role::Owner => "Owner",
-                Role::Mod => "Mod",
-                Role::Member => "Member",
+            ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+            ui.label(
+                egui::RichText::new(&m.username)
+                    .size(13.0)
+                    .color(if online {
+                        palette.nav_text_hover
+                    } else {
+                        palette.nav_text
+                    }),
+            );
+            let status = if online {
+                match m.role {
+                    Role::Owner => "Owner",
+                    Role::Mod => "Moderator",
+                    Role::Member => "Online",
+                }
+            } else {
+                "Offline"
             };
-            ui.label(egui::RichText::new(role).size(10.5).weak());
+            ui.label(
+                egui::RichText::new(status)
+                    .size(10.5)
+                    .color(palette.message_hint_text),
+            );
         });
     }
 
