@@ -2,11 +2,7 @@ param(
     [ValidateSet("Temp", "Permanent", "None")]
     [string]$ServerMode = "Temp",
 
-    [int]$ClientCount = 2,
-
-    [string[]]$Usernames = @("alice", "bob"),
-
-    [string]$ServerUrl = "http://127.0.0.1:8443",
+    [string]$ConfigPath = "scripts/multiuser.profiles.json",
 
     [switch]$ResetDb,
     [switch]$ResetUploads,
@@ -26,28 +22,80 @@ $RepoRoot = (Resolve-Path (Join-Path $ScriptDir "..")).Path
 Set-Location $RepoRoot
 
 $DataRoot = Join-Path $RepoRoot "data"
-$ClientsRoot = Join-Path $DataRoot "clients"
+$ClientsRootDefault = Join-Path $DataRoot "clients"
 $UploadsRoot = Join-Path $DataRoot "uploads"
 $ServerDataRoot = Join-Path $DataRoot "server"
 $LogsRoot = Join-Path $RepoRoot "logs"
 
-New-Item -ItemType Directory -Force -Path $DataRoot, $ClientsRoot, $UploadsRoot, $ServerDataRoot, $LogsRoot | Out-Null
+New-Item -ItemType Directory -Force -Path $DataRoot, $UploadsRoot, $ServerDataRoot, $LogsRoot | Out-Null
 
 # ----------------------------
-# Helper: ensure usernames list length
+# Read multiuser.profiles.json
+# Expected shape:
+# {
+#   "server_url": "http://127.0.0.1:8443",
+#   "base_data_dir": "./data/clients",
+#   "users": [
+#     { "username": "alice", "display_name": "Alice" },
+#     { "username": "bob",   "display_name": "Bob" }
+#   ]
+# }
 # ----------------------------
-if ($ClientCount -lt 1) {
-    throw "ClientCount must be >= 1"
+if (-not (Test-Path $ConfigPath)) {
+    throw "Config file not found: $ConfigPath"
 }
 
-if ($Usernames.Count -lt $ClientCount) {
-    $start = $Usernames.Count + 1
-    for ($i = $start; $i -le $ClientCount; $i++) {
-        $Usernames += "user$i"
+$configRaw = Get-Content -Raw -Path $ConfigPath
+if ([string]::IsNullOrWhiteSpace($configRaw)) {
+    throw "Config file is empty: $ConfigPath"
+}
+
+try {
+    $Config = $configRaw | ConvertFrom-Json
+} catch {
+    throw "Failed to parse JSON config at $ConfigPath. Error: $($_.Exception.Message)"
+}
+
+if (-not $Config.users -or $Config.users.Count -lt 1) {
+    throw "Config must contain at least one user under 'users'."
+}
+
+$ServerUrl = if ($Config.server_url) { [string]$Config.server_url } else { "http://127.0.0.1:8443" }
+
+# Resolve base data dir (can be relative to repo root)
+$ClientsRoot = $null
+if ($Config.base_data_dir) {
+    $baseDataDirRaw = [string]$Config.base_data_dir
+    if ([System.IO.Path]::IsPathRooted($baseDataDirRaw)) {
+        $ClientsRoot = $baseDataDirRaw
+    } else {
+        $ClientsRoot = Join-Path $RepoRoot $baseDataDirRaw
+    }
+} else {
+    $ClientsRoot = $ClientsRootDefault
+}
+
+New-Item -ItemType Directory -Force -Path $ClientsRoot | Out-Null
+
+# Normalize user list
+$Users = @()
+foreach ($u in $Config.users) {
+    if (-not $u.username) {
+        throw "Each user entry must include 'username'."
+    }
+
+    $username = [string]$u.username
+    $displayName = if ($u.display_name) { [string]$u.display_name } else { $username }
+
+    # Optional per-user overrides if present in JSON
+    $userServerUrl = if ($u.server_url) { [string]$u.server_url } else { $ServerUrl }
+
+    $Users += [PSCustomObject]@{
+        Username    = $username
+        DisplayName = $displayName
+        ServerUrl   = $userServerUrl
     }
 }
-
-$Usernames = $Usernames[0..($ClientCount - 1)]
 
 # ----------------------------
 # Optional resets
@@ -68,7 +116,7 @@ if ($ResetUploads) {
     New-Item -ItemType Directory -Force -Path $UploadsRoot | Out-Null
 }
 
-# Temp DB path (only used in temp mode)
+# Temp DB path (only used in Temp mode)
 $TempDbPath = Join-Path ([System.IO.Path]::GetTempPath()) ("proto_rtc_temp_server_{0}.db" -f ([System.Guid]::NewGuid().ToString("N")))
 if ($ResetDb -and (Test-Path $TempDbPath)) {
     Remove-Item -Force $TempDbPath -ErrorAction SilentlyContinue
@@ -77,17 +125,28 @@ if ($ResetDb -and (Test-Path $TempDbPath)) {
 # ----------------------------
 # Build once (avoids exe lock from cargo run per client)
 # ----------------------------
-$GuiProfile = if ($Release) { "release" } else { "debug" }
-$GuiExe = Join-Path $RepoRoot "target\$GuiProfile\desktop_gui.exe"
+$ProfileName = if ($Release) { "release" } else { "debug" }
+$GuiExe = Join-Path $RepoRoot "target\$ProfileName\desktop_gui.exe"
+$ServerExe = Join-Path $RepoRoot "target\$ProfileName\server.exe"
 
 if (-not $NoBuild) {
-    Write-Host "Building desktop GUI once ($GuiProfile)..."
+    Write-Host "Building desktop GUI ($ProfileName)..."
     if ($Release) {
         cargo build -p desktop_gui --release
     } else {
         cargo build -p desktop_gui
     }
     if ($LASTEXITCODE -ne 0) { throw "GUI build failed." }
+
+    if (-not $NoServer -and $ServerMode -ne "None") {
+        Write-Host "Building server ($ProfileName)..."
+        if ($Release) {
+            cargo build -p server --release
+        } else {
+            cargo build -p server
+        }
+        if ($LASTEXITCODE -ne 0) { throw "Server build failed." }
+    }
 }
 
 if (-not (Test-Path $GuiExe)) {
@@ -96,24 +155,24 @@ if (-not (Test-Path $GuiExe)) {
 
 # ----------------------------
 # Launch server (optional)
+# - Uses server.exe directly (faster than cargo run)
+# - Uses Tee-Object so output goes to BOTH console and log
+# - Uses -NoExit so spawned console stays visible (not black/empty)
 # ----------------------------
 $ServerProc = $null
 if (-not $NoServer -and $ServerMode -ne "None") {
-    $ServerEnv = @{}
     $ServerLog = Join-Path $LogsRoot ("server_{0}.log" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
+    $ServerEnv = @{}
 
     switch ($ServerMode) {
         "Temp" {
-            # Force temp/local server settings
             $ServerEnv["DATABASE_URL"] = "sqlite:$TempDbPath"
-            $ServerEnv["SERVER_BIND_ADDR"] = "127.0.0.1:8443"
+            $ServerEnv["SERVER_BIND_ADDR"] = "0.0.0.0:8443"
             $ServerEnv["SERVER_PUBLIC_URL"] = $ServerUrl
 
             if ($ResetDb) {
-                # If your server expects a file path inside sqlite:..., delete the file path portion
-                $dbFilePath = $TempDbPath
-                if (Test-Path $dbFilePath) {
-                    Remove-Item -Force $dbFilePath -ErrorAction SilentlyContinue
+                if (Test-Path $TempDbPath) {
+                    Remove-Item -Force $TempDbPath -ErrorAction SilentlyContinue
                 }
             }
 
@@ -123,111 +182,118 @@ if (-not $NoServer -and $ServerMode -ne "None") {
             Write-Host "  SERVER_PUBLIC_URL=$($ServerEnv["SERVER_PUBLIC_URL"])"
         }
         "Permanent" {
-            Write-Host "Starting PERMANENT/local-config server (uses your normal env/.env defaults)"
-            # No forced overrides here unless you want them.
+            Write-Host "Starting PERMANENT/local-config server (normal .env / environment applies)"
         }
     }
 
-    # Build server first to reduce startup delays
-    if ($Release) {
-        cargo build -p server --release
-    } else {
-        cargo build -p server
+    if (-not (Test-Path $ServerExe)) {
+        throw "Server executable not found: $ServerExe"
     }
-    if ($LASTEXITCODE -ne 0) { throw "Server build failed." }
 
-    # Start server with env overrides (Start-Process -Environment may not exist on older PS)
-    # So we launch via powershell child process and set env in that process.
     $serverCmdLines = @()
     foreach ($kv in $ServerEnv.GetEnumerator()) {
-        $escapedVal = $kv.Value.Replace("'", "''")
+        $escapedVal = ([string]$kv.Value).Replace("'", "''")
         $serverCmdLines += "`$env:$($kv.Key) = '$escapedVal'"
     }
 
-    $serverCargoArgs = if ($Release) { "run --release -p server" } else { "run -p server" }
     $serverCmdLines += "Set-Location '$($RepoRoot.Replace("'", "''"))'"
-    $serverCmdLines += "cargo $serverCargoArgs *>> '$($ServerLog.Replace("'", "''"))'"
+    $serverCmdLines += "Write-Host '--- proto_RTC server ---'"
+    $serverCmdLines += "Write-Host 'Log: $($ServerLog.Replace("'", "''"))'"
+    $serverCmdLines += "Write-Host ''"
+    $serverCmdLines += "& '$($ServerExe.Replace("'", "''"))' 2>&1 | Tee-Object -FilePath '$($ServerLog.Replace("'", "''"))' -Append"
 
     $serverPsScript = $serverCmdLines -join "; "
 
     $ServerProc = Start-Process -FilePath "powershell.exe" `
-        -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", $serverPsScript) `
+        -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-NoExit", "-Command", $serverPsScript) `
         -PassThru `
         -WindowStyle Normal
 
-    Write-Host "Server launched (PID=$($ServerProc.Id)). Log: $ServerLog"
+    Write-Host "Server launched (PID=$($ServerProc.Id))"
+    Write-Host "Server log: $ServerLog"
     Start-Sleep -Seconds 2
 }
 
 # ----------------------------
-# Launch N clients with isolated per-user dirs
+# Launch clients with isolated per-user app data dirs
+# NOTE:
+# - No HOME/USERPROFILE hijacking (fixes file picker default path issue)
+# - Requires GUI support for:
+#     --server-url
+#     --username
+#     --display-name
+#     --data-dir
+# - Uses Tee-Object so logs are visible in client console windows
 # ----------------------------
 Write-Host ""
-Write-Host "Launching $ClientCount client(s) against $ServerUrl"
+Write-Host "Launching $($Users.Count) client(s)"
 Write-Host "GUI binary: $GuiExe"
+Write-Host "Clients root: $ClientsRoot"
 Write-Host ""
 
 $ClientProcs = @()
 
-for ($i = 0; $i -lt $ClientCount; $i++) {
-    $username = $Usernames[$i]
+foreach ($user in $Users) {
+    $username = $user.Username
+    $displayName = $user.DisplayName
+    $userServerUrl = $user.ServerUrl
+
     $clientRoot = Join-Path $ClientsRoot $username
-
-    # Create isolated per-client "profile" roots.
-    # GUI code resolves MLS dir from HOME/USERPROFILE/LOCALAPPDATA, so we override all.
-    $homeRoot = Join-Path $clientRoot "home"
-    $userProfileRoot = Join-Path $clientRoot "profile"
-    $localAppDataRoot = Join-Path $clientRoot "localappdata"
-    $tempRoot = Join-Path $clientRoot "temp"
-    $tmpRoot = Join-Path $clientRoot "tmp"
-
-    New-Item -ItemType Directory -Force -Path `
-        $clientRoot, $homeRoot, $userProfileRoot, $localAppDataRoot, $tempRoot, $tmpRoot | Out-Null
-
-    # Helpful place for GUI state if HOME is used:
-    New-Item -ItemType Directory -Force -Path (Join-Path $homeRoot ".proto_rtc") | Out-Null
-
+    $clientDataDir = Join-Path $clientRoot "appdata"
+    $clientCacheDir = Join-Path $clientRoot "cache"   # optional extra dir if your app uses it later
     $clientLog = Join-Path $LogsRoot ("gui_{0}_{1}.log" -f $username, (Get-Date -Format "yyyyMMdd_HHmmss"))
 
-    # Launch GUI in a child PowerShell with per-process env overrides.
-    # This gives each client its own MLS keystore + temp dirs without separate builds.
-    $clientCmd = @(
-        "`$env:HOME = '$($homeRoot.Replace("'", "''"))'",
-        "`$env:USERPROFILE = '$($userProfileRoot.Replace("'", "''"))'",
-        "`$env:LOCALAPPDATA = '$($localAppDataRoot.Replace("'", "''"))'",
-        "`$env:TEMP = '$($tempRoot.Replace("'", "''"))'",
-        "`$env:TMP = '$($tmpRoot.Replace("'", "''"))'",
-        # Optional quality-of-life vars:
-        "`$env:RUST_LOG = 'info'",
+    New-Item -ItemType Directory -Force -Path $clientRoot, $clientDataDir, $clientCacheDir | Out-Null
+
+    # Build a small script so the window stays open and shows output.
+    $clientCmdLines = @(
         "Set-Location '$($RepoRoot.Replace("'", "''"))'",
-        "& '$($GuiExe.Replace("'", "''"))' *>> '$($clientLog.Replace("'", "''"))'"
-    ) -join "; "
+        "Write-Host '--- proto_RTC desktop_gui ($($username.Replace("'", "''"))) ---'",
+        "Write-Host 'Server URL : $($userServerUrl.Replace("'", "''"))'",
+        "Write-Host 'Data dir   : $($clientDataDir.Replace("'", "''"))'",
+        "Write-Host 'Log        : $($clientLog.Replace("'", "''"))'",
+        "Write-Host ''",
+        # Optional logging verbosity:
+        "`$env:RUST_LOG = 'info'",
+        "& '$($GuiExe.Replace("'", "''"))' --server-url '$($userServerUrl.Replace("'", "''"))' --username '$($username.Replace("'", "''"))' --display-name '$($displayName.Replace("'", "''"))' --data-dir '$($clientDataDir.Replace("'", "''"))' 2>&1 | Tee-Object -FilePath '$($clientLog.Replace("'", "''"))' -Append"
+    )
+    $clientPsScript = $clientCmdLines -join "; "
 
     $p = Start-Process -FilePath "powershell.exe" `
-        -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", $clientCmd) `
+        -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-NoExit", "-Command", $clientPsScript) `
         -PassThru `
         -WindowStyle Normal
 
     $ClientProcs += $p
 
-    Write-Host ("[{0}] {1} -> PID {2}" -f $i, $username, $p.Id)
-    Write-Host ("     HOME={0}" -f $homeRoot)
-    Write-Host ("     USERPROFILE={0}" -f $userProfileRoot)
-    Write-Host ("     LOCALAPPDATA={0}" -f $localAppDataRoot)
-    Write-Host ("     TEMP={0}" -f $tempRoot)
-    Write-Host ("     Log={0}" -f $clientLog)
+    Write-Host ("User '{0}' launched -> PID {1}" -f $username, $p.Id)
+    Write-Host ("  Server URL : {0}" -f $userServerUrl)
+    Write-Host ("  Data Dir   : {0}" -f $clientDataDir)
+    Write-Host ("  Log        : {0}" -f $clientLog)
+    Write-Host ""
 
     Start-Sleep -Milliseconds 500
 }
 
-Write-Host ""
+# ----------------------------
+# Summary
+# ----------------------------
 Write-Host "Done."
-Write-Host "Login in each GUI with:"
-Write-Host "  Server URL: $ServerUrl"
-Write-Host "  Usernames : $($Usernames -join ', ')"
+Write-Host ""
+Write-Host "Users:"
+foreach ($user in $Users) {
+    Write-Host ("  - {0} (display: {1})" -f $user.Username, $user.DisplayName)
+}
 Write-Host ""
 if ($ServerProc) {
     Write-Host "Server PID: $($ServerProc.Id)"
 }
-Write-Host "Tip: To run remote clients, copy/build the GUI on those machines and run this script with:"
-Write-Host "  -NoServer -ServerMode None -ServerUrl http://<your-server-ip>:8443"
+Write-Host ""
+Write-Host "Notes:"
+Write-Host "  - Client windows stay open and show stdout/stderr (plus logs are saved)."
+Write-Host "  - File picker should use the real Windows user's Desktop/Downloads (not fake profile paths)."
+Write-Host "  - This script expects desktop_gui to support CLI args:"
+Write-Host "      --server-url --username --display-name --data-dir"
+Write-Host ""
+Write-Host "Remote client tip:"
+Write-Host "  Run with -NoServer -ServerMode None and set server_url in multiuser.profiles.json"

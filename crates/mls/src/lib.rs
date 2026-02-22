@@ -448,7 +448,8 @@ impl<S: MlsStore> MlsGroupHandle<S> {
             .group
             .as_ref()
             .ok_or_else(|| anyhow!("MLS group not initialized"))?;
-        Ok(group.export_secret(&self.provider, label, &[], len)?)
+
+        Ok(group.export_secret(self.provider.crypto(), label, &[], len)?)
     }
 
     async fn persist_group(&self) -> Result<()> {

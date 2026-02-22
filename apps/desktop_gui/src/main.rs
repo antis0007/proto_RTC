@@ -31,7 +31,70 @@ use shared::{
         AttachmentPayload, ChannelSummary, GuildSummary, MemberSummary, MessagePayload, ServerEvent,
     },
 };
+use clap::Parser;
 
+#[derive(Debug, Clone)]
+pub struct StartupConfig {
+    pub server_url: String,
+    pub username: String,
+    pub display_name: String,
+    pub data_dir: Option<std::path::PathBuf>,
+}
+
+impl Default for StartupConfig {
+    fn default() -> Self {
+        Self {
+            server_url: "http://127.0.0.1:8443".to_string(),
+            username: "alice".to_string(),
+            display_name: "alice".to_string(),
+            data_dir: None,
+        }
+    }
+}
+#[derive(Parser, Debug)]
+#[command(name = "desktop_gui")]
+struct CliArgs {
+    #[arg(long, default_value = "http://127.0.0.1:8443")]
+    server_url: String,
+
+    #[arg(long, default_value = "alice")]
+    username: String,
+
+    #[arg(long)]
+    display_name: Option<String>,
+
+    #[arg(long)]
+    data_dir: Option<PathBuf>,
+}
+#[derive(Debug, Clone)]
+pub struct AppPaths {
+    pub data_root: std::path::PathBuf,   // per-profile isolated
+    pub cache_dir: std::path::PathBuf,
+    pub db_path: std::path::PathBuf,
+    pub mls_dir: std::path::PathBuf,
+    pub settings_path: std::path::PathBuf,
+}
+
+impl AppPaths {
+    pub fn from_startup(startup: &StartupConfig) -> anyhow::Result<Self> {
+        let root = if let Some(p) = &startup.data_dir {
+            p.clone()
+        } else {
+            // Fallback: per-user app data + username namespace
+            let base = dirs::data_local_dir()
+                .ok_or_else(|| anyhow::anyhow!("unable to resolve local app data dir"))?;
+            base.join("proto_rtc").join("profiles").join(&startup.username)
+        };
+
+        Ok(Self {
+            cache_dir: root.join("cache"),
+            db_path: root.join("client.sqlite3"),
+            mls_dir: root.join("mls"),
+            settings_path: root.join("settings.json"),
+            data_root: root,
+        })
+    }
+}
 enum BackendCommand {
     Login {
         server_url: String,
@@ -648,21 +711,22 @@ impl DesktopGuiApp {
         cmd_tx: Sender<BackendCommand>,
         ui_rx: Receiver<UiEvent>,
         persisted_settings: Option<PersistedDesktopSettings>,
-    ) -> Self {
+        startup: StartupConfig,
+    ) -> Self{
         let (theme, readability, composer_panel_height, left_user_panel_height) =
             persisted_settings.unwrap_or_default().into_runtime();
         Self {
             cmd_tx,
             ui_rx,
-            server_url: "http://127.0.0.1:8443".to_string(),
-            username: "alice".to_string(),
+            server_url: startup.server_url.clone(),
+            username: startup.username.clone(),
             invite_code_input: String::new(),
             auth_session_established: false,
             presence_preference: AccountPresence::Online,
             notifications_enabled: true,
             desktop_notifications_enabled: true,
             mention_notifications_enabled: true,
-            display_name_draft: "alice".to_string(),
+            display_name_draft: startup.display_name.clone(),
             composer: String::new(),
             pending_attachment: None,
             attachment_preview_cache: HashMap::new(),
@@ -972,7 +1036,7 @@ impl DesktopGuiApp {
             .resizable(false)
             .show(ctx, |ui| {
                 ui.label("Theme preset");
-                egui::ComboBox::from_id_source("theme_preset")
+                egui::ComboBox::from_id_salt("theme_preset")
                     .selected_text(self.theme.preset.label())
                     .show_ui(ui, |ui| {
                         ui.selectable_value(
@@ -1042,11 +1106,11 @@ impl DesktopGuiApp {
                 ),
             };
 
-            egui::Frame::none()
+            egui::Frame::NONE
                 .fill(fill)
                 .stroke(stroke)
-                .rounding(8.0)
-                .inner_margin(egui::Margin::symmetric(10.0, 8.0))
+                .corner_radius(8.0)
+                .inner_margin(egui::Margin::symmetric(10, 8))
                 .show(ui, |ui| {
                     ui.horizontal_wrapped(|ui| {
                         ui.label(egui::RichText::new(&banner.message).color(egui::Color32::WHITE));
@@ -1073,7 +1137,7 @@ impl DesktopGuiApp {
     ) -> egui::Response {
         ui.label(egui::RichText::new(label).strong());
         let edit = egui::TextEdit::singleline(value)
-            .id_source(id)
+            .id_salt(id)
             .hint_text(
                 egui::RichText::new(hint)
                     .color(ui.visuals().weak_text_color().gamma_multiply(0.85)),
@@ -1108,14 +1172,14 @@ impl DesktopGuiApp {
                     .map(|p| lighten_color(p.app_background, 0.06))
                     .unwrap_or_else(|| lighten_color(ui.visuals().panel_fill, 0.02));
 
-                egui::Frame::none()
+                egui::Frame::NONE
                     .fill(card_fill)
-                    .rounding(14.0)
+                    .corner_radius(14.0)
                     .stroke(egui::Stroke::new(
                         1.0,
                         ui.visuals().widgets.noninteractive.bg_stroke.color,
                     ))
-                    .inner_margin(egui::Margin::symmetric(20.0, 18.0))
+                    .inner_margin(egui::Margin::symmetric(20, 18))
                     .show(ui, |ui| {
                         ui.style_mut().spacing.item_spacing = egui::vec2(10.0, 10.0);
 
@@ -1142,10 +1206,10 @@ impl DesktopGuiApp {
                         }
 
                         // Fields (stacked)
-                        egui::Frame::none()
+                        egui::Frame::NONE
                             .fill(ui.visuals().faint_bg_color.gamma_multiply(0.55))
-                            .rounding(12.0)
-                            .inner_margin(egui::Margin::symmetric(14.0, 12.0))
+                            .corner_radius(12.0)
+                            .inner_margin(egui::Margin::symmetric(14, 12))
                             .show(ui, |ui| {
                                 ui.label(
                                     egui::RichText::new("Account")
@@ -1204,7 +1268,7 @@ impl DesktopGuiApp {
                             if let Some(p) = theme_discord_dark_palette(self.theme) {
                                 btn = btn
                                     .fill(self.theme.accent_color)
-                                    .stroke(egui::Stroke::new(1.0, p.guild_entry_stroke_active));
+                                    .stroke(egui::Stroke::new(1.0, p.nav_item_stroke_active));
                             }
 
                             if ui.add_enabled(!is_busy, btn).clicked() {
@@ -1450,7 +1514,7 @@ impl DesktopGuiApp {
             if let Some(bytes) = full_bytes {
                 self.copy_image_to_clipboard(bytes, "full-quality image");
             }
-            ui.close_menu();
+            ui.close();
         }
 
         let copy_preview = ui
@@ -1464,7 +1528,7 @@ impl DesktopGuiApp {
             if let Some(bytes) = preview_bytes {
                 self.copy_image_to_clipboard(bytes, "preview image");
             }
-            ui.close_menu();
+            ui.close();
         }
 
         let save_full = ui
@@ -1475,7 +1539,7 @@ impl DesktopGuiApp {
             if let Some(bytes) = full_bytes {
                 self.save_image_bytes_as(bytes, file_name);
             }
-            ui.close_menu();
+            ui.close();
         }
 
         let open_external = ui
@@ -1489,14 +1553,14 @@ impl DesktopGuiApp {
             if let Some(path) = external_path {
                 self.open_file_in_external_viewer(path);
             }
-            ui.close_menu();
+            ui.close();
         }
 
         ui.separator();
         if ui.button("Copy file name").clicked() {
             ui.ctx().copy_text(file_name.to_string());
             self.status = "Copied file name to clipboard".to_string();
-            ui.close_menu();
+            ui.close();
         }
 
         if ui
@@ -1507,7 +1571,7 @@ impl DesktopGuiApp {
                 ui.ctx().copy_text(text.to_string());
                 self.status = "Copied image metadata to clipboard".to_string();
             }
-            ui.close_menu();
+            ui.close();
         }
     }
 
@@ -1558,10 +1622,6 @@ impl DesktopGuiApp {
         let backend_supports_profile_edit = false;
 
         ui.style_mut().spacing.button_padding = egui::vec2(4.0, 1.0);
-        ui.style_mut().visuals.widgets.inactive.rounding = egui::Rounding::same(0.0);
-        ui.style_mut().visuals.widgets.hovered.rounding = egui::Rounding::same(0.0);
-        ui.style_mut().visuals.widgets.active.rounding = egui::Rounding::same(0.0);
-        ui.style_mut().visuals.widgets.open.rounding = egui::Rounding::same(0.0);
 
         ui.set_min_width(260.0);
         ui.label(egui::RichText::new(&self.username).strong());
@@ -1594,12 +1654,12 @@ impl DesktopGuiApp {
             .on_hover_text("Backend command support is required for profile updates.");
         if save_display_name.clicked() {
             self.status = "Display name updated".to_string();
-            ui.close_menu();
+            ui.close();
         }
 
         ui.separator();
         ui.small("Presence");
-        egui::ComboBox::from_id_source("account_presence_combo")
+        egui::ComboBox::from_id_salt("account_presence_combo")
             .selected_text(self.presence_preference.label())
             .show_ui(ui, |ui| {
                 ui.selectable_value(
@@ -1633,7 +1693,7 @@ impl DesktopGuiApp {
             .on_disabled_hover_text("No active session to sign out from.");
         if sign_out.clicked() {
             self.sign_out();
-            ui.close_menu();
+            ui.close();
         }
     }
 
@@ -1662,7 +1722,7 @@ impl DesktopGuiApp {
         ui.horizontal(|ui| {
             ui.heading("Channels");
             let refresh_label = if let Some(palette) = discord_dark {
-                egui::RichText::new("Refresh").color(palette.side_panel_button_text)
+                egui::RichText::new("Refresh").color(palette.nav_text)
             } else {
                 egui::RichText::new("Refresh")
             };
@@ -1687,7 +1747,7 @@ impl DesktopGuiApp {
                 "Join voice"
             };
             let cta_text = if let Some(palette) = discord_dark {
-                egui::RichText::new(cta_label).color(palette.side_panel_button_text)
+                egui::RichText::new(cta_label).color(palette.nav_text)
             } else {
                 egui::RichText::new(cta_label)
             };
@@ -1729,10 +1789,10 @@ impl DesktopGuiApp {
         let discord_dark = theme_discord_dark_palette(self.theme);
         let colors = MainWorkspaceColors {
             top_bar_bg: discord_dark
-                .map(|p| p.navigation_background)
+                .map(|p| p.nav_background)
                 .unwrap_or(ctx.style().visuals.panel_fill),
             nav_bg: discord_dark
-                .map(|p| p.navigation_background)
+                .map(|p| p.nav_background)
                 .unwrap_or(ctx.style().visuals.panel_fill),
             members_bg: discord_dark
                 .map(|p| p.members_background)
@@ -1757,8 +1817,8 @@ impl DesktopGuiApp {
         let mut button = egui::Button::new(label);
         if let Some(palette) = discord_dark {
             button = button
-                .fill(palette.side_panel_button_fill)
-                .stroke(egui::Stroke::new(1.0, palette.guild_entry_stroke));
+                .fill(palette.nav_background)
+                .stroke(egui::Stroke::new(1.0, palette.nav_item_stroke));
         }
         button
     }
@@ -1772,7 +1832,7 @@ impl DesktopGuiApp {
         discord_dark: Option<DiscordDarkPalette>,
     ) -> egui::Response {
         let base_bg = discord_dark
-            .map(|p| p.navigation_background)
+            .map(|p| p.nav_background)
             .unwrap_or_else(|| {
                 if self.theme.list_row_shading {
                     ui.visuals().faint_bg_color
@@ -1781,7 +1841,7 @@ impl DesktopGuiApp {
                 }
             });
         let selected_bg = discord_dark
-            .map(|p| p.guild_entry_active)
+            .map(|p| p.nav_item_active)
             .unwrap_or_else(|| {
                 ui.visuals()
                     .selection
@@ -1797,9 +1857,9 @@ impl DesktopGuiApp {
                 egui::Stroke::new(
                     1.0,
                     if selected {
-                        palette.guild_entry_stroke_active
+                        palette.nav_item_stroke_active
                     } else {
-                        palette.guild_entry_stroke
+                        palette.nav_item_stroke
                     },
                 )
             })
@@ -1821,7 +1881,7 @@ impl DesktopGuiApp {
             selected_bg
         } else if response.hovered() {
             discord_dark
-                .map(|p| p.guild_entry_hover)
+                .map(|p| p.nav_item_hover)
                 .unwrap_or_else(|| ui.visuals().widgets.hovered.bg_fill)
         } else {
             base_bg
@@ -1829,28 +1889,29 @@ impl DesktopGuiApp {
 
         ui.painter().rect_filled(
             rect,
-            egui::Rounding::same(f32::from(self.theme.panel_rounding)),
+            egui::CornerRadius::same(u8::from(self.theme.panel_rounding)),
             row_fill,
         );
         if row_stroke != egui::Stroke::NONE {
             ui.painter().rect_stroke(
                 rect,
-                egui::Rounding::same(f32::from(self.theme.panel_rounding)),
+                egui::CornerRadius::same(u8::from(self.theme.panel_rounding)),
                 row_stroke,
+                egui::StrokeKind::Middle
             );
         }
 
         let text_color = if selected {
             discord_dark
-                .map(|p| p.guild_text_highlighted)
+                .map(|p| p.nav_text_highlighted)
                 .unwrap_or(ui.visuals().strong_text_color())
         } else if response.hovered() {
             discord_dark
-                .map(|p| p.guild_text_hovered)
+                .map(|p| p.nav_text_hover)
                 .unwrap_or(ui.visuals().strong_text_color())
         } else {
             discord_dark
-                .map(|p| p.guild_text_unhighlighted)
+                .map(|p| p.nav_text)
                 .unwrap_or(ui.visuals().text_color())
         };
 
@@ -1869,10 +1930,10 @@ impl DesktopGuiApp {
         let nav_width = style.layout.guilds_panel_width + style.layout.channels_panel_width + 24.0;
         egui::SidePanel::left("left_navigation_panel")
             .default_width(nav_width)
-            .frame(egui::Frame::none().fill(style.colors.nav_bg).inner_margin(
+            .frame(egui::Frame::NONE.fill(style.colors.nav_bg).inner_margin(
                 egui::Margin::symmetric(
-                    style.layout.toolbar_h_padding,
-                    style.layout.toolbar_v_padding,
+                    style.layout.toolbar_h_padding as i8,
+                    style.layout.toolbar_v_padding as i8,
                 ),
             ))
             .show(ctx, |ui| {
@@ -1917,7 +1978,7 @@ impl DesktopGuiApp {
                                 ui.add_space(style.layout.section_vertical_gap);
 
                                 egui::ScrollArea::vertical()
-                                    .id_source("left_nav_guilds_scroll")
+                                    .id_salt("left_nav_guilds_scroll")
                                     .auto_shrink([false, false])
                                     .max_height(ui.available_height())
                                     .show(ui, |ui| {
@@ -1925,7 +1986,7 @@ impl DesktopGuiApp {
                                             if let Some(guild_id) = self.selected_guild {
                                                 let label = if let Some(palette) = discord_dark {
                                                     egui::RichText::new("Create Invite")
-                                                        .color(palette.side_panel_button_text)
+                                                        .color(palette.nav_text)
                                                 } else {
                                                     egui::RichText::new("Create Invite")
                                                 };
@@ -2002,7 +2063,7 @@ impl DesktopGuiApp {
                                 ui.add_space(style.layout.section_vertical_gap);
 
                                 egui::ScrollArea::vertical()
-                                    .id_source("left_nav_channels_scroll")
+                                    .id_salt("left_nav_channels_scroll")
                                     .auto_shrink([false, false])
                                     .max_height(ui.available_height())
                                     .show(ui, |ui| {
@@ -2085,11 +2146,11 @@ impl DesktopGuiApp {
         egui::SidePanel::right("members_panel")
             .default_width(style.layout.members_panel_width)
             .show(ctx, |ui| {
-                egui::Frame::none()
+                egui::Frame::NONE
                     .fill(style.colors.members_bg)
                     .inner_margin(egui::Margin::symmetric(
-                        style.layout.toolbar_h_padding,
-                        style.layout.toolbar_v_padding,
+                        style.layout.toolbar_h_padding as i8,
+                        style.layout.toolbar_v_padding as i8,
                     ))
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
@@ -2179,118 +2240,198 @@ impl DesktopGuiApp {
     }
 
     fn show_top_bar(&mut self, ctx: &egui::Context, style: MainWorkspaceStyle) {
+        const STATUS_ROW_HEIGHT: f32 = 20.0;
+        const INVITE_MIN_W: f32 = 140.0;
+        const INVITE_MAX_W: f32 = 260.0;
+        const TOPBAR_HEIGHT: f32 = 24.0;
+
         egui::TopBottomPanel::top("top_bar")
+            .resizable(false)
             .frame(
-                egui::Frame::none()
-                    .fill(style.colors.top_bar_bg)
-                    .inner_margin(egui::Margin::symmetric(
-                        style.layout.top_bar_h_padding,
-                        style.layout.top_bar_v_padding,
-                    )),
+                egui::Frame {
+                    fill: style.colors.top_bar_bg,
+                    inner_margin: egui::Margin {
+                        top: 1,
+                        bottom: 0,
+                        left: 0,
+                        right: 0,
+                    },
+                    outer_margin: egui::Margin::same(0),
+                    ..Default::default()
+                }
             )
             .show(ctx, |ui| {
                 ui.scope(|ui| {
-                    let style = ui.style_mut();
-                    style.spacing.button_padding = egui::vec2(4.0, 0.0);
-                    style.spacing.item_spacing.x = 0.0;
-                    style.spacing.interact_size.y = 18.0;
-                    style.visuals.widgets.inactive.rounding = egui::Rounding::same(0.0);
-                    style.visuals.widgets.hovered.rounding = egui::Rounding::same(0.0);
-                    style.visuals.widgets.active.rounding = egui::Rounding::same(0.0);
-                    style.visuals.widgets.open.rounding = egui::Rounding::same(0.0);
+                    let s = ui.style_mut();
+                    s.spacing.item_spacing.x = 1.0;
+                    s.spacing.button_padding = egui::vec2(8.0, 1.0);
+                    s.spacing.interact_size.y = TOPBAR_HEIGHT;
 
-                    egui::menu::bar(ui, |ui| {
-                        ui.menu_button("⚙ Settings", |ui| {
-                            ui.style_mut().spacing.button_padding = egui::vec2(4.0, 0.0);
-                            ui.style_mut().visuals.widgets.inactive.rounding =
-                                egui::Rounding::same(0.0);
-                            ui.style_mut().visuals.widgets.hovered.rounding =
-                                egui::Rounding::same(0.0);
-                            ui.style_mut().visuals.widgets.active.rounding =
-                                egui::Rounding::same(0.0);
-                            ui.style_mut().visuals.widgets.open.rounding =
-                                egui::Rounding::same(0.0);
+                    // Keep your "no rounding" rules:
+                    let zero = egui::CornerRadius::ZERO;
+                    s.visuals.widgets.inactive.corner_radius = zero;
+                    s.visuals.widgets.hovered.corner_radius = zero;
+                    s.visuals.widgets.active.corner_radius = zero;
+                    s.visuals.widgets.open.corner_radius = zero;
+                    s.visuals.widgets.noninteractive.corner_radius = zero;
 
-                            ui.label(egui::RichText::new("Quick settings").weak());
-                            ui.checkbox(&mut self.readability.compact_density, "Compact density");
-                            ui.checkbox(
-                                &mut self.readability.show_timestamps,
-                                "Message timestamps",
-                            );
-                            ui.checkbox(&mut self.notifications_enabled, "Enable notifications");
-                            ui.separator();
+                    // === RESTORE OLD "BLACK BUTTON + BRIGHTER HOVER" LOOK (BASED ON TOP BAR BG) ===
+                    let top = style.colors.top_bar_bg;
 
-                            if ui.button("Advanced settings…").clicked() {
-                                self.settings_open = true;
-                                ui.close_menu();
-                            }
-                        });
+                    // Make buttons *near-black* relative to the bar, regardless of panel_fill.
+                    let base   = top.gamma_multiply(0.22); // much darker
+                    let hovered = top.gamma_multiply(0.35); // brighter on hover, but still dark
+                    let active  = top.gamma_multiply(0.30);
+                    let open    = hovered;
 
-                        ui.menu_button("Account", |ui| self.show_account_menu_contents(ui));
+                    // Apply fills
+                    s.visuals.widgets.inactive.bg_fill = base;
+                    s.visuals.widgets.hovered.bg_fill  = hovered;
+                    s.visuals.widgets.active.bg_fill   = active;
+                    s.visuals.widgets.open.bg_fill     = open;
 
-                        if ui.button("Refresh Guilds").clicked() {
-                            queue_command(
-                                &self.cmd_tx,
-                                BackendCommand::ListGuilds,
-                                &mut self.status,
-                            );
-                        }
+                    // Kill outlines
+                    s.visuals.widgets.inactive.bg_stroke.width = 0.0;
+                    s.visuals.widgets.hovered.bg_stroke.width  = 0.0;
+                    s.visuals.widgets.active.bg_stroke.width   = 0.0;
+                    s.visuals.widgets.open.bg_stroke.width     = 0.0;
 
-                        ui.separator();
-                        ui.label("Invite:");
+                    // Make sure the label color stays readable even though bg is darker
+                    let txt = egui::Color32::from_gray(210);
+                    s.visuals.widgets.inactive.fg_stroke.color = txt;
+                    s.visuals.widgets.hovered.fg_stroke.color  = txt;
+                    s.visuals.widgets.active.fg_stroke.color   = txt;
+                    s.visuals.widgets.open.fg_stroke.color     = txt;
+                    // Optional: keep panel content flush
+                    ui.set_min_width(ui.available_width());
 
-                        let invite_width = ui.available_width().clamp(120.0, 220.0);
-                        let invite_input = ui
-                            .scope(|ui| {
-                                if theme_discord_dark_palette(self.theme).is_some() {
-                                    ui.visuals_mut().override_text_color = None;
-                                }
-                                ui.add_sized(
-                                    [invite_width, ui.spacing().interact_size.y],
-                                    egui::TextEdit::singleline(&mut self.invite_code_input)
-                                        .id_source("main_invite_input")
-                                        .hint_text("Enter invite code"),
-                                )
-                            })
-                            .inner;
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(ui.available_width(), TOPBAR_HEIGHT),
+                        egui::Layout::left_to_right(egui::Align::Min),
+                        |ui| {
+                            // LEFT: menus
+                            ui.horizontal(|ui| {
+                                    ui.menu_button("⚙ Settings", |ui| {
+                                        ui.label(egui::RichText::new("Quick settings").weak());
+                                        ui.separator();
 
-                        let join_enabled = self.auth_session_established
-                            && !self.invite_code_input.trim().is_empty();
-                        let join_clicked = ui
-                            .add_enabled(join_enabled, egui::Button::new("Join Invite"))
-                            .clicked();
-                        let join_with_enter = invite_input.has_focus()
-                            && ui.input(|i| i.key_pressed(egui::Key::Enter))
-                            && join_enabled;
-                        if join_clicked || join_with_enter {
-                            let invite_code = self.invite_code_input.trim().to_string();
-                            queue_command(
-                                &self.cmd_tx,
-                                BackendCommand::JoinWithInvite { invite_code },
-                                &mut self.status,
-                            );
-                        }
+                                        ui.checkbox(&mut self.readability.compact_density, "Compact density");
+                                        ui.checkbox(
+                                            &mut self.readability.show_timestamps,
+                                            "Message timestamps",
+                                        );
+                                        ui.checkbox(
+                                            &mut self.notifications_enabled,
+                                            "Enable notifications",
+                                        );
 
-                        if ui.button("Create Invite").clicked() {
-                            if let Some(guild_id) = self.selected_guild {
-                                queue_command(
-                                    &self.cmd_tx,
-                                    BackendCommand::CreateInvite { guild_id },
-                                    &mut self.status,
-                                );
-                            } else {
-                                self.status =
-                                    "Select a workspace before creating an invite".to_string();
-                            }
-                        }
-                    });
+                                        ui.separator();
+                                        if ui.button("Advanced settings…").clicked() {
+                                            self.settings_open = true;
+                                            ui.close(); // current best practice
+                                        }
+                                    });
+
+                                    ui.menu_button("Account", |ui| {
+                                        self.show_account_menu_contents(ui);
+                                    });
+                            
+
+
+                                    // MIDDLE: actions
+                                    ui.horizontal(|ui| {
+                                        if ui.button("Refresh Guilds").clicked() {
+                                            queue_command(
+                                                &self.cmd_tx,
+                                                BackendCommand::ListGuilds,
+                                                &mut self.status,
+                                            );
+                                        }
+
+                                        let create_enabled = self.selected_guild.is_some();
+                                        if ui
+                                            .add_enabled(create_enabled, egui::Button::new("Create Invite"))
+                                            .clicked()
+                                        {
+                                            if let Some(guild_id) = self.selected_guild {
+                                                queue_command(
+                                                    &self.cmd_tx,
+                                                    BackendCommand::CreateInvite { guild_id },
+                                                    &mut self.status,
+                                                );
+                                            }
+                                        }
+
+                                        if !create_enabled {
+                                            ui.add_space(8.0);
+                                            ui.label(
+                                                egui::RichText::new("Select a workspace to create invites")
+                                                    .weak()
+                                                    .small(),
+                                            );
+                                        }
+                                    });
+
+                            
+                                // RIGHT: invite controls
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    let join_enabled = self.auth_session_established
+                                        && !self.invite_code_input.trim().is_empty();
+
+                                    let join_clicked = ui
+                                        .add_enabled(join_enabled, egui::Button::new("Join"))
+                                        .clicked();
+
+                                    ui.add_space(4.0);
+
+                                    let invite_width =
+                                        (ui.available_width() * 0.45).clamp(INVITE_MIN_W, INVITE_MAX_W);
+
+                                    let invite_response = ui
+                                        .scope(|ui| {
+                                            // Keep text color theme-safe
+                                            if theme_discord_dark_palette(self.theme).is_some() {
+                                                ui.visuals_mut().override_text_color = None;
+                                            }
+
+                                            ui.add_sized(
+                                                [invite_width, ui.spacing().interact_size.y],
+                                                egui::TextEdit::singleline(&mut self.invite_code_input)
+                                                    .id_salt("main_invite_input")
+                                                    .hint_text("Invite code"),
+                                            )
+                                        })
+                                        .inner;
+
+                                    ui.add_space(6.0);
+                                    ui.label(egui::RichText::new("Invite").weak());
+
+                                    let join_with_enter = invite_response.has_focus()
+                                        && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                                        && join_enabled;
+
+                                    if join_clicked || join_with_enter {
+                                        let invite_code = self.invite_code_input.trim().to_string();
+                                        queue_command(
+                                            &self.cmd_tx,
+                                            BackendCommand::JoinWithInvite { invite_code },
+                                            &mut self.status,
+                                        );
+                                    }
+                                });
+                            });
+                        },
+                    );
                 });
 
-                let status_row_height = 18.0;
-                ui.add_sized(
-                    [ui.available_width(), status_row_height],
-                    egui::Label::new(egui::RichText::new(&self.status).small()),
-                );
+                // Tight spacing below toolbar
+                ui.add_space(2.0);
+
+                ui.horizontal_wrapped(|ui| {
+                    ui.set_min_height(STATUS_ROW_HEIGHT);
+                    ui.label(egui::RichText::new(&self.status).small());
+                });
+
                 self.show_status_banner(ui);
             });
     }
@@ -2331,7 +2472,18 @@ impl DesktopGuiApp {
                             .on_hover_text("Attach file")
                             .clicked()
                         {
-                            self.pending_attachment = rfd::FileDialog::new().pick_file();
+                            fn default_upload_dir() -> Option<std::path::PathBuf> {
+                                // Prefer user-facing folders
+                                dirs::desktop_dir()
+                                    .or_else(dirs::download_dir)
+                                    .or_else(dirs::document_dir)
+                                    .or_else(dirs::home_dir)
+                            }
+                            let mut dialog = rfd::FileDialog::new();
+                            if let Some(dir) = default_upload_dir() {
+                                dialog = dialog.set_directory(dir);
+                            }
+                            self.pending_attachment = dialog.pick_file();
                         }
 
                         // Account for spacing so the text box doesn’t “slide”
@@ -2346,7 +2498,7 @@ impl DesktopGuiApp {
                                 ui.add_sized(
                                     [text_w, row_height],
                                     egui::TextEdit::multiline(&mut self.composer)
-                                        .id_source("composer_text")
+                                        .id_salt("composer_text")
                                         .hint_text("Message #channel (Enter to send, Shift+Enter for newline)"),
                                 )
                             })
@@ -2434,8 +2586,8 @@ impl DesktopGuiApp {
             });
 
         egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(style.colors.message_bg).inner_margin(
-                egui::Margin::symmetric(0.0, style.layout.toolbar_v_padding),
+            .frame(egui::Frame::NONE.fill(style.colors.message_bg).inner_margin(
+                egui::Margin::symmetric(0, style.layout.toolbar_v_padding as i8),
             ))
             .show(ctx, |ui| {
                 ui.add_space(style.layout.toolbar_h_padding);
@@ -2475,9 +2627,9 @@ impl DesktopGuiApp {
                                     msg.wire.sent_at.format("%Y-%m-%d %H:%M:%S UTC").to_string();
 
                                 let message_margin = if self.readability.compact_density {
-                                    egui::Margin::symmetric(8.0, 6.0)
+                                    egui::Margin::symmetric(8, 6)
                                 } else {
-                                    egui::Margin::symmetric(10.0, 8.0)
+                                    egui::Margin::symmetric(10, 8)
                                 };
                                 let discord_dark = theme_discord_dark_palette(self.theme);
                                 let base_message_bg =
@@ -2491,9 +2643,9 @@ impl DesktopGuiApp {
                                     base_message_bg
                                 };
                                 let frame = if self.readability.message_bubble_backgrounds {
-                                    egui::Frame::none().fill(row_bg)
+                                    egui::Frame::NONE.fill(row_bg)
                                 } else {
-                                    egui::Frame::none()
+                                    egui::Frame::NONE
                                 };
 
                                 ui.allocate_ui_with_layout(
@@ -2501,9 +2653,9 @@ impl DesktopGuiApp {
                                         egui::Layout::top_down(egui::Align::Min),
                                         |ui| {
                                             let message_response = frame
-                                                .rounding(egui::Rounding::same(f32::from(
+                                                .corner_radius(egui::CornerRadius::same(
                                                     self.theme.panel_rounding,
-                                                )))
+                                                ))
                                                 .inner_margin(message_margin)
                                                 .show(ui, |ui| {
                                                     ui.set_width(ui.available_width());
@@ -2660,7 +2812,7 @@ impl DesktopGuiApp {
 
                     let response = ui
                         .add(
-                            egui::ImageButton::new(
+                            egui::Button::image(
                                 egui::Image::new(&texture).fit_to_exact_size(preview_size),
                             )
                             .frame(false),
@@ -2885,19 +3037,53 @@ fn queue_command(cmd_tx: &Sender<BackendCommand>, cmd: BackendCommand, status: &
 
 #[derive(Debug, Clone, Copy)]
 struct DiscordDarkPalette {
+    // Backgrounds:
     app_background: egui::Color32,
+    nav_background: egui::Color32,
     message_background: egui::Color32,
     members_background: egui::Color32,
-    navigation_background: egui::Color32,
-    guild_entry_hover: egui::Color32,
-    guild_entry_active: egui::Color32,
-    guild_entry_stroke: egui::Color32,
-    guild_entry_stroke_active: egui::Color32,
-    guild_text_unhighlighted: egui::Color32,
-    guild_text_hovered: egui::Color32,
-    guild_text_highlighted: egui::Color32,
-    side_panel_button_fill: egui::Color32,
-    side_panel_button_text: egui::Color32,
+
+    // Main Text:
+    nav_text: egui::Color32,
+    nav_text_hover: egui::Color32,
+    nav_text_highlighted: egui::Color32,
+    message_text: egui::Color32,
+    message_hint_text: egui::Color32,
+
+    // Title Text:
+    title_text: egui::Color32,
+    nav_title_text: egui::Color32,
+
+    // Navigator Item Styling:
+    nav_item_hover: egui::Color32,
+    nav_item_active: egui::Color32,
+    nav_item_stroke: egui::Color32,
+    nav_item_stroke_active: egui::Color32,
+}
+fn theme_discord_dark_palette(theme: ThemeSettings) -> Option<DiscordDarkPalette> {
+    (theme.preset == ThemePreset::DiscordDark).then_some({
+        DiscordDarkPalette {
+            // Backgrounds:
+            app_background: egui::Color32::from_rgb(26, 26, 30),
+            nav_background: egui::Color32::from_rgb(18, 18, 20),
+            message_background: egui::Color32::from_rgb(26, 26, 30),
+            members_background: egui::Color32::from_rgb(26, 26, 30),
+            // Main Text:
+            nav_text: egui::Color32::from_rgb(129, 130, 138),
+            nav_text_hover: egui::Color32::from_rgb(251, 251, 251),
+            nav_text_highlighted: egui::Color32::from_rgb(251, 251, 251),
+            message_text: egui::Color32::from_rgb(239, 239, 241),
+            message_hint_text: egui::Color32::from_rgb(108,109,118),
+            // Title Text:
+            title_text: egui::Color32::from_rgb(251, 251, 251),
+            nav_title_text: egui::Color32::from_rgb(239, 239, 241),
+            // Navigator Item Styling:
+            nav_item_hover: egui::Color32::from_rgb(29, 29, 30),
+            nav_item_active: egui::Color32::from_rgb(44, 44, 48),
+            nav_item_stroke: egui::Color32::from_rgb(48, 48, 56),
+            nav_item_stroke_active: egui::Color32::from_rgb(92, 92, 105),
+        }
+    })
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2909,8 +3095,6 @@ struct MainWorkspaceLayout {
     toolbar_h_padding: f32,
     toolbar_v_padding: f32,
     section_vertical_gap: f32,
-    top_bar_h_padding: f32,
-    top_bar_v_padding: f32,
 }
 
 impl Default for MainWorkspaceLayout {
@@ -2923,8 +3107,6 @@ impl Default for MainWorkspaceLayout {
             toolbar_h_padding: 10.0,
             toolbar_v_padding: 8.0,
             section_vertical_gap: 8.0,
-            top_bar_h_padding: 0.0,
-            top_bar_v_padding: 0.0,
         }
     }
 }
@@ -2944,25 +3126,7 @@ struct MainWorkspaceStyle {
     discord_dark: Option<DiscordDarkPalette>,
 }
 
-fn theme_discord_dark_palette(theme: ThemeSettings) -> Option<DiscordDarkPalette> {
-    (theme.preset == ThemePreset::DiscordDark).then_some({
-        DiscordDarkPalette {
-            app_background: egui::Color32::from_rgb(26, 26, 30),
-            message_background: egui::Color32::from_rgb(26, 26, 30),
-            members_background: egui::Color32::from_rgb(26, 26, 30),
-            navigation_background: egui::Color32::from_rgb(18, 18, 20),
-            guild_entry_hover: egui::Color32::from_rgb(29, 29, 30),
-            guild_entry_active: egui::Color32::from_rgb(44, 44, 48),
-            guild_entry_stroke: egui::Color32::from_rgb(48, 48, 56),
-            guild_entry_stroke_active: egui::Color32::from_rgb(92, 92, 105),
-            guild_text_unhighlighted: egui::Color32::from_rgb(129, 130, 138),
-            guild_text_hovered: egui::Color32::from_rgb(251, 251, 251),
-            guild_text_highlighted: egui::Color32::from_rgb(251, 251, 251),
-            side_panel_button_fill: egui::Color32::from_rgb(35, 35, 40),
-            side_panel_button_text: egui::Color32::from_rgb(236, 237, 240),
-        }
-    })
-}
+
 
 fn visuals_for_theme(theme: ThemeSettings) -> egui::Visuals {
     let mut visuals = match theme.preset {
@@ -3002,14 +3166,6 @@ fn visuals_for_theme(theme: ThemeSettings) -> egui::Visuals {
     visuals.selection.bg_fill = theme.accent_color;
     visuals.widgets.active.bg_fill = theme.accent_color;
     visuals.widgets.hovered.bg_fill = theme.accent_color.gamma_multiply(0.85);
-
-    let radius = f32::from(theme.panel_rounding);
-    visuals.widgets.noninteractive.rounding = egui::Rounding::same(radius);
-    visuals.widgets.inactive.rounding = egui::Rounding::same(radius);
-    visuals.widgets.hovered.rounding = egui::Rounding::same(radius);
-    visuals.widgets.active.rounding = egui::Rounding::same(radius);
-    visuals.widgets.open.rounding = egui::Rounding::same(radius);
-
     visuals
 }
 
@@ -3616,6 +3772,14 @@ fn main() -> eframe::Result<()> {
             .with_min_inner_size([980.0, 640.0]),
         ..Default::default()
     };
+    let args = CliArgs::parse();
+
+    let startup = StartupConfig {
+        server_url: args.server_url,
+        username: args.username.clone(),
+        display_name: args.display_name.unwrap_or(args.username),
+        data_dir: args.data_dir,
+    };
     eframe::run_native(
         "Prototype RTC Desktop GUI",
         options,
@@ -3629,6 +3793,7 @@ fn main() -> eframe::Result<()> {
                 cmd_tx,
                 ui_rx,
                 persisted_settings,
+                startup,
             )))
         }),
     )
