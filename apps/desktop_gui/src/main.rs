@@ -15,6 +15,18 @@ mod ui;
 
 use arboard::{Clipboard, ImageData};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use clap::Parser;
+
+fn ui_in_rect(ui: &mut egui::Ui, rect: egui::Rect, add: impl FnOnce(&mut egui::Ui)) {
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(rect)
+            .layout(egui::Layout::top_down(egui::Align::Min)),
+    );
+    child.set_clip_rect(rect);
+    add(&mut child);
+}
+
 use client_core::{
     AttachmentUpload, ClientEvent, ClientHandle, DurableMlsSessionManager, PassthroughCrypto,
     RealtimeClient, VoiceConnectOptions, VoiceParticipantState, VoiceSessionSnapshot,
@@ -31,7 +43,6 @@ use shared::{
         AttachmentPayload, ChannelSummary, GuildSummary, MemberSummary, MessagePayload, ServerEvent,
     },
 };
-use clap::Parser;
 
 #[derive(Debug, Clone)]
 pub struct StartupConfig {
@@ -68,7 +79,7 @@ struct CliArgs {
 }
 #[derive(Debug, Clone)]
 pub struct AppPaths {
-    pub data_root: std::path::PathBuf,   // per-profile isolated
+    pub data_root: std::path::PathBuf, // per-profile isolated
     pub cache_dir: std::path::PathBuf,
     pub db_path: std::path::PathBuf,
     pub mls_dir: std::path::PathBuf,
@@ -83,7 +94,9 @@ impl AppPaths {
             // Fallback: per-user app data + username namespace
             let base = dirs::data_local_dir()
                 .ok_or_else(|| anyhow::anyhow!("unable to resolve local app data dir"))?;
-            base.join("proto_rtc").join("profiles").join(&startup.username)
+            base.join("proto_rtc")
+                .join("profiles")
+                .join(&startup.username)
         };
 
         Ok(Self {
@@ -669,6 +682,13 @@ struct DesktopGuiApp {
     applied_readability: Option<UiReadabilitySettings>,
     composer_panel_height: f32,
     left_user_panel_height: f32,
+    left_sidebar_width: f32,
+    members_panel_width: f32,
+    guilds_column_width: f32,
+    show_members_panel: bool,
+    show_guilds_panel: bool,
+    history: Vec<String>,
+    history_index: usize,
 
     // New: stable per-view UI state so text boxes keep focus reliably.
     login_ui: LoginUiState,
@@ -712,7 +732,7 @@ impl DesktopGuiApp {
         ui_rx: Receiver<UiEvent>,
         persisted_settings: Option<PersistedDesktopSettings>,
         startup: StartupConfig,
-    ) -> Self{
+    ) -> Self {
         let (theme, readability, composer_panel_height, left_user_panel_height) =
             persisted_settings.unwrap_or_default().into_runtime();
         Self {
@@ -752,6 +772,13 @@ impl DesktopGuiApp {
             applied_readability: None,
             composer_panel_height,
             left_user_panel_height,
+            left_sidebar_width: 360.0,
+            members_panel_width: 250.0,
+            guilds_column_width: 118.0,
+            show_members_panel: true,
+            show_guilds_panel: true,
+            history: vec!["#general".to_string()],
+            history_index: 0,
             login_ui: LoginUiState::default(),
             tick: 0,
         }
@@ -1577,40 +1604,103 @@ impl DesktopGuiApp {
 
     #[allow(dead_code)]
     fn render_left_user_panel(&mut self, ui: &mut egui::Ui) {
-        let discord_dark = theme_discord_dark_palette(self.theme);
-        egui::Frame::group(ui.style())
-            .fill(
-                discord_dark
-                    .map(|p| p.message_background)
-                    .unwrap_or(ui.visuals().panel_fill),
-            )
+        let palette = theme_discord_dark_palette(self.theme).unwrap();
+        egui::Frame::new()
+            .fill(egui::Color32::TRANSPARENT)
+            .inner_margin(egui::Margin::symmetric(8, 6))
             .show(ui, |ui| {
+                let content_h = 32.0;
+                let extra = (ui.available_height() - content_h).max(0.0);
+                ui.add_space(extra * 0.5);
+
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("●").color(egui::Color32::from_rgb(67, 181, 129)));
-                    ui.strong(&self.username);
-                    let status_label = if self.voice_ui.active_session.is_some() {
-                        "In voice"
-                    } else {
-                        "Online"
-                    };
-                    ui.small(format!("· {status_label}"));
-                });
-                ui.add_space(4.0);
-                ui.horizontal_wrapped(|ui| {
-                    ui.toggle_value(&mut self.voice_ui.muted, "Mute");
-                    ui.toggle_value(&mut self.voice_ui.deafened, "Deafen");
-                });
-                ui.add_space(6.0);
-                ui.horizontal_wrapped(|ui| {
-                    if ui.button("⚙ Settings").clicked() {
-                        self.settings_open = true;
-                    }
-                    if ui.button("⎋ Sign out").clicked() {
-                        self.auth_session_established = false;
-                        self.view_state = AppViewState::Login;
-                        self.status = "Signed out".to_string();
-                        self.status_banner = None;
-                    }
+                    let (avatar, _) =
+                        ui.allocate_exact_size(egui::vec2(32.0, 32.0), egui::Sense::hover());
+                    ui.painter().rect_filled(
+                        avatar,
+                        egui::CornerRadius::same(16),
+                        egui::Color32::from_rgb(70, 75, 90),
+                    );
+                    ui.painter().circle_filled(
+                        egui::pos2(avatar.right() - 4.0, avatar.bottom() - 4.0),
+                        4.0,
+                        egui::Color32::from_rgb(35, 165, 90),
+                    );
+
+                    ui.add_space(4.0);
+                    ui.vertical(|ui| {
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(&self.username)
+                                    .color(palette.title_text)
+                                    .strong()
+                                    .size(13.0),
+                            )
+                            .selectable(false),
+                        );
+                        let status = if self.voice_ui.deafened {
+                            "Deafened"
+                        } else if self.voice_ui.muted {
+                            "Muted"
+                        } else {
+                            "Online"
+                        };
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(status)
+                                    .color(palette.message_hint_text)
+                                    .size(11.0),
+                            )
+                            .selectable(false),
+                        );
+                    });
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add(icon_btn("⚙", egui::Color32::from_rgb(185, 187, 190), None))
+                            .clicked()
+                        {
+                            self.settings_open = true;
+                        }
+                        let deafen_on = self.voice_ui.deafened;
+                        if ui
+                            .add(icon_btn(
+                                "🎧",
+                                if deafen_on {
+                                    egui::Color32::from_rgb(240, 71, 71)
+                                } else {
+                                    egui::Color32::from_rgb(185, 187, 190)
+                                },
+                                if deafen_on {
+                                    Some(egui::Color32::from_rgb(63, 39, 43))
+                                } else {
+                                    None
+                                },
+                            ))
+                            .clicked()
+                        {
+                            self.voice_ui.deafened = !self.voice_ui.deafened;
+                        }
+                        let mute_on = self.voice_ui.muted;
+                        if ui
+                            .add(icon_btn(
+                                "🎤",
+                                if mute_on {
+                                    egui::Color32::from_rgb(240, 71, 71)
+                                } else {
+                                    egui::Color32::from_rgb(185, 187, 190)
+                                },
+                                if mute_on {
+                                    Some(egui::Color32::from_rgb(63, 39, 43))
+                                } else {
+                                    None
+                                },
+                            ))
+                            .clicked()
+                        {
+                            self.voice_ui.muted = !self.voice_ui.muted;
+                        }
+                    });
                 });
             });
     }
@@ -1831,27 +1921,23 @@ impl DesktopGuiApp {
         selected: bool,
         discord_dark: Option<DiscordDarkPalette>,
     ) -> egui::Response {
-        let base_bg = discord_dark
-            .map(|p| p.nav_background)
-            .unwrap_or_else(|| {
-                if self.theme.list_row_shading {
-                    ui.visuals().faint_bg_color
+        let base_bg = discord_dark.map(|p| p.nav_background).unwrap_or_else(|| {
+            if self.theme.list_row_shading {
+                ui.visuals().faint_bg_color
+            } else {
+                egui::Color32::TRANSPARENT
+            }
+        });
+        let selected_bg = discord_dark.map(|p| p.nav_item_active).unwrap_or_else(|| {
+            ui.visuals()
+                .selection
+                .bg_fill
+                .gamma_multiply(if self.theme.list_row_shading {
+                    0.35
                 } else {
-                    egui::Color32::TRANSPARENT
-                }
-            });
-        let selected_bg = discord_dark
-            .map(|p| p.nav_item_active)
-            .unwrap_or_else(|| {
-                ui.visuals()
-                    .selection
-                    .bg_fill
-                    .gamma_multiply(if self.theme.list_row_shading {
-                        0.35
-                    } else {
-                        0.22
-                    })
-            });
+                    0.22
+                })
+        });
         let row_stroke = discord_dark
             .map(|palette| {
                 egui::Stroke::new(
@@ -1897,7 +1983,7 @@ impl DesktopGuiApp {
                 rect,
                 egui::CornerRadius::same(u8::from(self.theme.panel_rounding)),
                 row_stroke,
-                egui::StrokeKind::Middle
+                egui::StrokeKind::Middle,
             );
         }
 
@@ -2239,511 +2325,692 @@ impl DesktopGuiApp {
             });
     }
 
-    fn show_top_bar(&mut self, ctx: &egui::Context, style: MainWorkspaceStyle) {
-        const STATUS_ROW_HEIGHT: f32 = 20.0;
-        const INVITE_MIN_W: f32 = 140.0;
-        const INVITE_MAX_W: f32 = 260.0;
-        const TOPBAR_HEIGHT: f32 = 24.0;
+    fn show_top_bar(&mut self, ctx: &egui::Context, _style: MainWorkspaceStyle) {
+        let palette = theme_discord_dark_palette(self.theme).unwrap();
+        let topbar_bg = egui::Color32::from_rgb(21, 21, 24);
+        let sub_topbar_bg = egui::Color32::from_rgb(30, 31, 36);
 
-        egui::TopBottomPanel::top("top_bar")
+        egui::TopBottomPanel::top("app_top_menu_bar")
             .resizable(false)
+            .exact_height(30.0)
             .frame(
-                egui::Frame {
-                    fill: style.colors.top_bar_bg,
-                    inner_margin: egui::Margin {
-                        top: 1,
-                        bottom: 0,
-                        left: 0,
-                        right: 0,
-                    },
-                    outer_margin: egui::Margin::same(0),
-                    ..Default::default()
-                }
+                egui::Frame::new()
+                    .fill(topbar_bg)
+                    .inner_margin(egui::Margin::symmetric(6, 3)),
             )
             .show(ctx, |ui| {
-                ui.scope(|ui| {
-                    let s = ui.style_mut();
-                    s.spacing.item_spacing.x = 1.0;
-                    s.spacing.button_padding = egui::vec2(8.0, 1.0);
-                    s.spacing.interact_size.y = TOPBAR_HEIGHT;
+                egui::MenuBar::new().ui(ui, |ui| {
+                    ui.spacing_mut().button_padding = egui::vec2(8.0, 3.0);
+                    ui.menu_button("Settings", |ui| {
+                        ui.set_min_width(240.0);
+                        ui.checkbox(&mut self.settings_open, "Show settings window");
+                        ui.separator();
+                        ui.label(egui::RichText::new("Appearance").color(palette.nav_title_text));
+                        ui.checkbox(&mut self.show_members_panel, "Show members panel");
+                        ui.checkbox(&mut self.show_guilds_panel, "Show guilds column");
+                        ui.checkbox(
+                            &mut self.readability.compact_density,
+                            "Compact message rows",
+                        );
+                    });
+                    ui.menu_button("Account", |ui| self.show_account_menu_contents(ui));
+                    ui.menu_button("View", |ui| {
+                        ui.checkbox(&mut self.show_members_panel, "Members panel");
+                        ui.checkbox(&mut self.show_guilds_panel, "Guilds column");
+                    });
+                    ui.menu_button("Help", |ui| {
+                        ui.label("Discord-style UI mockup built with egui.");
+                    });
+                });
+            });
 
-                    // Keep your "no rounding" rules:
-                    let zero = egui::CornerRadius::ZERO;
-                    s.visuals.widgets.inactive.corner_radius = zero;
-                    s.visuals.widgets.hovered.corner_radius = zero;
-                    s.visuals.widgets.active.corner_radius = zero;
-                    s.visuals.widgets.open.corner_radius = zero;
-                    s.visuals.widgets.noninteractive.corner_radius = zero;
-
-                    // === RESTORE OLD "BLACK BUTTON + BRIGHTER HOVER" LOOK (BASED ON TOP BAR BG) ===
-                    let top = style.colors.top_bar_bg;
-
-                    // Make buttons *near-black* relative to the bar, regardless of panel_fill.
-                    let base   = top.gamma_multiply(0.22); // much darker
-                    let hovered = top.gamma_multiply(0.35); // brighter on hover, but still dark
-                    let active  = top.gamma_multiply(0.30);
-                    let open    = hovered;
-
-                    // Apply fills
-                    s.visuals.widgets.inactive.bg_fill = base;
-                    s.visuals.widgets.hovered.bg_fill  = hovered;
-                    s.visuals.widgets.active.bg_fill   = active;
-                    s.visuals.widgets.open.bg_fill     = open;
-
-                    // Kill outlines
-                    s.visuals.widgets.inactive.bg_stroke.width = 0.0;
-                    s.visuals.widgets.hovered.bg_stroke.width  = 0.0;
-                    s.visuals.widgets.active.bg_stroke.width   = 0.0;
-                    s.visuals.widgets.open.bg_stroke.width     = 0.0;
-
-                    // Make sure the label color stays readable even though bg is darker
-                    let txt = egui::Color32::from_gray(210);
-                    s.visuals.widgets.inactive.fg_stroke.color = txt;
-                    s.visuals.widgets.hovered.fg_stroke.color  = txt;
-                    s.visuals.widgets.active.fg_stroke.color   = txt;
-                    s.visuals.widgets.open.fg_stroke.color     = txt;
-                    // Optional: keep panel content flush
-                    ui.set_min_width(ui.available_width());
-
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(ui.available_width(), TOPBAR_HEIGHT),
-                        egui::Layout::left_to_right(egui::Align::Min),
-                        |ui| {
-                            // LEFT: menus
-                            ui.horizontal(|ui| {
-                                    ui.menu_button("⚙ Settings", |ui| {
-                                        ui.label(egui::RichText::new("Quick settings").weak());
-                                        ui.separator();
-
-                                        ui.checkbox(&mut self.readability.compact_density, "Compact density");
-                                        ui.checkbox(
-                                            &mut self.readability.show_timestamps,
-                                            "Message timestamps",
-                                        );
-                                        ui.checkbox(
-                                            &mut self.notifications_enabled,
-                                            "Enable notifications",
-                                        );
-
-                                        ui.separator();
-                                        if ui.button("Advanced settings…").clicked() {
-                                            self.settings_open = true;
-                                            ui.close(); // current best practice
-                                        }
-                                    });
-
-                                    ui.menu_button("Account", |ui| {
-                                        self.show_account_menu_contents(ui);
-                                    });
-                            
-
-
-                                    // MIDDLE: actions
-                                    ui.horizontal(|ui| {
-                                        if ui.button("Refresh Guilds").clicked() {
-                                            queue_command(
-                                                &self.cmd_tx,
-                                                BackendCommand::ListGuilds,
-                                                &mut self.status,
-                                            );
-                                        }
-
-                                        let create_enabled = self.selected_guild.is_some();
-                                        if ui
-                                            .add_enabled(create_enabled, egui::Button::new("Create Invite"))
-                                            .clicked()
-                                        {
-                                            if let Some(guild_id) = self.selected_guild {
-                                                queue_command(
-                                                    &self.cmd_tx,
-                                                    BackendCommand::CreateInvite { guild_id },
-                                                    &mut self.status,
-                                                );
-                                            }
-                                        }
-
-                                        if !create_enabled {
-                                            ui.add_space(8.0);
-                                            ui.label(
-                                                egui::RichText::new("Select a workspace to create invites")
-                                                    .weak()
-                                                    .small(),
-                                            );
-                                        }
-                                    });
-
-                            
-                                // RIGHT: invite controls
-                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    let join_enabled = self.auth_session_established
-                                        && !self.invite_code_input.trim().is_empty();
-
-                                    let join_clicked = ui
-                                        .add_enabled(join_enabled, egui::Button::new("Join"))
-                                        .clicked();
-
-                                    ui.add_space(4.0);
-
-                                    let invite_width =
-                                        (ui.available_width() * 0.45).clamp(INVITE_MIN_W, INVITE_MAX_W);
-
-                                    let invite_response = ui
-                                        .scope(|ui| {
-                                            // Keep text color theme-safe
-                                            if theme_discord_dark_palette(self.theme).is_some() {
-                                                ui.visuals_mut().override_text_color = None;
-                                            }
-
-                                            ui.add_sized(
-                                                [invite_width, ui.spacing().interact_size.y],
-                                                egui::TextEdit::singleline(&mut self.invite_code_input)
-                                                    .id_salt("main_invite_input")
-                                                    .hint_text("Invite code"),
-                                            )
-                                        })
-                                        .inner;
-
-                                    ui.add_space(6.0);
-                                    ui.label(egui::RichText::new("Invite").weak());
-
-                                    let join_with_enter = invite_response.has_focus()
-                                        && ui.input(|i| i.key_pressed(egui::Key::Enter))
-                                        && join_enabled;
-
-                                    if join_clicked || join_with_enter {
-                                        let invite_code = self.invite_code_input.trim().to_string();
-                                        queue_command(
-                                            &self.cmd_tx,
-                                            BackendCommand::JoinWithInvite { invite_code },
-                                            &mut self.status,
-                                        );
-                                    }
-                                });
-                            });
-                        },
+        egui::TopBottomPanel::top("sub_top_bar")
+            .resizable(false)
+            .exact_height(38.0)
+            .frame(
+                egui::Frame::new()
+                    .fill(sub_topbar_bg)
+                    .inner_margin(egui::Margin::symmetric(8, 5)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    let can_back = self.history_index > 0;
+                    let can_fwd = self.history_index + 1 < self.history.len();
+                    if ui
+                        .add_enabled(
+                            can_back,
+                            egui::Button::new(
+                                egui::RichText::new("⬅").color(palette.nav_text_hover),
+                            )
+                            .min_size(egui::vec2(26.0, 24.0)),
+                        )
+                        .clicked()
+                    {
+                        self.history_index = self.history_index.saturating_sub(1);
+                    }
+                    if ui
+                        .add_enabled(
+                            can_fwd,
+                            egui::Button::new(
+                                egui::RichText::new("➡").color(palette.nav_text_hover),
+                            )
+                            .min_size(egui::vec2(26.0, 24.0)),
+                        )
+                        .clicked()
+                    {
+                        self.history_index =
+                            (self.history_index + 1).min(self.history.len().saturating_sub(1));
+                    }
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new("⟳").color(palette.nav_text_hover),
+                            )
+                            .min_size(egui::vec2(26.0, 24.0)),
+                        )
+                        .clicked()
+                    {
+                        queue_command(&self.cmd_tx, BackendCommand::ListGuilds, &mut self.status);
+                    }
+                    ui.separator();
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new("Update")
+                                    .strong()
+                                    .color(egui::Color32::WHITE),
+                            )
+                            .fill(self.theme.accent_color)
+                            .stroke(egui::Stroke::NONE)
+                            .min_size(egui::vec2(72.0, 24.0)),
+                        )
+                        .clicked()
+                    {
+                        ctx.open_url(egui::OpenUrl {
+                            url: "https://github.com/yourname/discord-egui-mockup".into(),
+                            new_tab: true,
+                        });
+                    }
+                    let recent = self
+                        .history
+                        .get(self.history_index)
+                        .cloned()
+                        .unwrap_or_else(|| "None".to_string());
+                    ui.label(
+                        egui::RichText::new(format!("Recent: {recent}"))
+                            .color(palette.message_hint_text),
                     );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new("Refresh Guilds")
+                                        .color(palette.nav_text_hover),
+                                )
+                                .min_size(egui::vec2(104.0, 24.0)),
+                            )
+                            .clicked()
+                        {
+                            queue_command(
+                                &self.cmd_tx,
+                                BackendCommand::ListGuilds,
+                                &mut self.status,
+                            );
+                        }
+                    });
                 });
-
-                // Tight spacing below toolbar
-                ui.add_space(2.0);
-
-                ui.horizontal_wrapped(|ui| {
-                    ui.set_min_height(STATUS_ROW_HEIGHT);
-                    ui.label(egui::RichText::new(&self.status).small());
-                });
-
-                self.show_status_banner(ui);
             });
     }
 
     fn show_main_workspace(&mut self, ctx: &egui::Context) {
         let style = self.main_workspace_style(ctx);
-
         self.show_top_bar(ctx, style);
-
         self.show_settings_window(ctx);
 
-        self.show_left_navigation_panel(ctx, style);
-
-        self.show_members_side_panel(ctx, style);
-
-        egui::TopBottomPanel::bottom("composer_panel")
-            .resizable(true)
-            // pick a sane starting height once; egui will persist the resized height internally
-            .default_height(MIN_COMPOSER_PANEL_HEIGHT.max(96.0))
-            .min_height(MIN_COMPOSER_PANEL_HEIGHT)
-            .max_height(MAX_COMPOSER_PANEL_HEIGHT)
-            .show(ctx, |ui| {
-                ui.add_space(6.0);
-
-                let can_send = self.selected_channel.is_some();
-                let enabled = can_send && self.auth_session_established;
-
-                // Use the *current* panel height for sizing, but do NOT store it and feed it back.
-                let panel_h = ui.available_height();
-                let row_height = (panel_h - 18.0).clamp(36.0, 72.0);
-                let send_width = (88.0 + (row_height - 36.0) * 0.28).clamp(88.0, 124.0);
-                let attachment_width = (38.0 + (row_height - 36.0) * 0.12).clamp(38.0, 48.0);
-
-                ui.add_enabled_ui(enabled, |ui| {
-                    ui.horizontal(|ui| {
-                        // Make the attachment button actually occupy attachment_width
-                        if ui.add_sized([attachment_width, row_height], egui::Button::new("📎"))
-                            .on_hover_text("Attach file")
-                            .clicked()
-                        {
-                            fn default_upload_dir() -> Option<std::path::PathBuf> {
-                                // Prefer user-facing folders
-                                dirs::desktop_dir()
-                                    .or_else(dirs::download_dir)
-                                    .or_else(dirs::document_dir)
-                                    .or_else(dirs::home_dir)
-                            }
-                            let mut dialog = rfd::FileDialog::new();
-                            if let Some(dir) = default_upload_dir() {
-                                dialog = dialog.set_directory(dir);
-                            }
-                            self.pending_attachment = dialog.pick_file();
-                        }
-
-                        // Account for spacing so the text box doesn’t “slide”
-                        let spacing = ui.spacing().item_spacing.x;
-                        let text_w = (ui.available_width() - send_width - spacing).max(64.0);
-
-                        let response = ui
-                            .scope(|ui| {
-                                if let Some(palette) = theme_discord_dark_palette(self.theme) {
-                                    ui.visuals_mut().extreme_bg_color = palette.message_background;
-                                }
-                                ui.add_sized(
-                                    [text_w, row_height],
-                                    egui::TextEdit::multiline(&mut self.composer)
-                                        .id_salt("composer_text")
-                                        .hint_text("Message #channel (Enter to send, Shift+Enter for newline)"),
-                                )
-                            })
-                            .inner;
-
-                        let send_shortcut = response.has_focus()
-                            && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
-
-                        let clicked_send = ui
-                            .add_sized([send_width, row_height], egui::Button::new("⬆ Send"))
-                            .clicked();
-
-                        if send_shortcut || clicked_send {
-                            self.try_send_current_composer(&response);
-                        }
-                    });
-
-                    // If attachment previews can be tall, keep them from forcing layout thrash:
-                    // show them in a small scroll area inside the panel.
-                    if let Some(path) = self.pending_attachment.clone() {
-                        ui.add_space(6.0);
-
-                        egui::ScrollArea::vertical()
-                            .max_height((panel_h - row_height - 18.0).max(0.0))
-                            .show(ui, |ui| {
-                                ui.horizontal_wrapped(|ui| {
-                                    ui.small(format!("Attached: {}", path.display()));
-                                    if ui.button("✕ Remove").clicked() {
-                                        self.pending_attachment = None;
-                                    }
-                                });
-
-                                let file_name = path
-                                    .file_name()
-                                    .and_then(|name| name.to_str())
-                                    .unwrap_or("attachment");
-                                let size_text = Self::attachment_size_text(&path);
-
-                                match self.load_attachment_preview(ctx, &path) {
-                                    Some(AttachmentPreview::Image { texture, size, preview_png }) => {
-                                        egui::Frame::group(ui.style()).show(ui, |ui| {
-                                            ui.horizontal(|ui| {
-                                                ui.label(format!("🖼 {file_name}"));
-                                                ui.small(size_text.clone());
-                                            });
-                                            let img_resp = ui.add(
-                                                egui::Image::new((texture.id(), size))
-                                                    .max_size(egui::vec2(240.0, 240.0)),
-                                            );
-                                            let metadata = format!("name: {file_name}\nsize: {size_text}");
-                                            img_resp.context_menu(|ui| {
-                                                self.render_image_context_menu(
-                                                    ui,
-                                                    file_name,
-                                                    fs::read(&path).ok().as_deref(),
-                                                    Some(preview_png.as_slice()),
-                                                    Some(path.as_path()),
-                                                    Some(&metadata),
-                                                );
-                                            });
-                                        });
-                                    }
-                                    Some(AttachmentPreview::DecodeFailed) => {
-                                        egui::Frame::group(ui.style()).show(ui, |ui| {
-                                            ui.label(format!("⚠ {file_name}"));
-                                            ui.small(size_text.clone());
-                                            ui.small("Image preview unavailable (decode failed)");
-                                        });
-                                    }
-                                    None => {
-                                        egui::Frame::group(ui.style()).show(ui, |ui| {
-                                            ui.label(format!("📎 {file_name}"));
-                                            ui.small(size_text);
-                                        });
-                                    }
-                                }
-                            });
-                    }
+        if self.show_members_panel {
+            let members = egui::SidePanel::right("members_panel")
+                .resizable(true)
+                .default_width(self.members_panel_width)
+                .width_range(180.0..=420.0)
+                .frame(
+                    egui::Frame::new()
+                        .fill(style.colors.members_bg)
+                        .inner_margin(egui::Margin::same(0)),
+                )
+                .show(ctx, |ui| {
+                    self.show_members_side_panel_contents(ui, style.discord_dark)
                 });
-
-                // IMPORTANT: don’t put a “fill remaining height” widget here.
-                // Show the “pick a channel” hint in the *CentralPanel* instead (see below).
-
-                ui.add_space(4.0);
-            });
+            self.members_panel_width = members.response.rect.width();
+        }
 
         egui::CentralPanel::default()
-            .frame(egui::Frame::NONE.fill(style.colors.message_bg).inner_margin(
-                egui::Margin::symmetric(0, style.layout.toolbar_v_padding as i8),
-            ))
+            .frame(
+                egui::Frame::new()
+                    .fill(style.colors.message_bg)
+                    .inner_margin(egui::Margin::same(0)),
+            )
             .show(ctx, |ui| {
-                ui.add_space(style.layout.toolbar_h_padding);
-                ui.horizontal(|ui| {
-                    ui.heading("Messages");
-                    if let Some(channel_id) = self.selected_channel {
-                        if ui.button("Load older").clicked() {
-                            if let Some(before) = self.oldest_message_id(channel_id) {
-                                queue_command(
-                                    &self.cmd_tx,
-                                    BackendCommand::LoadMoreMessages { channel_id, before },
-                                    &mut self.status,
-                                );
-                            }
-                        }
+                let full = ui.max_rect();
+                let min_left = 240.0;
+                let min_center = 220.0;
+                let splitter_w = 8.0;
+                let max_left = (full.width() - min_center).max(min_left).min(560.0);
+                self.left_sidebar_width = self.left_sidebar_width.clamp(min_left, max_left);
+                let mut split_x = (full.left() + self.left_sidebar_width)
+                    .clamp(full.left() + min_left, full.right() - min_center);
+
+                let splitter_rect = egui::Rect::from_min_max(
+                    egui::pos2(split_x - splitter_w * 0.5, full.top()),
+                    egui::pos2(split_x + splitter_w * 0.5, full.bottom()),
+                );
+                let resp = ui.interact(
+                    splitter_rect,
+                    ui.make_persistent_id("left_nav_manual_splitter"),
+                    egui::Sense::click_and_drag(),
+                );
+                if resp.dragged() {
+                    if let Some(pointer) = resp.interact_pointer_pos() {
+                        split_x = pointer
+                            .x
+                            .clamp(full.left() + min_left, full.right() - min_center);
+                        self.left_sidebar_width = (split_x - full.left()).clamp(min_left, max_left);
                     }
-                });
-                ui.add_space(style.layout.section_vertical_gap);
-                ui.separator();
-                ui.add_space(2.0);
-
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    ui.add_space(style.layout.toolbar_h_padding);
-                    let mut hovered_message = None;
-                    if let Some(channel_id) = self.selected_channel {
-                        if let Some(messages) = self.messages.get(&channel_id).cloned() {
-                            for msg in &messages {
-                                let sender_display = msg
-                                    .wire
-                                    .sender_username
-                                    .clone()
-                                    .or_else(|| {
-                                        self.sender_directory.get(&msg.wire.sender_id.0).cloned()
-                                    })
-                                    .unwrap_or_else(|| msg.wire.sender_id.0.to_string());
-                                let sent_at =
-                                    msg.wire.sent_at.format("%Y-%m-%d %H:%M:%S UTC").to_string();
-
-                                let message_margin = if self.readability.compact_density {
-                                    egui::Margin::symmetric(8, 6)
-                                } else {
-                                    egui::Margin::symmetric(10, 8)
-                                };
-                                let discord_dark = theme_discord_dark_palette(self.theme);
-                                let base_message_bg =
-                                    discord_dark.map(|p| p.message_background).unwrap_or_else(
-                                        || ui.visuals().faint_bg_color.gamma_multiply(0.45),
-                                    );
-                                let hover_message_bg = lighten_color(base_message_bg, 0.12);
-                                let row_bg = if self.hovered_message == Some(msg.wire.message_id) {
-                                    hover_message_bg
-                                } else {
-                                    base_message_bg
-                                };
-                                let frame = if self.readability.message_bubble_backgrounds {
-                                    egui::Frame::NONE.fill(row_bg)
-                                } else {
-                                    egui::Frame::NONE
-                                };
-
-                                ui.allocate_ui_with_layout(
-                                        egui::vec2(ui.available_width(), 0.0),
-                                        egui::Layout::top_down(egui::Align::Min),
-                                        |ui| {
-                                            let message_response = frame
-                                                .corner_radius(egui::CornerRadius::same(
-                                                    self.theme.panel_rounding,
-                                                ))
-                                                .inner_margin(message_margin)
-                                                .show(ui, |ui| {
-                                                    ui.set_width(ui.available_width());
-                                                    ui.horizontal_wrapped(|ui| {
-                                                        ui.label(
-                                                            egui::RichText::new(sender_display)
-                                                                .strong(),
-                                                        );
-                                                        if self.readability.show_timestamps {
-                                                            ui.label(
-                                                                egui::RichText::new(sent_at)
-                                                                    .small()
-                                                                    .weak(),
-                                                            );
-                                                        }
-                                                    });
-                                                    ui.label(&msg.plaintext);
-                                                    if let Some(attachment) = &msg.wire.attachment {
-                                                        if attachment_is_image(attachment) {
-                                                            self.render_image_attachment_preview(
-                                                                ui, attachment,
-                                                            );
-                                                        } else {
-                                                            ui.horizontal(|ui| {
-                                                                ui.label(format!(
-                                                                    "📎 {} ({})",
-                                                                    attachment.filename,
-                                                                    human_readable_bytes(
-                                                                        attachment.size_bytes
-                                                                    )
-                                                                ));
-                                                                if ui.button("Download").clicked()
-                                                                {
-                                                                    queue_command(
-                                                                        &self.cmd_tx,
-                                                                        BackendCommand::DownloadAttachment {
-                                                                            file_id: attachment.file_id,
-                                                                            filename: attachment
-                                                                                .filename
-                                                                                .clone(),
-                                                                        },
-                                                                        &mut self.status,
-                                                                    );
-                                                                }
-                                                            });
-                                                        }
-                                                    }
-                                                })
-                                                .response;
-                                            if message_response.hovered() {
-                                                hovered_message = Some(msg.wire.message_id);
-                                            }
-                                        },
-                                    );
-
-                                ui.add_space(if self.readability.compact_density {
-                                    6.0
-                                } else {
-                                    8.0
-                                });
-                            }
-                        } else {
-                            ui.allocate_ui_with_layout(
-
-                                ui.available_size(),
-                                egui::Layout::centered_and_justified(egui::Direction::TopDown),
-                                |ui| {
-                                    ui.heading("Pick a channel");
-                                    ui.weak("Pick a channel to start chatting.");
-                                },
-                            );
-                        }
-                    }
-                    self.hovered_message = hovered_message;
-                });
-
-                if !self.auth_session_established {
-                    ui.separator();
-                    ui.colored_label(
-                        egui::Color32::YELLOW,
-                        "Chat is disabled until an authenticated session is established.",
-                    );
                 }
+
+                let nav_rect = egui::Rect::from_min_max(
+                    full.min,
+                    egui::pos2(split_x - splitter_w * 0.5, full.bottom()),
+                );
+                let center_rect = egui::Rect::from_min_max(
+                    egui::pos2(split_x + splitter_w * 0.5, full.top()),
+                    full.max,
+                );
+
+                ui_in_rect(ui, nav_rect, |ui| {
+                    self.show_nav_sidebar_area(ui, style.discord_dark);
+                });
+
+                ui_in_rect(ui, center_rect, |ui| {
+                    self.show_message_area(ui, style.discord_dark);
+                });
+
+                ui.painter().line_segment(
+                    [
+                        egui::pos2(split_x, full.top()),
+                        egui::pos2(split_x, full.bottom()),
+                    ],
+                    egui::Stroke::new(
+                        1.0,
+                        if resp.hovered() || resp.dragged() {
+                            style
+                                .discord_dark
+                                .map(|p| p.nav_item_stroke_active)
+                                .unwrap_or(style.colors.nav_bg)
+                        } else {
+                            egui::Color32::from_rgb(40, 41, 46)
+                        },
+                    ),
+                );
             });
 
         self.render_expanded_preview_window(ctx);
     }
 
+    fn show_nav_sidebar_area(
+        &mut self,
+        ui: &mut egui::Ui,
+        discord_dark: Option<DiscordDarkPalette>,
+    ) {
+        let palette =
+            discord_dark.unwrap_or_else(|| theme_discord_dark_palette(self.theme).unwrap());
+        let full = ui.max_rect();
+        let splitter_h = 8.0;
+        self.left_user_panel_height = 72.0;
+        let split_y = (full.bottom() - self.left_user_panel_height)
+            .clamp(full.top() + 120.0, full.bottom() - 48.0);
+        let top_rect = egui::Rect::from_min_max(
+            full.min,
+            egui::pos2(full.right(), split_y - splitter_h * 0.5),
+        );
+        let bottom_rect = egui::Rect::from_min_max(
+            egui::pos2(full.left(), split_y + splitter_h * 0.5),
+            full.max,
+        );
+
+        ui_in_rect(ui, top_rect, |ui| {
+            egui::Frame::new()
+                .fill(palette.nav_background)
+                .inner_margin(egui::Margin::same(0))
+                .show(ui, |ui| {
+                    if self.show_guilds_panel {
+                        let guilds = egui::SidePanel::left("guilds_inner_panel")
+                            .resizable(true)
+                            .default_width(self.guilds_column_width)
+                            .width_range(84.0..=260.0)
+                            .frame(
+                                egui::Frame::new()
+                                    .fill(palette.nav_background)
+                                    .inner_margin(egui::Margin::same(0)),
+                            )
+                            .show_inside(ui, |ui| {
+                                ui.label(egui::RichText::new("SERVERS").size(11.0).weak().strong());
+                                egui::ScrollArea::vertical()
+                                    .id_salt("guilds_scroll_mock")
+                                    .show(ui, |ui| {
+                                        for g in self.guilds.clone() {
+                                            let selected = self.selected_guild == Some(g.guild_id);
+                                            let response = self.render_nav_row(
+                                                ui,
+                                                &g.name,
+                                                30.0,
+                                                selected,
+                                                Some(palette),
+                                            );
+                                            if response.clicked() {
+                                                self.selected_guild = Some(g.guild_id);
+                                                self.selected_channel = None;
+                                                self.channels.clear();
+                                                self.members.remove(&g.guild_id);
+                                                queue_command(
+                                                    &self.cmd_tx,
+                                                    BackendCommand::ListChannels {
+                                                        guild_id: g.guild_id,
+                                                    },
+                                                    &mut self.status,
+                                                );
+                                                queue_command(
+                                                    &self.cmd_tx,
+                                                    BackendCommand::ListMembers {
+                                                        guild_id: g.guild_id,
+                                                    },
+                                                    &mut self.status,
+                                                );
+                                                self.history.push(format!("Guild: {}", g.name));
+                                                self.history_index =
+                                                    self.history.len().saturating_sub(1);
+                                            }
+                                        }
+                                    });
+                            });
+                        self.guilds_column_width = guilds.response.rect.width();
+                    }
+
+                    egui::CentralPanel::default()
+                        .frame(
+                            egui::Frame::new()
+                                .fill(palette.nav_background)
+                                .inner_margin(egui::Margin::symmetric(8, 8)),
+                        )
+                        .show_inside(ui, |ui| {
+                            let guild_title = self
+                                .guilds
+                                .iter()
+                                .find(|g| Some(g.guild_id) == self.selected_guild)
+                                .map(|g| g.name.as_str())
+                                .unwrap_or("Guild");
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new(guild_title)
+                                        .color(palette.nav_title_text)
+                                        .strong(),
+                                );
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        ui.label(egui::RichText::new("⌄"));
+                                    },
+                                );
+                            });
+                            ui.separator();
+                            ui.label(
+                                egui::RichText::new("TEXT CHANNELS")
+                                    .size(11.0)
+                                    .weak()
+                                    .strong(),
+                            );
+                            egui::ScrollArea::vertical()
+                                .id_salt("channels_scroll_mock")
+                                .show(ui, |ui| {
+                                    for ch in self
+                                        .channels
+                                        .clone()
+                                        .into_iter()
+                                        .filter(|c| c.kind == ChannelKind::Text)
+                                    {
+                                        let selected = self.selected_channel == Some(ch.channel_id);
+                                        let response = self.render_nav_row(
+                                            ui,
+                                            &format!("# {}", ch.name),
+                                            30.0,
+                                            selected,
+                                            Some(palette),
+                                        );
+                                        if response.clicked() {
+                                            self.selected_channel = Some(ch.channel_id);
+                                            queue_command(
+                                                &self.cmd_tx,
+                                                BackendCommand::SelectChannel {
+                                                    channel_id: ch.channel_id,
+                                                },
+                                                &mut self.status,
+                                            );
+                                            self.history.push(format!("#{}", ch.name));
+                                            self.history_index =
+                                                self.history.len().saturating_sub(1);
+                                        }
+                                    }
+                                    ui.add_space(8.0);
+                                    ui.label(
+                                        egui::RichText::new("VOICE CHANNELS")
+                                            .size(11.0)
+                                            .weak()
+                                            .strong(),
+                                    );
+                                    for ch in self
+                                        .channels
+                                        .clone()
+                                        .into_iter()
+                                        .filter(|c| c.kind == ChannelKind::Voice)
+                                    {
+                                        let response = self.render_nav_row(
+                                            ui,
+                                            &format!("🔊 {}", ch.name),
+                                            30.0,
+                                            false,
+                                            Some(palette),
+                                        );
+                                        if response.clicked() {
+                                            self.voice_ui.selected_voice_channel =
+                                                Some(ch.channel_id);
+                                        }
+                                    }
+                                });
+                        });
+                });
+        });
+
+        ui_in_rect(ui, bottom_rect, |ui| {
+            ui.painter().rect_filled(
+                ui.max_rect(),
+                egui::CornerRadius::ZERO,
+                egui::Color32::from_rgb(22, 22, 24),
+            );
+            self.render_left_user_panel(ui);
+        });
+
+        ui.painter().line_segment(
+            [
+                egui::pos2(full.left(), split_y),
+                egui::pos2(full.right(), split_y),
+            ],
+            egui::Stroke::new(1.0, egui::Color32::from_rgb(40, 41, 46)),
+        );
+    }
+    fn show_members_side_panel_contents(
+        &mut self,
+        ui: &mut egui::Ui,
+        discord_dark: Option<DiscordDarkPalette>,
+    ) {
+        egui::Frame::new()
+            .fill(
+                discord_dark
+                    .map(|p| p.members_background)
+                    .unwrap_or(ui.visuals().panel_fill),
+            )
+            .inner_margin(egui::Margin::symmetric(10, 8))
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    if let Some(guild_id) = self.selected_guild {
+                        if let Some(members) = self.members.get(&guild_id) {
+                            let online = members.iter().filter(|m| !m.muted).count();
+                            ui.label(
+                                egui::RichText::new(format!("ONLINE — {online}"))
+                                    .size(11.0)
+                                    .weak()
+                                    .strong(),
+                            );
+                            for m in members.iter().filter(|m| !m.muted) {
+                                self.render_member_row(ui, m, true, discord_dark);
+                            }
+                            ui.add_space(8.0);
+                            let offline = members.iter().filter(|m| m.muted).count();
+                            ui.label(
+                                egui::RichText::new(format!("OFFLINE — {offline}"))
+                                    .size(11.0)
+                                    .weak()
+                                    .strong(),
+                            );
+                            for m in members.iter().filter(|m| m.muted) {
+                                self.render_member_row(ui, m, false, discord_dark);
+                            }
+                        }
+                    }
+                });
+            });
+    }
+
+    fn render_member_row(
+        &self,
+        ui: &mut egui::Ui,
+        m: &MemberSummary,
+        online: bool,
+        discord_dark: Option<DiscordDarkPalette>,
+    ) {
+        let (rect, _) =
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), 38.0), egui::Sense::hover());
+        let hovered = ui.rect_contains_pointer(rect);
+        if hovered {
+            ui.painter().rect_filled(
+                rect,
+                egui::CornerRadius::same(4),
+                discord_dark
+                    .map(|p| p.members_hover)
+                    .unwrap_or(ui.visuals().faint_bg_color),
+            );
+        }
+        let row = rect.shrink2(egui::vec2(6.0, 4.0));
+        let avatar_rect = egui::Rect::from_min_size(
+            egui::pos2(row.left(), row.center().y - 14.0),
+            egui::vec2(28.0, 28.0),
+        );
+        ui.painter().rect_filled(
+            avatar_rect,
+            egui::CornerRadius::same(14),
+            if online {
+                egui::Color32::from_rgb(76, 91, 135)
+            } else {
+                egui::Color32::from_rgb(72, 72, 75)
+            },
+        );
+        ui.painter().circle_filled(
+            egui::pos2(avatar_rect.right() - 3.5, avatar_rect.bottom() - 3.5),
+            3.5,
+            if online {
+                egui::Color32::from_rgb(35, 165, 90)
+            } else {
+                egui::Color32::from_rgb(116, 127, 141)
+            },
+        );
+        let text_rect = egui::Rect::from_min_max(
+            egui::pos2(avatar_rect.right() + 8.0, row.top()),
+            egui::pos2(row.right(), row.bottom()),
+        );
+        ui_in_rect(ui, text_rect, |ui| {
+            ui.label(egui::RichText::new(&m.username).size(13.0));
+            let role = match m.role {
+                Role::Owner => "Owner",
+                Role::Mod => "Mod",
+                Role::Member => "Member",
+            };
+            ui.label(egui::RichText::new(role).size(10.5).weak());
+        });
+    }
+
+    fn show_message_area(&mut self, ui: &mut egui::Ui, discord_dark: Option<DiscordDarkPalette>) {
+        let palette =
+            discord_dark.unwrap_or_else(|| theme_discord_dark_palette(self.theme).unwrap());
+        egui::TopBottomPanel::top("channel_header")
+            .resizable(false)
+            .exact_height(48.0)
+            .frame(
+                egui::Frame::new()
+                    .fill(palette.message_background)
+                    .inner_margin(egui::Margin::symmetric(12, 10)),
+            )
+            .show_inside(ui, |ui| {
+                if let Some(channel_id) = self.selected_channel {
+                    if let Some(ch) = self.channels.iter().find(|c| c.channel_id == channel_id) {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(
+                                egui::RichText::new("#")
+                                    .color(palette.nav_text)
+                                    .size(20.0)
+                                    .strong(),
+                            );
+                            ui.label(
+                                egui::RichText::new(&ch.name)
+                                    .color(palette.title_text)
+                                    .size(17.0)
+                                    .strong(),
+                            );
+                            ui.separator();
+                            ui.label(
+                                egui::RichText::new("Channel conversation")
+                                    .color(palette.nav_text)
+                                    .size(13.0),
+                            );
+                        });
+                    }
+                }
+            });
+
+        egui::TopBottomPanel::bottom("composer")
+            .resizable(true)
+            .default_height(80.0)
+            .min_height(68.0)
+            .max_height(180.0)
+            .frame(
+                egui::Frame::new()
+                    .fill(palette.message_background)
+                    .inner_margin(egui::Margin::symmetric(12, 10)),
+            )
+            .show_inside(ui, |ui| {
+                egui::Frame::new()
+                    .fill(egui::Color32::from_rgb(44, 45, 49))
+                    .corner_radius(egui::CornerRadius::same(4))
+                    .inner_margin(egui::Margin::symmetric(10, 8))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let send_w = 56.0;
+                            let gap = ui.spacing().item_spacing.x;
+                            let text_w = (ui.available_width() - send_w - gap).max(60.0);
+
+                            let response = ui.add_enabled(
+                                false,
+                                egui::TextEdit::singleline(&mut self.composer)
+                                    .desired_width(text_w)
+                                    .text_color(palette.message_text)
+                                    .hint_text("Message channel"),
+                            );
+                            if ui
+                                .add_sized(
+                                    [send_w, 24.0],
+                                    egui::Button::new(
+                                        egui::RichText::new("Send").color(palette.nav_text_hover),
+                                    )
+                                    .fill(palette.nav_item_active)
+                                    .stroke(egui::Stroke::new(1.0, palette.nav_item_stroke_active)),
+                                )
+                                .clicked()
+                            {
+                                self.try_send_current_composer(&response);
+                            }
+                        });
+                    });
+            });
+
+        egui::ScrollArea::vertical()
+            .id_salt(("messages_scroll", self.selected_channel))
+            .auto_shrink([false, false])
+            .stick_to_bottom(true)
+            .show(ui, |ui| {
+                if let Some(channel_id) = self.selected_channel {
+                    if let Some(messages) = self.messages.get(&channel_id).cloned() {
+                        for (i, msg) in messages.iter().enumerate() {
+                            let starts_block =
+                                i == 0 || messages[i - 1].wire.sender_id != msg.wire.sender_id;
+                            self.render_mock_message_row(ui, msg, starts_block, palette);
+                        }
+                    }
+                }
+            });
+    }
+
+    fn render_mock_message_row(
+        &self,
+        ui: &mut egui::Ui,
+        msg: &DisplayMessage,
+        starts_block: bool,
+        palette: DiscordDarkPalette,
+    ) {
+        let row_w = ui.available_width();
+        let avatar_size = if self.readability.compact_density {
+            28.0
+        } else {
+            36.0
+        };
+        let header_h = if starts_block { 18.0 } else { 0.0 };
+        let body_size = if self.readability.compact_density {
+            12.5
+        } else {
+            13.5
+        };
+        let body_h: f32 = 18.0;
+        let row_h = (header_h + body_h).max(avatar_size) + 8.0;
+        let (row_rect, _) = ui.allocate_exact_size(egui::vec2(row_w, row_h), egui::Sense::hover());
+        if ui.rect_contains_pointer(row_rect) {
+            ui.painter()
+                .rect_filled(row_rect, egui::CornerRadius::ZERO, palette.message_hover);
+        }
+        let content = row_rect.shrink2(egui::vec2(10.0, 4.0));
+        let x0 = content.left();
+        let text_x = x0 + avatar_size + 16.0;
+        if starts_block {
+            let avatar = egui::Rect::from_min_size(
+                egui::pos2(x0, content.center().y - avatar_size * 0.5),
+                egui::vec2(avatar_size, avatar_size),
+            );
+            ui.painter().rect_filled(
+                avatar,
+                egui::CornerRadius::same((avatar_size / 2.0) as u8),
+                egui::Color32::from_rgb(89, 101, 125),
+            );
+            ui.painter().text(
+                egui::pos2(text_x, content.top()),
+                egui::Align2::LEFT_TOP,
+                msg.wire
+                    .sender_username
+                    .clone()
+                    .unwrap_or_else(|| msg.wire.sender_id.0.to_string()),
+                egui::TextStyle::Body.resolve(ui.style()),
+                palette.title_text,
+            );
+            ui.painter().text(
+                egui::pos2(text_x + 90.0, content.top() + 2.0),
+                egui::Align2::LEFT_TOP,
+                msg.wire.sent_at.format("%I:%M %p").to_string(),
+                egui::FontId::proportional(11.0),
+                palette.message_hint_text,
+            );
+        }
+        ui.painter().text(
+            egui::pos2(text_x, content.top() + header_h),
+            egui::Align2::LEFT_TOP,
+            &msg.plaintext,
+            egui::FontId::proportional(body_size),
+            palette.message_text,
+        );
+    }
     fn render_image_attachment_preview(
         &mut self,
         ui: &mut egui::Ui,
@@ -3041,7 +3308,9 @@ struct DiscordDarkPalette {
     app_background: egui::Color32,
     nav_background: egui::Color32,
     message_background: egui::Color32,
+    message_hover: egui::Color32,
     members_background: egui::Color32,
+    members_hover: egui::Color32,
 
     // Main Text:
     nav_text: egui::Color32,
@@ -3067,13 +3336,15 @@ fn theme_discord_dark_palette(theme: ThemeSettings) -> Option<DiscordDarkPalette
             app_background: egui::Color32::from_rgb(26, 26, 30),
             nav_background: egui::Color32::from_rgb(18, 18, 20),
             message_background: egui::Color32::from_rgb(26, 26, 30),
+            message_hover: egui::Color32::from_rgb(36, 36, 40),
             members_background: egui::Color32::from_rgb(26, 26, 30),
+            members_hover: egui::Color32::from_rgb(43, 45, 49),
             // Main Text:
             nav_text: egui::Color32::from_rgb(129, 130, 138),
             nav_text_hover: egui::Color32::from_rgb(251, 251, 251),
             nav_text_highlighted: egui::Color32::from_rgb(251, 251, 251),
             message_text: egui::Color32::from_rgb(239, 239, 241),
-            message_hint_text: egui::Color32::from_rgb(108,109,118),
+            message_hint_text: egui::Color32::from_rgb(108, 109, 118),
             // Title Text:
             title_text: egui::Color32::from_rgb(251, 251, 251),
             nav_title_text: egui::Color32::from_rgb(239, 239, 241),
@@ -3125,8 +3396,6 @@ struct MainWorkspaceStyle {
     colors: MainWorkspaceColors,
     discord_dark: Option<DiscordDarkPalette>,
 }
-
-
 
 fn visuals_for_theme(theme: ThemeSettings) -> egui::Visuals {
     let mut visuals = match theme.preset {
@@ -3204,6 +3473,17 @@ fn desktop_gui_device_id_for_username(username: &str) -> String {
 #[derive(Debug, Deserialize)]
 struct LoginResponse {
     user_id: i64,
+}
+
+fn icon_btn(
+    icon: &str,
+    color: egui::Color32,
+    active_bg: Option<egui::Color32>,
+) -> egui::Button<'static> {
+    egui::Button::new(egui::RichText::new(icon).color(color))
+        .min_size(egui::vec2(24.0, 24.0))
+        .stroke(egui::Stroke::NONE)
+        .fill(active_bg.unwrap_or(egui::Color32::TRANSPARENT))
 }
 
 impl eframe::App for DesktopGuiApp {
