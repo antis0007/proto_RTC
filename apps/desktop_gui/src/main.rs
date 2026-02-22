@@ -1604,40 +1604,103 @@ impl DesktopGuiApp {
 
     #[allow(dead_code)]
     fn render_left_user_panel(&mut self, ui: &mut egui::Ui) {
-        let discord_dark = theme_discord_dark_palette(self.theme);
-        egui::Frame::group(ui.style())
-            .fill(
-                discord_dark
-                    .map(|p| p.message_background)
-                    .unwrap_or(ui.visuals().panel_fill),
-            )
+        let palette = theme_discord_dark_palette(self.theme).unwrap();
+        egui::Frame::new()
+            .fill(egui::Color32::TRANSPARENT)
+            .inner_margin(egui::Margin::symmetric(8, 6))
             .show(ui, |ui| {
+                let content_h = 32.0;
+                let extra = (ui.available_height() - content_h).max(0.0);
+                ui.add_space(extra * 0.5);
+
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("●").color(egui::Color32::from_rgb(67, 181, 129)));
-                    ui.strong(&self.username);
-                    let status_label = if self.voice_ui.active_session.is_some() {
-                        "In voice"
-                    } else {
-                        "Online"
-                    };
-                    ui.small(format!("· {status_label}"));
-                });
-                ui.add_space(4.0);
-                ui.horizontal_wrapped(|ui| {
-                    ui.toggle_value(&mut self.voice_ui.muted, "Mute");
-                    ui.toggle_value(&mut self.voice_ui.deafened, "Deafen");
-                });
-                ui.add_space(6.0);
-                ui.horizontal_wrapped(|ui| {
-                    if ui.button("⚙ Settings").clicked() {
-                        self.settings_open = true;
-                    }
-                    if ui.button("⎋ Sign out").clicked() {
-                        self.auth_session_established = false;
-                        self.view_state = AppViewState::Login;
-                        self.status = "Signed out".to_string();
-                        self.status_banner = None;
-                    }
+                    let (avatar, _) =
+                        ui.allocate_exact_size(egui::vec2(32.0, 32.0), egui::Sense::hover());
+                    ui.painter().rect_filled(
+                        avatar,
+                        egui::CornerRadius::same(16),
+                        egui::Color32::from_rgb(70, 75, 90),
+                    );
+                    ui.painter().circle_filled(
+                        egui::pos2(avatar.right() - 4.0, avatar.bottom() - 4.0),
+                        4.0,
+                        egui::Color32::from_rgb(35, 165, 90),
+                    );
+
+                    ui.add_space(4.0);
+                    ui.vertical(|ui| {
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(&self.username)
+                                    .color(palette.title_text)
+                                    .strong()
+                                    .size(13.0),
+                            )
+                            .selectable(false),
+                        );
+                        let status = if self.voice_ui.deafened {
+                            "Deafened"
+                        } else if self.voice_ui.muted {
+                            "Muted"
+                        } else {
+                            "Online"
+                        };
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(status)
+                                    .color(palette.message_hint_text)
+                                    .size(11.0),
+                            )
+                            .selectable(false),
+                        );
+                    });
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add(icon_btn("⚙", egui::Color32::from_rgb(185, 187, 190), None))
+                            .clicked()
+                        {
+                            self.settings_open = true;
+                        }
+                        let deafen_on = self.voice_ui.deafened;
+                        if ui
+                            .add(icon_btn(
+                                "🎧",
+                                if deafen_on {
+                                    egui::Color32::from_rgb(240, 71, 71)
+                                } else {
+                                    egui::Color32::from_rgb(185, 187, 190)
+                                },
+                                if deafen_on {
+                                    Some(egui::Color32::from_rgb(63, 39, 43))
+                                } else {
+                                    None
+                                },
+                            ))
+                            .clicked()
+                        {
+                            self.voice_ui.deafened = !self.voice_ui.deafened;
+                        }
+                        let mute_on = self.voice_ui.muted;
+                        if ui
+                            .add(icon_btn(
+                                "🎤",
+                                if mute_on {
+                                    egui::Color32::from_rgb(240, 71, 71)
+                                } else {
+                                    egui::Color32::from_rgb(185, 187, 190)
+                                },
+                                if mute_on {
+                                    Some(egui::Color32::from_rgb(63, 39, 43))
+                                } else {
+                                    None
+                                },
+                            ))
+                            .clicked()
+                        {
+                            self.voice_ui.muted = !self.voice_ui.muted;
+                        }
+                    });
                 });
             });
     }
@@ -3377,6 +3440,17 @@ fn desktop_gui_device_id_for_username(username: &str) -> String {
 #[derive(Debug, Deserialize)]
 struct LoginResponse {
     user_id: i64,
+}
+
+fn icon_btn(
+    icon: &str,
+    color: egui::Color32,
+    active_bg: Option<egui::Color32>,
+) -> egui::Button<'static> {
+    egui::Button::new(egui::RichText::new(icon).color(color))
+        .min_size(egui::vec2(24.0, 24.0))
+        .stroke(egui::Stroke::NONE)
+        .fill(active_bg.unwrap_or(egui::Color32::TRANSPARENT))
 }
 
 impl eframe::App for DesktopGuiApp {
