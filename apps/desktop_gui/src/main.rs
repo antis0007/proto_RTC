@@ -2688,6 +2688,26 @@ impl DesktopGuiApp {
                             });
 
                         self.guilds_column_width = guilds.response.rect.width();
+
+                        let splitter_x = guilds.response.rect.right();
+                        let splitter_rect = egui::Rect::from_min_max(
+                            egui::pos2(splitter_x - 4.0, top_rect.top()),
+                            egui::pos2(splitter_x + 4.0, top_rect.bottom()),
+                        );
+                        let splitter_resp = ui.interact(
+                            splitter_rect,
+                            ui.make_persistent_id("guilds_manual_splitter"),
+                            egui::Sense::click_and_drag(),
+                        );
+                        if splitter_resp.dragged() {
+                            if let Some(pointer) = splitter_resp.interact_pointer_pos() {
+                                let rel = (pointer.x - top_rect.left()).clamp(84.0, 260.0);
+                                self.guilds_column_width = rel;
+                            }
+                        }
+                        if splitter_resp.hovered() || splitter_resp.dragged() {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                        }
                     }
 
                     egui::CentralPanel::default()
@@ -3018,8 +3038,8 @@ impl DesktopGuiApp {
 
         egui::TopBottomPanel::bottom("composer")
             .resizable(true)
-            .default_height(80.0)
-            .min_height(68.0)
+            .default_height(MIN_COMPOSER_PANEL_HEIGHT.max(96.0))
+            .min_height(MIN_COMPOSER_PANEL_HEIGHT)
             .max_height(180.0)
             .frame(
                 egui::Frame::new()
@@ -3032,41 +3052,60 @@ impl DesktopGuiApp {
                     .corner_radius(egui::CornerRadius::same(4))
                     .inner_margin(egui::Margin::symmetric(10, 8))
                     .show(ui, |ui| {
-                        let can_send =
-                            self.selected_channel.is_some() && self.auth_session_established;
-                        ui.add_enabled_ui(can_send, |ui| {
+                        let can_send = self.selected_channel.is_some();
+                        let enabled = can_send && self.auth_session_established;
+
+                        let panel_h = ui.available_height();
+                        let row_height = (panel_h - 18.0).clamp(36.0, 72.0);
+                        let send_width = (88.0 + (row_height - 36.0) * 0.28).clamp(88.0, 124.0);
+                        let attachment_width =
+                            (38.0 + (row_height - 36.0) * 0.12).clamp(38.0, 48.0);
+
+                        ui.add_enabled_ui(enabled, |ui| {
                             ui.horizontal(|ui| {
-                                if ui.button("📎").on_hover_text("Attach file").clicked() {
-                                    self.pending_attachment = rfd::FileDialog::new().pick_file();
+                                if ui
+                                    .add_sized([attachment_width, row_height], egui::Button::new("📎"))
+                                    .on_hover_text("Attach file")
+                                    .clicked()
+                                {
+                                    fn default_upload_dir() -> Option<std::path::PathBuf> {
+                                        dirs::desktop_dir()
+                                            .or_else(dirs::download_dir)
+                                            .or_else(dirs::document_dir)
+                                            .or_else(dirs::home_dir)
+                                    }
+                                    let mut dialog = rfd::FileDialog::new();
+                                    if let Some(dir) = default_upload_dir() {
+                                        dialog = dialog.set_directory(dir);
+                                    }
+                                    self.pending_attachment = dialog.pick_file();
                                 }
 
-                                let send_w = 68.0;
-                                let gap = ui.spacing().item_spacing.x;
-                                let text_w = (ui.available_width() - send_w - gap).max(80.0);
+                                let spacing = ui.spacing().item_spacing.x;
+                                let text_w = (ui.available_width() - send_width - spacing).max(64.0);
 
-                                let response = ui.add_sized(
-                                    [text_w, 28.0],
-                                    egui::TextEdit::singleline(&mut self.composer)
-                                        .hint_text("Message #channel"),
-                                );
-
-                                let send_clicked = ui
-                                    .add_sized(
-                                        [send_w, 28.0],
-                                        egui::Button::new(
-                                            egui::RichText::new("Send").color(egui::Color32::WHITE),
+                                let response = ui
+                                    .scope(|ui| {
+                                        ui.visuals_mut().extreme_bg_color = palette.message_background;
+                                        ui.add_sized(
+                                            [text_w, row_height],
+                                            egui::TextEdit::multiline(&mut self.composer)
+                                                .id_salt("composer_text")
+                                                .hint_text("Message #channel (Enter to send, Shift+Enter for newline)"),
                                         )
-                                        .fill(self.theme.accent_color)
-                                        .stroke(egui::Stroke::NONE),
-                                    )
-                                    .clicked();
+                                    })
+                                    .inner;
 
                                 let send_shortcut = response.has_focus()
                                     && ui.input(|i| {
                                         i.key_pressed(egui::Key::Enter) && !i.modifiers.shift
                                     });
 
-                                if send_clicked || send_shortcut {
+                                let clicked_send = ui
+                                    .add_sized([send_width, row_height], egui::Button::new("⬆ Send"))
+                                    .clicked();
+
+                                if send_shortcut || clicked_send {
                                     self.try_send_current_composer(&response);
                                 }
                             });
@@ -3143,7 +3182,7 @@ impl DesktopGuiApp {
             ui.painter().text(
                 egui::pos2(text_x + 90.0, content.top() + 2.0),
                 egui::Align2::LEFT_TOP,
-                msg.wire.sent_at.format("%I:%M %p").to_string(),
+                msg.wire.sent_at.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
                 egui::FontId::proportional(11.0),
                 palette.message_hint_text,
             );
