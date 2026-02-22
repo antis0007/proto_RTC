@@ -2626,7 +2626,6 @@ impl DesktopGuiApp {
                                     .inner_margin(egui::Margin::same(0)),
                             )
                             .show_inside(ui, |ui| {
-                                ui.add_space(6.0);
                                 ui.label(
                                     egui::RichText::new("SERVERS")
                                         .size(11.0)
@@ -3118,6 +3117,7 @@ impl DesktopGuiApp {
             .auto_shrink([false, false])
             .stick_to_bottom(true)
             .show(ui, |ui| {
+                ui.add_space(4.0);
                 if let Some(channel_id) = self.selected_channel {
                     if let Some(messages) = self.messages.get(&channel_id).cloned() {
                         for (i, msg) in messages.iter().enumerate() {
@@ -3127,6 +3127,7 @@ impl DesktopGuiApp {
                         }
                     }
                 }
+                ui.add_space(8.0);
             });
     }
 
@@ -3137,31 +3138,78 @@ impl DesktopGuiApp {
         starts_block: bool,
         palette: DiscordDarkPalette,
     ) {
+        const PAD_X: f32 = 10.0;
+        const PAD_Y: f32 = 4.0;
+        const TEXT_GAP_X: f32 = 8.0;
+
         let row_w = ui.available_width();
         let avatar_size = if self.readability.compact_density {
             28.0
         } else {
             36.0
         };
-        let header_h = if starts_block { 18.0 } else { 0.0 };
+        let avatar_slot_w = avatar_size + 8.0;
+        let header_h = if starts_block {
+            if self.readability.compact_density {
+                16.0
+            } else {
+                18.0
+            }
+        } else {
+            0.0
+        };
         let body_size = if self.readability.compact_density {
             12.5
         } else {
             13.5
         };
-        let body_h: f32 = 18.0;
-        let row_h = (header_h + body_h).max(avatar_size) + 8.0;
+
+        let body_wrap_w = (row_w - PAD_X * 2.0 - avatar_slot_w - TEXT_GAP_X).max(80.0);
+        let body_galley = ui.fonts_mut(|fonts| {
+            let mut job = egui::text::LayoutJob::default();
+            job.wrap.max_width = body_wrap_w;
+            job.append(
+                &msg.plaintext,
+                0.0,
+                egui::TextFormat {
+                    font_id: egui::FontId::proportional(body_size),
+                    color: palette.message_text,
+                    ..Default::default()
+                },
+            );
+            fonts.layout_job(job)
+        });
+
+        let body_h = body_galley
+            .size()
+            .y
+            .max(if self.readability.compact_density {
+                14.0
+            } else {
+                16.0
+            });
+        let text_block_h = header_h + body_h;
+        let content_h = if starts_block {
+            text_block_h.max(avatar_size)
+        } else {
+            text_block_h
+        };
+        let row_h = content_h + PAD_Y * 2.0;
+
         let (row_rect, _) = ui.allocate_exact_size(egui::vec2(row_w, row_h), egui::Sense::hover());
         if ui.rect_contains_pointer(row_rect) {
             ui.painter()
                 .rect_filled(row_rect, egui::CornerRadius::ZERO, palette.message_hover);
         }
-        let content = row_rect.shrink2(egui::vec2(10.0, 4.0));
+
+        let content = row_rect.shrink2(egui::vec2(PAD_X, PAD_Y));
         let x0 = content.left();
-        let text_x = x0 + avatar_size + 16.0;
+        let text_x = x0 + avatar_slot_w + TEXT_GAP_X;
+
         if starts_block {
+            let avatar_y = content.center().y - avatar_size * 0.5;
             let avatar = egui::Rect::from_min_size(
-                egui::pos2(x0, content.center().y - avatar_size * 0.5),
+                egui::pos2(x0, avatar_y),
                 egui::vec2(avatar_size, avatar_size),
             );
             ui.painter().rect_filled(
@@ -3169,31 +3217,69 @@ impl DesktopGuiApp {
                 egui::CornerRadius::same((avatar_size / 2.0) as u8),
                 egui::Color32::from_rgb(89, 101, 125),
             );
-            ui.painter().text(
-                egui::pos2(text_x, content.top()),
-                egui::Align2::LEFT_TOP,
-                msg.wire
-                    .sender_username
-                    .clone()
-                    .unwrap_or_else(|| msg.wire.sender_id.0.to_string()),
-                egui::TextStyle::Body.resolve(ui.style()),
-                palette.title_text,
-            );
-            ui.painter().text(
-                egui::pos2(text_x + 90.0, content.top() + 2.0),
-                egui::Align2::LEFT_TOP,
-                msg.wire.sent_at.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
-                egui::FontId::proportional(11.0),
-                palette.message_hint_text,
-            );
         }
-        ui.painter().text(
-            egui::pos2(text_x, content.top() + header_h),
-            egui::Align2::LEFT_TOP,
-            &msg.plaintext,
-            egui::FontId::proportional(body_size),
-            palette.message_text,
+
+        let mut text_y = content.center().y - text_block_h * 0.5;
+        if starts_block {
+            let header_rect = egui::Rect::from_min_size(
+                egui::pos2(text_x, text_y),
+                egui::vec2((content.right() - text_x).max(20.0), header_h.max(1.0)),
+            );
+            ui_in_rect(ui, header_rect, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(
+                                msg.wire
+                                    .sender_username
+                                    .clone()
+                                    .unwrap_or_else(|| msg.wire.sender_id.0.to_string()),
+                            )
+                            .color(palette.title_text)
+                            .strong()
+                            .size(
+                                if self.readability.compact_density {
+                                    13.0
+                                } else {
+                                    14.0
+                                },
+                            ),
+                        )
+                        .selectable(false),
+                    );
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(
+                                msg.wire.sent_at.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
+                            )
+                            .color(palette.message_hint_text)
+                            .size(11.0),
+                        )
+                        .selectable(false),
+                    );
+                });
+            });
+            text_y += header_h;
+        }
+
+        let body_rect = egui::Rect::from_min_size(
+            egui::pos2(text_x, text_y),
+            egui::vec2((content.right() - text_x).max(20.0), body_h.max(1.0)),
         );
+
+        ui_in_rect(ui, body_rect, |ui| {
+            ui.set_clip_rect(row_rect);
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(&msg.plaintext)
+                        .color(palette.message_text)
+                        .size(body_size),
+                )
+                .wrap()
+                .selectable(true),
+            );
+        });
     }
     fn render_image_attachment_preview(
         &mut self,
