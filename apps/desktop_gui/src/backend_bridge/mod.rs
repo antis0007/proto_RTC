@@ -1,1 +1,4 @@
-//! Backend bridge module namespace for command/event channel integration.
+//! Backend bridge: command queueing and backend/UI event transport glue.
+
+pub mod commands;
+pub mod runtime;

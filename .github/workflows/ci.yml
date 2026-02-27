@@ -30,6 +30,8 @@ jobs:
           echo "default-members guard passed"
       - name: Guard tokio/full in non-runtime crates
         run: python scripts/ci/check_tokio_full.py
+      - name: Guard desktop_gui main.rs remains bootstrap-only
+        run: python scripts/ci/check_desktop_main_thin.py
       - name: Format check
         run: cargo fmt --all -- --check
       - name: Clippy (default-members fast lane)
