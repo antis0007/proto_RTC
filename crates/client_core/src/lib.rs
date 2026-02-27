@@ -412,6 +412,8 @@ impl MlsSessionManager for MissingMlsSessionManager {
 pub struct VoiceParticipantState {
     pub participant_id: String,
     pub identity: String,
+    pub muted: bool,
+    pub deafened: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -898,6 +900,8 @@ impl<C: CryptoProvider + 'static> RealtimeClient<C> {
                                 VoiceParticipantState {
                                     participant_id: participant.participant_id,
                                     identity: participant.identity,
+                                    muted: false,
+                                    deafened: false,
                                 },
                             );
                         }
