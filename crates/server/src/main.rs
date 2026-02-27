@@ -10,12 +10,13 @@ use crate::api::{
 use crate::livekit::LiveKitConfig;
 use axum::{
     body::Bytes,
-    extract::{Path, Query, State, WebSocketUpgrade},
+    extract::{DefaultBodyLimit, Path, Query, State, WebSocketUpgrade},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
 };
+use tower_http::limit::RequestBodyLimitLayer;
 use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
     Engine as _,
@@ -190,7 +191,7 @@ struct RecoveryWelcomeQuery {
     target_device_id: Option<i64>,
 }
 
-const MAX_ATTACHMENT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_ATTACHMENT_BYTES: usize = 64 * 1024 * 1024; //64 MB
 const MAX_FILENAME_BYTES: usize = 180;
 
 #[tokio::main]
@@ -274,6 +275,11 @@ async fn main() -> anyhow::Result<()> {
 }
 
 fn build_router(state: Arc<AppState>) -> Router {
+    let file_upload_router = Router::new()
+        .route("/files/upload", post(upload_file))
+        .layer(DefaultBodyLimit::disable())
+        .layer(RequestBodyLimitLayer::new(MAX_ATTACHMENT_BYTES));
+
     Router::new()
         .route("/healthz", get(healthz))
         .route("/login", post(login))
@@ -292,7 +298,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/guilds/join", post(http_join_guild))
         .route("/messages", post(http_send_message))
         .route("/livekit/token", post(http_request_livekit_token))
-        .route("/files/upload", post(upload_file))
+        .merge(file_upload_router) // <- add this
         .route("/files/:file_id", get(download_file))
         .route(mls_key_packages_route(), post(upload_key_package))
         .route(mls_key_packages_route(), get(fetch_key_package))
@@ -376,6 +382,17 @@ async fn login(
             .api
             .storage
             .create_channel(guild_id, "general", ChannelKind::Text)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ApiError::new(ErrorCode::Internal, e.to_string())),
+                )
+            })?;
+        state
+            .api
+            .storage
+            .create_channel(guild_id, "voice", ChannelKind::Voice)
             .await
             .map_err(|e| {
                 (
