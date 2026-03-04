@@ -17,8 +17,6 @@ pub struct MeshingCounters {
 pub struct GpuMeshingPipeline {
     pub pipeline: wgpu::ComputePipeline,
     pub bind_group_layout: wgpu::BindGroupLayout,
-    /// Readback buffer used for debug verification logging.
-    pub mesh_meta_readback_buffer: wgpu::Buffer,
 }
 
 pub struct GpuMeshingBuffers {
@@ -107,7 +105,7 @@ impl GpuMeshingPipeline {
             pass.dispatch_workgroups(dispatch.x, dispatch.y, dispatch.z);
         }
 
-        // After dispatch: copy per-page counts into mesh_meta_buffer and emit debug readback.
+        // After dispatch: copy per-page counts into mesh_meta_buffer.
         let counts_size = std::mem::size_of::<MeshMetaCounts>() as u64;
         let copy_dst = page_id as u64 * counts_size;
         encoder.copy_buffer_to_buffer(
@@ -124,36 +122,5 @@ impl GpuMeshingPipeline {
             copy_dst + std::mem::size_of::<u32>() as u64,
             std::mem::size_of::<u32>() as u64,
         );
-
-        encoder.copy_buffer_to_buffer(
-            &buffers.mesh_meta_buffer,
-            copy_dst,
-            &self.mesh_meta_readback_buffer,
-            0,
-            counts_size,
-        );
-    }
-
-    pub fn debug_log_page_counts(&self, device: &wgpu::Device, page_id: u32) {
-        let slice = self
-            .mesh_meta_readback_buffer
-            .slice(..std::mem::size_of::<MeshMetaCounts>() as u64);
-        slice.map_async(wgpu::MapMode::Read, |_| {});
-        device.poll(wgpu::Maintain::Wait);
-
-        let mapped = slice.get_mapped_range();
-        if mapped.len() >= std::mem::size_of::<MeshMetaCounts>() {
-            let counts = bytemuck::from_bytes::<MeshMetaCounts>(
-                &mapped[..std::mem::size_of::<MeshMetaCounts>()],
-            );
-            log::debug!(
-                "GPU meshing page={} vertex_count={} index_count={}",
-                page_id,
-                counts.vertex_count,
-                counts.index_count
-            );
-        }
-        drop(mapped);
-        self.mesh_meta_readback_buffer.unmap();
     }
 }
