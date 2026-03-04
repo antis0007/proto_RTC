@@ -1,6 +1,7 @@
 use crate::gpu_compute::{DispatchCounts, GpuMeshingBuffers, GpuMeshingPipeline};
 
 const INDIRECT_DRAW_STRIDE: u64 = std::mem::size_of::<wgpu::util::DrawIndexedIndirectArgs>() as u64;
+const MESH_META_STRIDE: u64 = std::mem::size_of::<crate::gpu_compute::MeshMetaCounts>() as u64;
 
 pub struct MeshingPage {
     pub id: u32,
@@ -8,32 +9,19 @@ pub struct MeshingPage {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct CpuDrawIndexedArgs {
-    pub index_count: u32,
-    pub base_index: u32,
-    pub vertex_offset: i32,
-}
-
-#[derive(Clone, Copy, Debug)]
 pub struct VisibleChunk {
-    /// Meshing page index used to locate this chunk's `DrawIndexedIndirectArgs` entry.
-    pub page_index: u32,
-    /// CPU draw information, only used when `feature = "cpu_meshing"` is enabled.
-    #[cfg(feature = "cpu_meshing")]
-    pub cpu_draw: CpuDrawIndexedArgs,
+    /// Byte offset of this chunk/page metadata in `mesh_meta_buffer`.
+    pub mesh_meta_offset: u64,
+    /// Byte offset of this chunk/page indirect draw entry in `draw_indirect_buffer`.
+    pub indirect_offset: u64,
 }
 
 pub struct Renderer {
     pub gpu_meshing: GpuMeshingPipeline,
     pub gpu_buffers: GpuMeshingBuffers,
-    /// Runtime toggle: defaults to the validated CPU draw path.
-    pub use_gpu_indirect_rendering: bool,
 }
 
 impl Renderer {
-    pub fn set_gpu_indirect_rendering(&mut self, enabled: bool) {
-        self.use_gpu_indirect_rendering = enabled;
-    }
 
     pub fn rebuild_chunk_meshes(
         &mut self,
@@ -43,10 +31,6 @@ impl Renderer {
         pages: &[MeshingPage],
     ) {
         for page in pages {
-            // Keep CPU meshing enabled while GPU path is brought up in parallel.
-            #[cfg(feature = "cpu_meshing")]
-            self.run_cpu_meshing(page.id);
-
             self.gpu_meshing.dispatch_for_page(
                 device,
                 queue,
@@ -59,9 +43,6 @@ impl Renderer {
                     z: page.dispatch.z,
                 },
             );
-
-            // Debug verification: log generated counts per page.
-            self.gpu_meshing.debug_log_page_counts(device, page.id);
         }
     }
 
@@ -78,36 +59,9 @@ impl Renderer {
         );
 
         for chunk in visible_chunks {
-            if self.use_gpu_indirect_rendering {
-                // One `DrawIndexedIndirectArgs` entry per meshing page.
-                let indirect_offset = chunk.page_index as u64 * INDIRECT_DRAW_STRIDE;
-                render_pass
-                    .draw_indexed_indirect(&self.gpu_buffers.draw_indirect_buffer, indirect_offset);
-                continue;
-            }
-
-            #[cfg(feature = "cpu_meshing")]
-            {
-                render_pass.draw_indexed(
-                    chunk.cpu_draw.base_index
-                        ..(chunk.cpu_draw.base_index + chunk.cpu_draw.index_count),
-                    chunk.cpu_draw.vertex_offset,
-                    0..1,
-                );
-            }
-
-            #[cfg(not(feature = "cpu_meshing"))]
-            {
-                let indirect_offset = chunk.page_index as u64 * INDIRECT_DRAW_STRIDE;
-                render_pass
-                    .draw_indexed_indirect(&self.gpu_buffers.draw_indirect_buffer, indirect_offset);
-            }
+            debug_assert_eq!(chunk.indirect_offset / INDIRECT_DRAW_STRIDE, chunk.mesh_meta_offset / MESH_META_STRIDE);
+            render_pass
+                .draw_indexed_indirect(&self.gpu_buffers.draw_indirect_buffer, chunk.indirect_offset);
         }
-    }
-
-    #[cfg(feature = "cpu_meshing")]
-    fn run_cpu_meshing(&self, page_id: u32) {
-        log::trace!("CPU meshing still active for page={}", page_id);
-        // Existing CPU meshing code path remains unchanged and still executes.
     }
 }
