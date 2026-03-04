@@ -15,6 +15,7 @@ mod ui;
 
 use arboard::{Clipboard, ImageData};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use clap::Parser;
 use client_core::{
     AttachmentUpload, ClientEvent, ClientHandle, DurableMlsSessionManager, PassthroughCrypto,
     RealtimeClient, VoiceConnectOptions, VoiceParticipantState, VoiceSessionSnapshot,
@@ -31,7 +32,6 @@ use shared::{
         AttachmentPayload, ChannelSummary, GuildSummary, MemberSummary, MessagePayload, ServerEvent,
     },
 };
-use clap::Parser;
 
 #[derive(Debug, Clone)]
 pub struct StartupConfig {
@@ -68,7 +68,7 @@ struct CliArgs {
 }
 #[derive(Debug, Clone)]
 pub struct AppPaths {
-    pub data_root: std::path::PathBuf,   // per-profile isolated
+    pub data_root: std::path::PathBuf, // per-profile isolated
     pub cache_dir: std::path::PathBuf,
     pub db_path: std::path::PathBuf,
     pub mls_dir: std::path::PathBuf,
@@ -83,7 +83,9 @@ impl AppPaths {
             // Fallback: per-user app data + username namespace
             let base = dirs::data_local_dir()
                 .ok_or_else(|| anyhow::anyhow!("unable to resolve local app data dir"))?;
-            base.join("proto_rtc").join("profiles").join(&startup.username)
+            base.join("proto_rtc")
+                .join("profiles")
+                .join(&startup.username)
         };
 
         Ok(Self {
@@ -712,7 +714,7 @@ impl DesktopGuiApp {
         ui_rx: Receiver<UiEvent>,
         persisted_settings: Option<PersistedDesktopSettings>,
         startup: StartupConfig,
-    ) -> Self{
+    ) -> Self {
         let (theme, readability, composer_panel_height, left_user_panel_height) =
             persisted_settings.unwrap_or_default().into_runtime();
         Self {
@@ -1831,27 +1833,23 @@ impl DesktopGuiApp {
         selected: bool,
         discord_dark: Option<DiscordDarkPalette>,
     ) -> egui::Response {
-        let base_bg = discord_dark
-            .map(|p| p.nav_background)
-            .unwrap_or_else(|| {
-                if self.theme.list_row_shading {
-                    ui.visuals().faint_bg_color
+        let base_bg = discord_dark.map(|p| p.nav_background).unwrap_or_else(|| {
+            if self.theme.list_row_shading {
+                ui.visuals().faint_bg_color
+            } else {
+                egui::Color32::TRANSPARENT
+            }
+        });
+        let selected_bg = discord_dark.map(|p| p.nav_item_active).unwrap_or_else(|| {
+            ui.visuals()
+                .selection
+                .bg_fill
+                .gamma_multiply(if self.theme.list_row_shading {
+                    0.35
                 } else {
-                    egui::Color32::TRANSPARENT
-                }
-            });
-        let selected_bg = discord_dark
-            .map(|p| p.nav_item_active)
-            .unwrap_or_else(|| {
-                ui.visuals()
-                    .selection
-                    .bg_fill
-                    .gamma_multiply(if self.theme.list_row_shading {
-                        0.35
-                    } else {
-                        0.22
-                    })
-            });
+                    0.22
+                })
+        });
         let row_stroke = discord_dark
             .map(|palette| {
                 egui::Stroke::new(
@@ -1897,7 +1895,7 @@ impl DesktopGuiApp {
                 rect,
                 egui::CornerRadius::same(u8::from(self.theme.panel_rounding)),
                 row_stroke,
-                egui::StrokeKind::Middle
+                egui::StrokeKind::Middle,
             );
         }
 
@@ -2247,19 +2245,17 @@ impl DesktopGuiApp {
 
         egui::TopBottomPanel::top("top_bar")
             .resizable(false)
-            .frame(
-                egui::Frame {
-                    fill: style.colors.top_bar_bg,
-                    inner_margin: egui::Margin {
-                        top: 1,
-                        bottom: 0,
-                        left: 0,
-                        right: 0,
-                    },
-                    outer_margin: egui::Margin::same(0),
-                    ..Default::default()
-                }
-            )
+            .frame(egui::Frame {
+                fill: style.colors.top_bar_bg,
+                inner_margin: egui::Margin {
+                    top: 1,
+                    bottom: 0,
+                    left: 0,
+                    right: 0,
+                },
+                outer_margin: egui::Margin::same(0),
+                ..Default::default()
+            })
             .show(ctx, |ui| {
                 ui.scope(|ui| {
                     let s = ui.style_mut();
@@ -2279,29 +2275,29 @@ impl DesktopGuiApp {
                     let top = style.colors.top_bar_bg;
 
                     // Make buttons *near-black* relative to the bar, regardless of panel_fill.
-                    let base   = top.gamma_multiply(0.22); // much darker
+                    let base = top.gamma_multiply(0.22); // much darker
                     let hovered = top.gamma_multiply(0.35); // brighter on hover, but still dark
-                    let active  = top.gamma_multiply(0.30);
-                    let open    = hovered;
+                    let active = top.gamma_multiply(0.30);
+                    let open = hovered;
 
                     // Apply fills
                     s.visuals.widgets.inactive.bg_fill = base;
-                    s.visuals.widgets.hovered.bg_fill  = hovered;
-                    s.visuals.widgets.active.bg_fill   = active;
-                    s.visuals.widgets.open.bg_fill     = open;
+                    s.visuals.widgets.hovered.bg_fill = hovered;
+                    s.visuals.widgets.active.bg_fill = active;
+                    s.visuals.widgets.open.bg_fill = open;
 
                     // Kill outlines
                     s.visuals.widgets.inactive.bg_stroke.width = 0.0;
-                    s.visuals.widgets.hovered.bg_stroke.width  = 0.0;
-                    s.visuals.widgets.active.bg_stroke.width   = 0.0;
-                    s.visuals.widgets.open.bg_stroke.width     = 0.0;
+                    s.visuals.widgets.hovered.bg_stroke.width = 0.0;
+                    s.visuals.widgets.active.bg_stroke.width = 0.0;
+                    s.visuals.widgets.open.bg_stroke.width = 0.0;
 
                     // Make sure the label color stays readable even though bg is darker
                     let txt = egui::Color32::from_gray(210);
                     s.visuals.widgets.inactive.fg_stroke.color = txt;
-                    s.visuals.widgets.hovered.fg_stroke.color  = txt;
-                    s.visuals.widgets.active.fg_stroke.color   = txt;
-                    s.visuals.widgets.open.fg_stroke.color     = txt;
+                    s.visuals.widgets.hovered.fg_stroke.color = txt;
+                    s.visuals.widgets.active.fg_stroke.color = txt;
+                    s.visuals.widgets.open.fg_stroke.color = txt;
                     // Optional: keep panel content flush
                     ui.set_min_width(ui.available_width());
 
@@ -2311,114 +2307,126 @@ impl DesktopGuiApp {
                         |ui| {
                             // LEFT: menus
                             ui.horizontal(|ui| {
-                                    ui.menu_button("⚙ Settings", |ui| {
-                                        ui.label(egui::RichText::new("Quick settings").weak());
-                                        ui.separator();
+                                ui.menu_button("⚙ Settings", |ui| {
+                                    ui.label(egui::RichText::new("Quick settings").weak());
+                                    ui.separator();
 
-                                        ui.checkbox(&mut self.readability.compact_density, "Compact density");
-                                        ui.checkbox(
-                                            &mut self.readability.show_timestamps,
-                                            "Message timestamps",
-                                        );
-                                        ui.checkbox(
-                                            &mut self.notifications_enabled,
-                                            "Enable notifications",
-                                        );
+                                    ui.checkbox(
+                                        &mut self.readability.compact_density,
+                                        "Compact density",
+                                    );
+                                    ui.checkbox(
+                                        &mut self.readability.show_timestamps,
+                                        "Message timestamps",
+                                    );
+                                    ui.checkbox(
+                                        &mut self.notifications_enabled,
+                                        "Enable notifications",
+                                    );
 
-                                        ui.separator();
-                                        if ui.button("Advanced settings…").clicked() {
-                                            self.settings_open = true;
-                                            ui.close(); // current best practice
-                                        }
-                                    });
+                                    ui.separator();
+                                    if ui.button("Advanced settings…").clicked() {
+                                        self.settings_open = true;
+                                        ui.close(); // current best practice
+                                    }
+                                });
 
-                                    ui.menu_button("Account", |ui| {
-                                        self.show_account_menu_contents(ui);
-                                    });
-                            
+                                ui.menu_button("Account", |ui| {
+                                    self.show_account_menu_contents(ui);
+                                });
 
-
-                                    // MIDDLE: actions
-                                    ui.horizontal(|ui| {
-                                        if ui.button("Refresh Guilds").clicked() {
-                                            queue_command(
-                                                &self.cmd_tx,
-                                                BackendCommand::ListGuilds,
-                                                &mut self.status,
-                                            );
-                                        }
-
-                                        let create_enabled = self.selected_guild.is_some();
-                                        if ui
-                                            .add_enabled(create_enabled, egui::Button::new("Create Invite"))
-                                            .clicked()
-                                        {
-                                            if let Some(guild_id) = self.selected_guild {
-                                                queue_command(
-                                                    &self.cmd_tx,
-                                                    BackendCommand::CreateInvite { guild_id },
-                                                    &mut self.status,
-                                                );
-                                            }
-                                        }
-
-                                        if !create_enabled {
-                                            ui.add_space(8.0);
-                                            ui.label(
-                                                egui::RichText::new("Select a workspace to create invites")
-                                                    .weak()
-                                                    .small(),
-                                            );
-                                        }
-                                    });
-
-                            
-                                // RIGHT: invite controls
-                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    let join_enabled = self.auth_session_established
-                                        && !self.invite_code_input.trim().is_empty();
-
-                                    let join_clicked = ui
-                                        .add_enabled(join_enabled, egui::Button::new("Join"))
-                                        .clicked();
-
-                                    ui.add_space(4.0);
-
-                                    let invite_width =
-                                        (ui.available_width() * 0.45).clamp(INVITE_MIN_W, INVITE_MAX_W);
-
-                                    let invite_response = ui
-                                        .scope(|ui| {
-                                            // Keep text color theme-safe
-                                            if theme_discord_dark_palette(self.theme).is_some() {
-                                                ui.visuals_mut().override_text_color = None;
-                                            }
-
-                                            ui.add_sized(
-                                                [invite_width, ui.spacing().interact_size.y],
-                                                egui::TextEdit::singleline(&mut self.invite_code_input)
-                                                    .id_salt("main_invite_input")
-                                                    .hint_text("Invite code"),
-                                            )
-                                        })
-                                        .inner;
-
-                                    ui.add_space(6.0);
-                                    ui.label(egui::RichText::new("Invite").weak());
-
-                                    let join_with_enter = invite_response.has_focus()
-                                        && ui.input(|i| i.key_pressed(egui::Key::Enter))
-                                        && join_enabled;
-
-                                    if join_clicked || join_with_enter {
-                                        let invite_code = self.invite_code_input.trim().to_string();
+                                // MIDDLE: actions
+                                ui.horizontal(|ui| {
+                                    if ui.button("Refresh Guilds").clicked() {
                                         queue_command(
                                             &self.cmd_tx,
-                                            BackendCommand::JoinWithInvite { invite_code },
+                                            BackendCommand::ListGuilds,
                                             &mut self.status,
                                         );
                                     }
+
+                                    let create_enabled = self.selected_guild.is_some();
+                                    if ui
+                                        .add_enabled(
+                                            create_enabled,
+                                            egui::Button::new("Create Invite"),
+                                        )
+                                        .clicked()
+                                    {
+                                        if let Some(guild_id) = self.selected_guild {
+                                            queue_command(
+                                                &self.cmd_tx,
+                                                BackendCommand::CreateInvite { guild_id },
+                                                &mut self.status,
+                                            );
+                                        }
+                                    }
+
+                                    if !create_enabled {
+                                        ui.add_space(8.0);
+                                        ui.label(
+                                            egui::RichText::new(
+                                                "Select a workspace to create invites",
+                                            )
+                                            .weak()
+                                            .small(),
+                                        );
+                                    }
                                 });
+
+                                // RIGHT: invite controls
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        let join_enabled = self.auth_session_established
+                                            && !self.invite_code_input.trim().is_empty();
+
+                                        let join_clicked = ui
+                                            .add_enabled(join_enabled, egui::Button::new("Join"))
+                                            .clicked();
+
+                                        ui.add_space(4.0);
+
+                                        let invite_width = (ui.available_width() * 0.45)
+                                            .clamp(INVITE_MIN_W, INVITE_MAX_W);
+
+                                        let invite_response = ui
+                                            .scope(|ui| {
+                                                // Keep text color theme-safe
+                                                if theme_discord_dark_palette(self.theme).is_some()
+                                                {
+                                                    ui.visuals_mut().override_text_color = None;
+                                                }
+
+                                                ui.add_sized(
+                                                    [invite_width, ui.spacing().interact_size.y],
+                                                    egui::TextEdit::singleline(
+                                                        &mut self.invite_code_input,
+                                                    )
+                                                    .id_salt("main_invite_input")
+                                                    .hint_text("Invite code"),
+                                                )
+                                            })
+                                            .inner;
+
+                                        ui.add_space(6.0);
+                                        ui.label(egui::RichText::new("Invite").weak());
+
+                                        let join_with_enter = invite_response.has_focus()
+                                            && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                                            && join_enabled;
+
+                                        if join_clicked || join_with_enter {
+                                            let invite_code =
+                                                self.invite_code_input.trim().to_string();
+                                            queue_command(
+                                                &self.cmd_tx,
+                                                BackendCommand::JoinWithInvite { invite_code },
+                                                &mut self.status,
+                                            );
+                                        }
+                                    },
+                                );
                             });
                         },
                     );
@@ -3073,7 +3081,7 @@ fn theme_discord_dark_palette(theme: ThemeSettings) -> Option<DiscordDarkPalette
             nav_text_hover: egui::Color32::from_rgb(251, 251, 251),
             nav_text_highlighted: egui::Color32::from_rgb(251, 251, 251),
             message_text: egui::Color32::from_rgb(239, 239, 241),
-            message_hint_text: egui::Color32::from_rgb(108,109,118),
+            message_hint_text: egui::Color32::from_rgb(108, 109, 118),
             // Title Text:
             title_text: egui::Color32::from_rgb(251, 251, 251),
             nav_title_text: egui::Color32::from_rgb(239, 239, 241),
@@ -3125,8 +3133,6 @@ struct MainWorkspaceStyle {
     colors: MainWorkspaceColors,
     discord_dark: Option<DiscordDarkPalette>,
 }
-
-
 
 fn visuals_for_theme(theme: ThemeSettings) -> egui::Visuals {
     let mut visuals = match theme.preset {
