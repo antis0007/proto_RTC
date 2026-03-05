@@ -30,7 +30,18 @@ impl Renderer {
         encoder: &mut wgpu::CommandEncoder,
         pages: &[MeshingPage],
     ) {
+        self.gpu_buffers
+            .debug_assert_page_configuration(pages.len() as u32);
+
         for page in pages {
+            if page.id >= self.gpu_buffers.page_capacity {
+                eprintln!(
+                    "renderer: skipping meshing page_id={} (capacity={})",
+                    page.id, self.gpu_buffers.page_capacity
+                );
+                continue;
+            }
+
             self.gpu_meshing.dispatch_for_page(
                 device,
                 queue,
