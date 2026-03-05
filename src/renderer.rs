@@ -22,6 +22,12 @@ pub struct Renderer {
 }
 
 impl Renderer {
+    fn log_meshing_startup_validation_once(&self) {
+        static STARTUP_VALIDATION_LOG: std::sync::Once = std::sync::Once::new();
+        STARTUP_VALIDATION_LOG.call_once(|| {
+            self.gpu_meshing.log_startup_validation();
+        });
+    }
 
     pub fn rebuild_chunk_meshes(
         &mut self,
@@ -30,6 +36,8 @@ impl Renderer {
         encoder: &mut wgpu::CommandEncoder,
         pages: &[MeshingPage],
     ) {
+        self.log_meshing_startup_validation_once();
+
         self.gpu_buffers
             .debug_assert_page_configuration(pages.len() as u32);
 
@@ -70,9 +78,14 @@ impl Renderer {
         );
 
         for chunk in visible_chunks {
-            debug_assert_eq!(chunk.indirect_offset / INDIRECT_DRAW_STRIDE, chunk.mesh_meta_offset / MESH_META_STRIDE);
-            render_pass
-                .draw_indexed_indirect(&self.gpu_buffers.draw_indirect_buffer, chunk.indirect_offset);
+            debug_assert_eq!(
+                chunk.indirect_offset / INDIRECT_DRAW_STRIDE,
+                chunk.mesh_meta_offset / MESH_META_STRIDE
+            );
+            render_pass.draw_indexed_indirect(
+                &self.gpu_buffers.draw_indirect_buffer,
+                chunk.indirect_offset,
+            );
         }
     }
 }
