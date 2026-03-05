@@ -29,6 +29,14 @@ pub struct GpuMeshingBuffers {
     /// New per-page GPU counters.
     pub vertex_counter_buffer: wgpu::Buffer,
     pub index_counter_buffer: wgpu::Buffer,
+    /// Number of logical pages allocated across all page-indexed GPU buffers.
+    pub page_capacity: u32,
+    /// Capacity (in pages) for `mesh_meta_buffer`.
+    pub mesh_meta_page_capacity: u32,
+    /// Capacity (in pages) for `draw_indirect_buffer`.
+    pub draw_indirect_page_capacity: u32,
+    /// Capacity (in pages) for `vertex_counter_buffer` and `index_counter_buffer`.
+    pub counter_page_capacity: u32,
 }
 
 pub struct DispatchCounts {
@@ -48,9 +56,39 @@ impl GpuMeshingPipeline {
         page_id: u32,
         dispatch: DispatchCounts,
     ) {
+        if page_id >= buffers.page_capacity {
+            eprintln!(
+                "gpu_meshing: rejecting dispatch for page_id={} (capacity={})",
+                page_id, buffers.page_capacity
+            );
+            return;
+        }
+
+        debug_assert_eq!(
+            buffers.page_capacity, buffers.mesh_meta_page_capacity,
+            "mesh meta page capacity must match configured page capacity"
+        );
+        debug_assert_eq!(
+            buffers.page_capacity, buffers.draw_indirect_page_capacity,
+            "draw indirect page capacity must match configured page capacity"
+        );
+        debug_assert_eq!(
+            buffers.page_capacity, buffers.counter_page_capacity,
+            "counter page capacity must match configured page capacity"
+        );
+
         // 1) Reset vertex_counter and index_counter before dispatch.
         let zero = 0_u32.to_le_bytes();
-        let page_offset = page_id as u64 * std::mem::size_of::<u32>() as u64;
+        let counter_stride = std::mem::size_of::<u32>() as u64;
+        let page_offset = page_id as u64 * counter_stride;
+        let counter_bytes = buffers.counter_page_capacity as u64 * counter_stride;
+        debug_assert!(
+            page_offset + counter_stride <= counter_bytes,
+            "counter page offset out of range: page_offset={} stride={} counter_bytes={}",
+            page_offset,
+            counter_stride,
+            counter_bytes
+        );
         queue.write_buffer(&buffers.vertex_counter_buffer, page_offset, &zero);
         queue.write_buffer(&buffers.index_counter_buffer, page_offset, &zero);
 
@@ -108,19 +146,49 @@ impl GpuMeshingPipeline {
         // After dispatch: copy per-page counts into mesh_meta_buffer.
         let counts_size = std::mem::size_of::<MeshMetaCounts>() as u64;
         let copy_dst = page_id as u64 * counts_size;
+        let mesh_meta_bytes = buffers.mesh_meta_page_capacity as u64 * counts_size;
+        debug_assert!(
+            copy_dst + counts_size <= mesh_meta_bytes,
+            "mesh meta copy destination out of range: copy_dst={} counts_size={} mesh_meta_bytes={}",
+            copy_dst,
+            counts_size,
+            mesh_meta_bytes
+        );
         encoder.copy_buffer_to_buffer(
             &buffers.vertex_counter_buffer,
             page_offset,
             &buffers.mesh_meta_buffer,
             copy_dst,
-            std::mem::size_of::<u32>() as u64,
+            counter_stride,
         );
         encoder.copy_buffer_to_buffer(
             &buffers.index_counter_buffer,
             page_offset,
             &buffers.mesh_meta_buffer,
-            copy_dst + std::mem::size_of::<u32>() as u64,
-            std::mem::size_of::<u32>() as u64,
+            copy_dst + counter_stride,
+            counter_stride,
+        );
+    }
+}
+
+impl GpuMeshingBuffers {
+    #[inline]
+    pub fn debug_assert_page_configuration(&self, configured_page_count: u32) {
+        debug_assert_eq!(
+            configured_page_count, self.page_capacity,
+            "configured GPU page count must match allocated page capacity"
+        );
+        debug_assert_eq!(
+            self.page_capacity, self.mesh_meta_page_capacity,
+            "mesh_meta_page_capacity must equal page_capacity"
+        );
+        debug_assert_eq!(
+            self.page_capacity, self.draw_indirect_page_capacity,
+            "draw_indirect_page_capacity must equal page_capacity"
+        );
+        debug_assert_eq!(
+            self.page_capacity, self.counter_page_capacity,
+            "counter_page_capacity must equal page_capacity"
         );
     }
 }
